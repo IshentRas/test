@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 import urllib3
-from airflow.sdk import dag, task, Variable
+from airflow.sdk import Variable, dag, task
 from airflow.sdk.execution_time.secrets_masker import mask_secret
 from kubernetes.client import models as k8s
 
@@ -13,10 +13,219 @@ log = logging.getLogger("airflow.task")
 # Coder API configuration
 CODER_BASE_URL = "http://coder.coder.svc"
 
+# System users to exclude from suspension checks (emails)
+SYSTEM_USERS = ["admin@local.com"]
+
+# HTTP status code constants
+HTTP_OK_MIN = 200
+HTTP_OK_MAX = 300
+
+
+class CoderClient:
+    """Client for interacting with Coder API."""
+    
+    def __init__(self, base_url: str, session_token: str = None):
+        """Initialize Coder client.
+        
+        Args:
+            base_url: Base URL for Coder API
+            session_token: Optional session token. If not provided, must call authenticate() first.
+        """
+        self.base_url = base_url.rstrip('/')
+        self.session_token = session_token
+        self.http = urllib3.PoolManager()
+        self.timeout = urllib3.Timeout(connect=10, read=30)
+    
+    def authenticate(self, email: str, password: str) -> str:
+        """Authenticate with Coder API and store session token.
+        
+        Args:
+            email: User email for authentication
+            password: User password for authentication
+            
+        Returns:
+            Session token string
+            
+        Raises:
+            Exception: If authentication fails
+        """
+        login_url = f"{self.base_url}/api/v2/users/login"
+        login_data = {
+            "email": email,
+            "password": password
+        }
+        
+        try:
+            log.info(f"Connecting to Coder at {login_url}...")
+            json_data = json.dumps(login_data).encode('utf-8')
+            
+            response = self.http.request(
+                'POST',
+                login_url,
+                body=json_data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                timeout=self.timeout
+            )
+            
+            if (response.status >= HTTP_OK_MIN
+                    and response.status < HTTP_OK_MAX):
+                result = json.loads(response.data.decode('utf-8'))
+                session_token = result.get("session_token", "NOT_FOUND")
+                
+                if session_token == "NOT_FOUND":
+                    raise ValueError(
+                        "ERROR: Session token not found in response!"
+                    )
+                
+                self.session_token = session_token
+                mask_secret(session_token)
+                log.info("Successfully authenticated with Coder!")
+                return session_token
+            else:
+                response_body = response.data.decode('utf-8')
+                raise Exception(
+                    f"Coder API returned status {response.status}: "
+                    f"{response_body}"
+                )
+        
+        except urllib3.exceptions.HTTPError as e:
+            raise Exception(f"ERROR connecting to Coder (HTTPError): {e}")
+        except urllib3.exceptions.RequestError as e:
+            raise Exception(f"ERROR connecting to Coder (RequestError): {e}")
+        except json.JSONDecodeError as e:
+            raise Exception(f"ERROR parsing JSON response: {e}")
+        except Exception as e:
+            raise Exception(f"ERROR connecting to Coder: {e}")
+    
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        body: dict = None,
+        headers: dict = None
+    ) -> dict:
+        """Make an authenticated API request.
+        
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            endpoint: API endpoint (relative to base_url)
+            body: Optional request body dictionary
+            headers: Optional additional headers
+            
+        Returns:
+            Parsed JSON response as dictionary
+            
+        Raises:
+            ValueError: If not authenticated
+            Exception: If request fails
+        """
+        if not self.session_token:
+            raise ValueError(
+                "ERROR: Not authenticated. Call authenticate() first."
+            )
+        
+        url = f"{self.base_url}{endpoint}" if endpoint.startswith('/') else f"{self.base_url}/{endpoint}"
+        request_headers = {
+            "Accept": "application/json",
+            "Coder-Session-Token": self.session_token
+        }
+        
+        if headers:
+            request_headers.update(headers)
+        
+        if body:
+            request_headers["Content-Type"] = "application/json"
+        
+        try:
+            json_body = json.dumps(body).encode('utf-8') if body else None
+            
+            response = self.http.request(
+                method,
+                url,
+                body=json_body,
+                headers=request_headers,
+                timeout=self.timeout
+            )
+            
+            if (response.status >= HTTP_OK_MIN
+                    and response.status < HTTP_OK_MAX):
+                return json.loads(response.data.decode('utf-8'))
+            else:
+                response_body = response.data.decode('utf-8')
+                raise Exception(
+                    f"API request failed. Status: {response.status}, "
+                    f"Response: {response_body}"
+                )
+        
+        except urllib3.exceptions.HTTPError as e:
+            raise Exception(f"ERROR making API request (HTTPError): {e}")
+        except urllib3.exceptions.RequestError as e:
+            raise Exception(f"ERROR making API request (RequestError): {e}")
+        except json.JSONDecodeError as e:
+            raise Exception(f"ERROR parsing JSON response: {e}")
+        except Exception as e:
+            raise Exception(f"ERROR making API request: {e}")
+    
+    def list_workspaces(self) -> list:
+        """List all workspaces.
+        
+        Returns:
+            List of workspace dictionaries
+        """
+        log.info("Listing all workspaces...")
+        response = self._make_request('GET', '/api/v2/workspaces')
+        workspaces = response.get("workspaces", [])
+        log.info(f"Found {len(workspaces)} workspace(s)")
+        return workspaces
+    
+    def list_users(self) -> list:
+        """List all users.
+        
+        Returns:
+            List of user dictionaries
+        """
+        log.info("Listing all users...")
+        response = self._make_request('GET', '/api/v2/users')
+        users = response.get("users", [])
+        log.info(f"Found {len(users)} total user(s)")
+        return users
+    
+    def suspend_user(self, user_identifier: str) -> dict:
+        """Suspend a user by ID or email.
+        
+        Args:
+            user_identifier: User ID or email
+            
+        Returns:
+            Updated user dictionary
+        """
+        endpoint = f"/api/v2/users/{user_identifier}/status/suspend"
+        return self._make_request('PUT', endpoint)
+    
+    def delete_workspace(self, workspace_id: str) -> dict:
+        """Delete a workspace by creating a build with transition=delete.
+        
+        Args:
+            workspace_id: Workspace ID
+            
+        Returns:
+            Build result dictionary
+        """
+        endpoint = f"/api/v2/workspaces/{workspace_id}/builds"
+        payload = {"transition": "delete"}
+        return self._make_request('POST', endpoint, body=payload)
+
 
 @dag(
     dag_id="coder-workspace-manager",
-    description="Authenticates with Coder API, identifies suspended users and their workspaces, then deletes those workspaces.",
+    description=(
+        "Authenticates with Coder API, suspends unauthorized users, "
+        "identifies suspended users and their workspaces, "
+        "then deletes those workspaces."
+    ),
     start_date=datetime(2024, 1, 1),
     schedule="*/10 * * * *",  # Run every 10 minutes
     catchup=False,
@@ -52,74 +261,19 @@ def local_test_dag():
     )
     def authenticate_coder():
         """Authenticate with Coder API and return session token."""
-
-        # Get password from environment variable
         password = os.getenv("PASS", "NOT_SET")
         if password == "NOT_SET":
             raise ValueError("ERROR: PASS environment variable not set!")
         
-        # Coder API endpoint
-        coder_url = f"{CODER_BASE_URL}/api/v2/users/login"
+        client = CoderClient(CODER_BASE_URL)
+        session_token = client.authenticate("admin@local.com", password)
         
-        # Login payload
-        login_data = {
-            "email": "admin@local.com",
-            "password": password
-        }
+        # Store token in Variable and return key reference
+        secret_key = "coder_session_token"
+        Variable.set(key=secret_key, value=session_token)
+        log.info(f"Token stored under key: {secret_key}")
         
-        try:
-            # Make POST request to Coder API using urllib3
-            log.info(f"Connecting to Coder at {coder_url}...")
-            
-            # Create urllib3 PoolManager
-            http = urllib3.PoolManager()
-            
-            # Encode JSON data
-            json_data = json.dumps(login_data).encode('utf-8')
-            
-            # Make POST request
-            response = http.request(
-                'POST',
-                coder_url,
-                body=json_data,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                },
-                timeout=urllib3.Timeout(connect=10, read=30)
-            )
-            
-            # Check response status
-            if response.status >= 200 and response.status < 300:
-                # Parse JSON response
-                result = json.loads(response.data.decode('utf-8'))
-                session_token = result.get("session_token", "NOT_FOUND")
-                
-                if session_token == "NOT_FOUND":
-                    raise ValueError("ERROR: Session token not found in response!")
-                
-                # Store token in Variable and return key reference
-                secret_key = "coder_session_token"
-                Variable.set(key=secret_key, value=session_token)
-                
-                # Mask locally for safety
-                mask_secret(session_token)
-                
-                log.info(f"Successfully connected to Coder! Token stored under key: {secret_key}")
-                
-                # Return the key reference instead of the actual token
-                return secret_key
-            else:
-                raise Exception(f"Coder API returned status {response.status}: {response.data.decode('utf-8')}")
-            
-        except urllib3.exceptions.HTTPError as e:
-            raise Exception(f"ERROR connecting to Coder (HTTPError): {e}")
-        except urllib3.exceptions.RequestError as e:
-            raise Exception(f"ERROR connecting to Coder (RequestError): {e}")
-        except json.JSONDecodeError as e:
-            raise Exception(f"ERROR parsing JSON response: {e}")
-        except Exception as e:
-            raise Exception(f"ERROR connecting to Coder: {e}")
+        return secret_key
 
     @task
     def list_workspaces(secret_ref_key: str):
@@ -127,61 +281,32 @@ def local_test_dag():
         if not secret_ref_key:
             raise ValueError("ERROR: Secret reference key is required!")
         
-        try:
-            log.info(f"Received reference key: {secret_ref_key}")
-            
-            # Retrieve the actual session token from Variable
-            session_token = Variable.get(key=secret_ref_key)
-            
-            # Re-mask immediately
-            mask_secret(session_token)
-            
-            # Create urllib3 PoolManager
-            http = urllib3.PoolManager()
-            
-            # List workspaces using the session token
-            log.info("Listing all workspaces...")
-            workspaces_url = f"{CODER_BASE_URL}/api/v2/workspaces"
-            
-            workspaces_response = http.request(
-                'GET',
-                workspaces_url,
-                headers={
-                    "Accept": "application/json",
-                    "Coder-Session-Token": session_token
-                },
-                timeout=urllib3.Timeout(connect=10, read=30)
+        session_token = Variable.get(key=secret_ref_key)
+        mask_secret(session_token)
+        
+        client = CoderClient(CODER_BASE_URL, session_token)
+        workspaces = client.list_workspaces()
+        
+        log.info(f"Found {len(workspaces)} workspace(s):")
+        for idx, workspace in enumerate(workspaces, 1):
+            workspace_id = workspace.get("id", "N/A")
+            workspace_name = workspace.get("name", "N/A")
+            workspace_owner = workspace.get("owner_name", "N/A")
+            workspace_owner_id = workspace.get("owner_id", "N/A")
+            latest_build = workspace.get("latest_build")
+            workspace_status = (
+                latest_build.get("status", "N/A") if latest_build else "N/A"
             )
-            
-            if workspaces_response.status >= 200 and workspaces_response.status < 300:
-                workspaces_data = json.loads(workspaces_response.data.decode('utf-8'))
-                workspaces = workspaces_data.get("workspaces", [])
-                
-                log.info(f"Found {len(workspaces)} workspace(s):")
-                for idx, workspace in enumerate(workspaces, 1):
-                    workspace_id = workspace.get("id", "N/A")
-                    workspace_name = workspace.get("name", "N/A")
-                    workspace_owner = workspace.get("owner_name", "N/A")
-                    workspace_owner_id = workspace.get("owner_id", "N/A")
-                    workspace_status = workspace.get("latest_build", {}).get("status", "N/A") if workspace.get("latest_build") else "N/A"
-                    log.info(f"  {idx}. Name: {workspace_name}, ID: {workspace_id}, Owner: {workspace_owner}, Owner ID: {workspace_owner_id}, Status: {workspace_status}")
-                
-                # Return full workspace data for filtering
-                return {
-                    "workspaces": workspaces,
-                    "count": len(workspaces)
-                }
-            else:
-                raise Exception(f"Failed to list workspaces. Status: {workspaces_response.status}, Response: {workspaces_response.data.decode('utf-8')}")
-            
-        except urllib3.exceptions.HTTPError as e:
-            raise Exception(f"ERROR listing workspaces (HTTPError): {e}")
-        except urllib3.exceptions.RequestError as e:
-            raise Exception(f"ERROR listing workspaces (RequestError): {e}")
-        except json.JSONDecodeError as e:
-            raise Exception(f"ERROR parsing JSON response: {e}")
-        except Exception as e:
-            raise Exception(f"ERROR listing workspaces: {e}")
+            log.info(
+                f"  {idx}. Name: {workspace_name}, ID: {workspace_id}, "
+                f"Owner: {workspace_owner}, Owner ID: {workspace_owner_id}, "
+                f"Status: {workspace_status}"
+            )
+        
+        return {
+            "workspaces": workspaces,
+            "count": len(workspaces)
+        }
 
     @task
     def list_suspended_users(secret_ref_key: str):
@@ -189,66 +314,220 @@ def local_test_dag():
         if not secret_ref_key:
             raise ValueError("ERROR: Secret reference key is required!")
         
+        session_token = Variable.get(key=secret_ref_key)
+        mask_secret(session_token)
+        
+        client = CoderClient(CODER_BASE_URL, session_token)
+        all_users = client.list_users()
+        
+        # Filter for suspended users
+        suspended_users = [
+            user for user in all_users 
+            if user.get("status", "").lower() == "suspended"
+        ]
+        
+        log.info(
+            f"Found {len(all_users)} total user(s), "
+            f"{len(suspended_users)} suspended user(s):"
+        )
+        for idx, user in enumerate(suspended_users, 1):
+            user_id = user.get("id", "N/A")
+            user_name = user.get("name", "N/A")
+            username = user.get("username", "N/A")
+            user_email = user.get("email", "N/A")
+            log.info(
+                f"  {idx}. Name: {user_name}, Username: {username}, "
+                f"ID: {user_id}, Email: {user_email}"
+            )
+        
+        return {
+            "suspended_users": suspended_users,
+            "count": len(suspended_users)
+        }
+
+    def _read_authorized_users() -> set:
+        """Read authorized users from ConfigMap file."""
+        authorized_users_file = "/tmp/rbac/users.json"
+        if not os.path.exists(authorized_users_file):
+            raise FileNotFoundError(
+                f"ERROR: Authorized users file not found at "
+                f"{authorized_users_file}"
+            )
+        
+        log.info(f"Reading authorized users from {authorized_users_file}...")
+        with open(authorized_users_file, 'r') as f:
+            authorized_data = json.load(f)
+        
+        # Extract authorized emails (supports {"emails": [...]} or list)
+        if isinstance(authorized_data, dict):
+            authorized_emails_raw = authorized_data.get("emails", [])
+        elif isinstance(authorized_data, list):
+            authorized_emails_raw = authorized_data
+        else:
+            raise ValueError(
+                f"ERROR: Unexpected JSON structure in authorized users "
+                f"file: {authorized_data}"
+            )
+        
+        # Convert to lowercase set for case-insensitive comparison
+        authorized_emails = {
+            email.lower() if isinstance(email, str) else str(email).lower()
+            for email in authorized_emails_raw
+        }
+        
+        log.info(f"Found {len(authorized_emails)} authorized user(s) in ConfigMap")
+        return authorized_emails
+
+    def _find_unauthorized_users(all_users: list, authorized_emails: set) -> list:
+        """Find users that are not authorized."""
+        # Filter out system users and already suspended users
+        system_users_lower = {email.lower() for email in SYSTEM_USERS}
+        users_to_check = [
+            user for user in all_users
+            if (user.get("email", "").lower() not in system_users_lower
+                and user.get("status", "").lower() != "suspended")
+        ]
+        
+        log.info(
+            f"Checking {len(users_to_check)} user(s) "
+            f"(excluding {len(SYSTEM_USERS)} system user(s) and "
+            f"already suspended users)..."
+        )
+        
+        # Find unauthorized users (not in authorized list)
+        unauthorized_users = []
+        for user in users_to_check:
+            user_email = user.get("email", "").lower()
+            if user_email and user_email not in authorized_emails:
+                unauthorized_users.append(user)
+                user_name = user.get('name', 'N/A')
+                user_status = user.get('status', 'N/A')
+                log.info(
+                    f"  Unauthorized user found: {user_email} "
+                    f"(Name: {user_name}, Status: {user_status})"
+                )
+        
+        return unauthorized_users
+
+    def _suspend_user(user: dict, client: CoderClient) -> bool:
+        """Suspend a single user and return True if successful."""
+        user_id = user.get("id")
+        user_email = user.get("email", "N/A")
+        user_identifier = user_id or user_email
+        
+        if not user_id:
+            log.warning(f"  Skipping user {user_email}: No user ID found")
+            return False
+        
         try:
-            log.info(f"Received reference key: {secret_ref_key}")
+            client.suspend_user(user_identifier)
+            log.info(
+                f"  Successfully suspended user: {user_email} (ID: {user_id})"
+            )
+            return True
+        except Exception as e:
+            log.error(f"  ERROR suspending user {user_email}: {e}")
+            return False
+
+    @task(
+        executor_config={
+            "pod_override": k8s.V1Pod(
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base",
+                            volume_mounts=[
+                                k8s.V1VolumeMount(
+                                    name="authorized-users",
+                                    mount_path="/tmp/rbac",
+                                    read_only=True
+                                )
+                            ]
+                        )
+                    ],
+                    volumes=[
+                        k8s.V1Volume(
+                            name="authorized-users",
+                            config_map=k8s.V1ConfigMapVolumeSource(
+                                name="authorized-users"
+                            )
+                        )
+                    ]
+                )
+            )
+        }
+    )
+    def suspend_unauthorized_users(secret_ref_key: str):
+        """Suspend users that are not in the authorized users list."""
+        if not secret_ref_key:
+            raise ValueError("ERROR: Secret reference key is required!")
+        
+        try:
+            # Read authorized users from ConfigMap
+            authorized_emails = _read_authorized_users()
             
             # Retrieve the actual session token from Variable
             session_token = Variable.get(key=secret_ref_key)
-            
-            # Re-mask immediately
             mask_secret(session_token)
             
-            # Create urllib3 PoolManager
-            http = urllib3.PoolManager()
+            # Create client and list all users
+            client = CoderClient(CODER_BASE_URL, session_token)
+            all_users = client.list_users()
             
-            # List users using the session token
-            log.info("Listing all users...")
-            users_url = f"{CODER_BASE_URL}/api/v2/users"
-            
-            users_response = http.request(
-                'GET',
-                users_url,
-                headers={
-                    "Accept": "application/json",
-                    "Coder-Session-Token": session_token
-                },
-                timeout=urllib3.Timeout(connect=10, read=30)
+            # Find unauthorized users
+            unauthorized_users = _find_unauthorized_users(
+                all_users, authorized_emails
             )
             
-            if users_response.status >= 200 and users_response.status < 300:
-                users_data = json.loads(users_response.data.decode('utf-8'))
-                all_users = users_data.get("users", [])
-                
-                # Filter for suspended users
-                suspended_users = [
-                    user for user in all_users 
-                    if user.get("status", "").lower() == "suspended"
-                ]
-                
-                log.info(f"Found {len(all_users)} total user(s), {len(suspended_users)} suspended user(s):")
-                for idx, user in enumerate(suspended_users, 1):
-                    user_id = user.get("id", "N/A")
-                    user_name = user.get("name", "N/A")
-                    username = user.get("username", "N/A")
-                    user_email = user.get("email", "N/A")
-                    log.info(f"  {idx}. Name: {user_name}, Username: {username}, ID: {user_id}, Email: {user_email}")
-                
-                # Return suspended user data for filtering
+            if not unauthorized_users:
+                log.info(
+                    "No unauthorized users found. All users are "
+                    "authorized or already suspended."
+                )
+                users_to_check_count = len(all_users) - len([
+                    u for u in all_users
+                    if u.get("email", "").lower() in {
+                        email.lower() for email in SYSTEM_USERS
+                    } or u.get("status", "").lower() == "suspended"
+                ])
                 return {
-                    "suspended_users": suspended_users,
-                    "count": len(suspended_users)
+                    "suspended_count": 0,
+                    "skipped_count": users_to_check_count
                 }
-            else:
-                raise Exception(f"Failed to list users. Status: {users_response.status}, Response: {users_response.data.decode('utf-8')}")
             
-        except urllib3.exceptions.HTTPError as e:
-            raise Exception(f"ERROR listing users (HTTPError): {e}")
-        except urllib3.exceptions.RequestError as e:
-            raise Exception(f"ERROR listing users (RequestError): {e}")
+            # Suspend unauthorized users
+            log.info(
+                f"Suspending {len(unauthorized_users)} unauthorized "
+                f"user(s)..."
+            )
+            suspended_count = 0
+            failed_count = 0
+            
+            for user in unauthorized_users:
+                if _suspend_user(user, client):
+                    suspended_count += 1
+                else:
+                    failed_count += 1
+            
+            log.info(
+                f"Suspension complete: {suspended_count} suspended, "
+                f"{failed_count} failed"
+            )
+            
+            return {
+                "suspended_count": suspended_count,
+                "failed_count": failed_count,
+                "skipped_count": len(all_users) - len(unauthorized_users)
+            }
+        
+        except FileNotFoundError as e:
+            raise Exception(f"ERROR reading authorized users file: {e}")
         except json.JSONDecodeError as e:
-            raise Exception(f"ERROR parsing JSON response: {e}")
+            raise Exception(
+                f"ERROR parsing authorized users JSON file: {e}"
+            )
         except Exception as e:
-            raise Exception(f"ERROR listing users: {e}")
+            raise Exception(f"ERROR suspending unauthorized users: {e}")
 
     @task
     def filter_workspaces_by_suspended_users(workspaces_info: dict, suspended_users_info: dict):
@@ -256,12 +535,23 @@ def local_test_dag():
         workspaces = workspaces_info.get("workspaces", [])
         suspended_users = suspended_users_info.get("suspended_users", [])
         
-        # Create sets of identifiers for suspended users (match by ID, username, or name)
-        suspended_user_ids = {user.get("id") for user in suspended_users if user.get("id")}
-        suspended_usernames = {user.get("username") for user in suspended_users if user.get("username")}
-        suspended_names = {user.get("name") for user in suspended_users if user.get("name")}
+        # Create sets of identifiers for suspended users
+        # (match by ID, username, or name)
+        suspended_user_ids = {
+            user.get("id") for user in suspended_users if user.get("id")
+        }
+        suspended_usernames = {
+            user.get("username") for user in suspended_users
+            if user.get("username")
+        }
+        suspended_names = {
+            user.get("name") for user in suspended_users if user.get("name")
+        }
         
-        log.info(f"Filtering {len(workspaces)} workspace(s) for {len(suspended_users)} suspended user(s)...")
+        log.info(
+            f"Filtering {len(workspaces)} workspace(s) for "
+            f"{len(suspended_users)} suspended user(s)..."
+        )
         
         # Filter workspaces owned by suspended users
         filtered_workspaces = []
@@ -279,11 +569,20 @@ def local_test_dag():
             
             if is_owned_by_suspended:
                 filtered_workspaces.append(workspace)
-                log.info(f"  Matched workspace: {workspace.get('name', 'N/A')} (ID: {workspace_id}, Owner: {workspace_owner_name})")
+                workspace_name = workspace.get('name', 'N/A')
+                log.info(
+                    f"  Matched workspace: {workspace_name} "
+                    f"(ID: {workspace_id}, Owner: {workspace_owner_name})"
+                )
         
-        workspace_ids = [ws.get("id") for ws in filtered_workspaces if ws.get("id")]
+        workspace_ids = [
+            ws.get("id") for ws in filtered_workspaces if ws.get("id")
+        ]
         
-        log.info(f"Found {len(workspace_ids)} workspace(s) owned by suspended users out of {len(workspaces)} total workspace(s)")
+        log.info(
+            f"Found {len(workspace_ids)} workspace(s) owned by suspended "
+            f"users out of {len(workspaces)} total workspace(s)"
+        )
         
         return {
             "workspace_ids": workspace_ids,
@@ -301,70 +600,47 @@ def local_test_dag():
         if not workspace_ids:
             raise ValueError("ERROR: Workspace IDs are required!")
         
-        try:
-            log.info(f"Received {len(workspace_ids)} workspace ID(s) to delete")
-            
-            # Retrieve the actual session token from Variable
-            session_token = Variable.get(key=secret_ref_key)
-            
-            # Re-mask immediately
-            mask_secret(session_token)
-            
-            # Create urllib3 PoolManager
-            http = urllib3.PoolManager()
-            
-            # Delete workspaces by creating a build with transition="delete"
-            log.info(f"Deleting {len(workspace_ids)} workspace(s)...")
-            for workspace_id in workspace_ids:
-                delete_build_url = f"{CODER_BASE_URL}/api/v2/workspaces/{workspace_id}/builds"
-                delete_payload = {
-                    "transition": "delete"
-                }
-                
-                delete_json_data = json.dumps(delete_payload).encode('utf-8')
-                
-                delete_response = http.request(
-                    'POST',
-                    delete_build_url,
-                    body=delete_json_data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "Coder-Session-Token": session_token
-                    },
-                    timeout=urllib3.Timeout(connect=10, read=30)
+        session_token = Variable.get(key=secret_ref_key)
+        mask_secret(session_token)
+        
+        client = CoderClient(CODER_BASE_URL, session_token)
+        
+        log.info(f"Deleting {len(workspace_ids)} workspace(s)...")
+        for workspace_id in workspace_ids:
+            try:
+                delete_result = client.delete_workspace(workspace_id)
+                build_id = delete_result.get("id", "N/A")
+                delete_job = delete_result.get("job")
+                build_status = (
+                    delete_job.get("status", "N/A") if delete_job else "N/A"
                 )
-                
-                if delete_response.status >= 200 and delete_response.status < 300:
-                    delete_result = json.loads(delete_response.data.decode('utf-8'))
-                    build_id = delete_result.get("id", "N/A")
-                    build_status = delete_result.get("job", {}).get("status", "N/A") if delete_result.get("job") else "N/A"
-                    log.info(f"  Successfully initiated deletion for workspace {workspace_id}")
-                    log.info(f"    Build ID: {build_id}, Status: {build_status}")
-                else:
-                    log.error(f"  ERROR: Failed to delete workspace {workspace_id}. Status: {delete_response.status}")
-                    log.error(f"    Response body: {delete_response.data.decode('utf-8')}")
-            
-        except urllib3.exceptions.HTTPError as e:
-            raise Exception(f"ERROR deleting workspaces (HTTPError): {e}")
-        except urllib3.exceptions.RequestError as e:
-            raise Exception(f"ERROR deleting workspaces (RequestError): {e}")
-        except json.JSONDecodeError as e:
-            raise Exception(f"ERROR parsing JSON response: {e}")
-        except Exception as e:
-            raise Exception(f"ERROR deleting workspaces: {e}")
+                log.info(
+                    f"  Successfully initiated deletion for workspace "
+                    f"{workspace_id}"
+                )
+                log.info(f"    Build ID: {build_id}, Status: {build_status}")
+            except Exception as e:
+                log.error(
+                    f"  ERROR: Failed to delete workspace {workspace_id}: {e}"
+                )
 
     @task.branch
     def check_filtered_workspaces(filtered_workspaces_info: dict):
-        """Conditionally branch to delete task if workspaces owned by suspended users were found."""
+        """Branch to delete task if workspaces owned by suspended users found."""
         count = filtered_workspaces_info.get("count", 0)
         
         if count > 0:
-            log.info(f"Found {count} workspace(s) owned by suspended users, proceeding with deletion...")
+            log.info(
+                f"Found {count} workspace(s) owned by suspended users, "
+                f"proceeding with deletion..."
+            )
             # Return the task ID to execute next
             return "delete_workspaces"
         else:
-            log.info("No workspaces owned by suspended users found, skipping deletion.")
+            log.info(
+                "No workspaces owned by suspended users found, "
+                "skipping deletion."
+            )
             # Return empty list to skip all downstream tasks
             return []
 
@@ -372,20 +648,31 @@ def local_test_dag():
     # 1. Authenticate first
     secret_key_ref = authenticate_coder()
     
-    # 2. Run list_workspaces and list_suspended_users in parallel
+    # 2. Suspend unauthorized users first
+    suspend_result = suspend_unauthorized_users(secret_key_ref)
+    
+    # 3. Run list_workspaces and list_suspended_users in parallel
+    #    (after suspend completes)
+    #    This ensures newly suspended users are included in the list
     workspaces_info = list_workspaces(secret_key_ref)
     suspended_users_info = list_suspended_users(secret_key_ref)
     
-    # 3. Filter workspaces to only those owned by suspended users
-    filtered_workspaces_info = filter_workspaces_by_suspended_users(workspaces_info, suspended_users_info)
+    # Set explicit dependency: suspend must complete before listing
+    suspend_result >> workspaces_info
+    suspend_result >> suspended_users_info
     
-    # 4. Branch based on whether filtered workspaces were found
+    # 4. Filter workspaces to only those owned by suspended users
+    filtered_workspaces_info = filter_workspaces_by_suspended_users(
+        workspaces_info, suspended_users_info
+    )
+    
+    # 5. Branch based on whether filtered workspaces were found
     branch_result = check_filtered_workspaces(filtered_workspaces_info)
     
-    # 5. Define delete task (will only execute if branch returns its task_id)
+    # 6. Define delete task (will only execute if branch returns task_id)
     delete_task = delete_workspaces(secret_key_ref, filtered_workspaces_info)
     
-    # Set up the branching - delete_task will only run if branch_result returns its task_id
+    # Set up the branching - delete_task only runs if branch returns task_id
     branch_result >> delete_task
 
 
