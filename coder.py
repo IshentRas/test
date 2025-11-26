@@ -18,9 +18,9 @@ CODER_BASE_URL = "http://coder.coder.svc"
     dag_id="coder-workspace-manager",
     description="Authenticates with Coder API, lists workspaces, and conditionally deletes them.",
     start_date=datetime(2024, 1, 1),
-    schedule=None,
+    schedule="*/10 * * * *",  # Run every 10 minutes
     catchup=False,
-    tags=["local", "test", "coder", "git"],
+    tags=["local", "test", "coder"],
 )
 def local_test_dag():
     """Simple test DAG using TaskFlow API decorators."""
