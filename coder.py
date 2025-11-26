@@ -4,9 +4,12 @@ import os
 from datetime import datetime
 
 import urllib3
+from airflow.models import DagRun
 from airflow.sdk import Variable, dag, task
 from airflow.sdk.execution_time.secrets_masker import mask_secret
+from airflow.utils.session import provide_session
 from kubernetes.client import models as k8s
+from sqlalchemy.orm import Session
 
 log = logging.getLogger("airflow.task")
 
@@ -19,6 +22,9 @@ SYSTEM_USERS = ["admin@local.com"]
 # HTTP status code constants
 HTTP_OK_MIN = 200
 HTTP_OK_MAX = 300
+
+# DAG run retention configuration
+KEEP_LAST_N_SUCCESSFUL_RUNS = 5  # Keep only last 5 successful runs
 
 
 class CoderClient:
@@ -644,6 +650,79 @@ def local_test_dag():
             # Return empty list to skip all downstream tasks
             return []
 
+    @task(trigger_rule="all_done")
+    @provide_session
+    def cleanup_old_dag_runs(session: Session = None):
+        """Clean up old successful DAG runs, keeping only the last N."""
+        dag_id = "coder-workspace-manager"
+        
+        try:
+            # Query all successful runs for this DAG, ordered by execution date descending
+            successful_runs = (
+                session.query(DagRun)
+                .filter(
+                    DagRun.dag_id == dag_id,
+                    DagRun.state == "success"
+                )
+                .order_by(DagRun.execution_date.desc())
+                .all()
+            )
+            
+            total_successful = len(successful_runs)
+            log.info(
+                f"Found {total_successful} successful DAG run(s) for {dag_id}"
+            )
+            
+            if total_successful <= KEEP_LAST_N_SUCCESSFUL_RUNS:
+                log.info(
+                    f"Only {total_successful} successful run(s) found, "
+                    f"which is <= {KEEP_LAST_N_SUCCESSFUL_RUNS}. "
+                    f"No cleanup needed."
+                )
+                return {
+                    "deleted_count": 0,
+                    "kept_count": total_successful
+                }
+            
+            # Keep the last N runs, delete the rest
+            runs_to_keep = successful_runs[:KEEP_LAST_N_SUCCESSFUL_RUNS]
+            runs_to_delete = successful_runs[KEEP_LAST_N_SUCCESSFUL_RUNS:]
+            
+            log.info(
+                f"Keeping last {len(runs_to_keep)} successful run(s), "
+                f"deleting {len(runs_to_delete)} older successful run(s)..."
+            )
+            
+            deleted_count = 0
+            for dag_run in runs_to_delete:
+                try:
+                    run_id = dag_run.run_id
+                    execution_date = dag_run.execution_date
+                    log.info(
+                        f"  Deleting successful run: {run_id} "
+                        f"(execution_date: {execution_date})"
+                    )
+                    session.delete(dag_run)
+                    deleted_count += 1
+                except Exception as e:
+                    log.error(f"  ERROR deleting run {dag_run.run_id}: {e}")
+            
+            session.commit()
+            log.info(
+                f"Cleanup complete: Deleted {deleted_count} old successful "
+                f"run(s), kept {len(runs_to_keep)} recent successful run(s)"
+            )
+            
+            return {
+                "deleted_count": deleted_count,
+                "kept_count": len(runs_to_keep)
+            }
+        
+        except Exception as e:
+            session.rollback()
+            log.error(f"ERROR during DAG run cleanup: {e}")
+            raise Exception(f"ERROR cleaning up old DAG runs: {e}")
+
     # Task flow:
     # 1. Authenticate first
     secret_key_ref = authenticate_coder()
@@ -674,6 +753,11 @@ def local_test_dag():
     
     # Set up the branching - delete_task only runs if branch returns task_id
     branch_result >> delete_task
+    
+    # 7. Cleanup old successful DAG runs (always runs at the end)
+    cleanup_task = cleanup_old_dag_runs()
+    # Cleanup runs after delete_task completes (or if skipped due to trigger_rule="all_done")
+    delete_task >> cleanup_task
 
 
 # Instantiate the DAG
