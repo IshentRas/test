@@ -24,7 +24,11 @@ HTTP_OK_MIN = 200
 HTTP_OK_MAX = 300
 
 # DAG run retention configuration
-KEEP_LAST_N_SUCCESSFUL_RUNS = 5  # Keep only last 5 successful runs
+# Option 1: Keep last N successful runs (simple, good for low-frequency DAGs)
+# KEEP_LAST_N_SUCCESSFUL_RUNS = 5
+
+# Option 2: Keep runs from last N days (recommended for frequent DAGs like this one)
+RETENTION_DAYS = 7  # Keep successful runs from last 7 days
 
 
 class CoderClient:
@@ -653,54 +657,55 @@ def local_test_dag():
     @task(trigger_rule="all_done")
     @provide_session
     def cleanup_old_dag_runs(session: Session = None):
-        """Clean up old successful DAG runs, keeping only the last N."""
+        """Clean up old successful DAG runs, keeping only recent ones.
+        
+        Uses time-based retention (RETENTION_DAYS) to delete successful runs
+        older than the retention period. This is better than count-based
+        retention for frequently running DAGs.
+        """
+        from datetime import timedelta
+        
         dag_id = "coder-workspace-manager"
+        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
         
         try:
-            # Query all successful runs for this DAG, ordered by execution date descending
-            successful_runs = (
+            # Query successful runs older than retention period
+            old_successful_runs = (
                 session.query(DagRun)
                 .filter(
                     DagRun.dag_id == dag_id,
-                    DagRun.state == "success"
+                    DagRun.state == "success",
+                    DagRun.execution_date < cutoff_date
                 )
-                .order_by(DagRun.execution_date.desc())
                 .all()
             )
             
-            total_successful = len(successful_runs)
-            log.info(
-                f"Found {total_successful} successful DAG run(s) for {dag_id}"
-            )
+            total_old = len(old_successful_runs)
             
-            if total_successful <= KEEP_LAST_N_SUCCESSFUL_RUNS:
+            if total_old == 0:
                 log.info(
-                    f"Only {total_successful} successful run(s) found, "
-                    f"which is <= {KEEP_LAST_N_SUCCESSFUL_RUNS}. "
-                    f"No cleanup needed."
+                    f"No successful runs older than {RETENTION_DAYS} days "
+                    f"found for {dag_id}. No cleanup needed."
                 )
                 return {
                     "deleted_count": 0,
-                    "kept_count": total_successful
+                    "retention_days": RETENTION_DAYS
                 }
             
-            # Keep the last N runs, delete the rest
-            runs_to_keep = successful_runs[:KEEP_LAST_N_SUCCESSFUL_RUNS]
-            runs_to_delete = successful_runs[KEEP_LAST_N_SUCCESSFUL_RUNS:]
-            
             log.info(
-                f"Keeping last {len(runs_to_keep)} successful run(s), "
-                f"deleting {len(runs_to_delete)} older successful run(s)..."
+                f"Found {total_old} successful run(s) older than "
+                f"{RETENTION_DAYS} days for {dag_id}. Deleting..."
             )
             
             deleted_count = 0
-            for dag_run in runs_to_delete:
+            for dag_run in old_successful_runs:
                 try:
                     run_id = dag_run.run_id
                     execution_date = dag_run.execution_date
+                    age_days = (datetime.now() - execution_date).days
                     log.info(
                         f"  Deleting successful run: {run_id} "
-                        f"(execution_date: {execution_date})"
+                        f"(execution_date: {execution_date}, age: {age_days} days)"
                     )
                     session.delete(dag_run)
                     deleted_count += 1
@@ -710,12 +715,12 @@ def local_test_dag():
             session.commit()
             log.info(
                 f"Cleanup complete: Deleted {deleted_count} old successful "
-                f"run(s), kept {len(runs_to_keep)} recent successful run(s)"
+                f"run(s) older than {RETENTION_DAYS} days"
             )
             
             return {
                 "deleted_count": deleted_count,
-                "kept_count": len(runs_to_keep)
+                "retention_days": RETENTION_DAYS
             }
         
         except Exception as e:
