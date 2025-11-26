@@ -20,7 +20,7 @@ CODER_BASE_URL = "http://coder.coder.svc"
     start_date=datetime(2024, 1, 1),
     schedule=None,
     catchup=False,
-    tags=["local", "test", "coder"],
+    tags=["local", "test", "coder", "git"],
 )
 def local_test_dag():
     """Simple test DAG using TaskFlow API decorators."""
