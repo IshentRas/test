@@ -4,12 +4,9 @@ import os
 from datetime import datetime
 
 import urllib3
-from airflow.models import DagRun
 from airflow.sdk import Variable, dag, task
 from airflow.sdk.execution_time.secrets_masker import mask_secret
-from airflow.utils.session import provide_session
 from kubernetes.client import models as k8s
-from sqlalchemy.orm import Session
 
 log = logging.getLogger("airflow.task")
 
@@ -22,13 +19,6 @@ SYSTEM_USERS = ["admin@local.com"]
 # HTTP status code constants
 HTTP_OK_MIN = 200
 HTTP_OK_MAX = 300
-
-# DAG run retention configuration
-# Option 1: Keep last N successful runs (simple, good for low-frequency DAGs)
-# KEEP_LAST_N_SUCCESSFUL_RUNS = 5
-
-# Option 2: Keep runs from last N days (recommended for frequent DAGs like this one)
-RETENTION_DAYS = 7  # Keep successful runs from last 7 days
 
 
 class CoderClient:
@@ -654,80 +644,6 @@ def local_test_dag():
             # Return empty list to skip all downstream tasks
             return []
 
-    @task(trigger_rule="all_done")
-    @provide_session
-    def cleanup_old_dag_runs(session: Session = None):
-        """Clean up old successful DAG runs, keeping only recent ones.
-        
-        Uses time-based retention (RETENTION_DAYS) to delete successful runs
-        older than the retention period. This is better than count-based
-        retention for frequently running DAGs.
-        """
-        from datetime import timedelta
-        
-        dag_id = "coder-workspace-manager"
-        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
-        
-        try:
-            # Query successful runs older than retention period
-            old_successful_runs = (
-                session.query(DagRun)
-                .filter(
-                    DagRun.dag_id == dag_id,
-                    DagRun.state == "success",
-                    DagRun.execution_date < cutoff_date
-                )
-                .all()
-            )
-            
-            total_old = len(old_successful_runs)
-            
-            if total_old == 0:
-                log.info(
-                    f"No successful runs older than {RETENTION_DAYS} days "
-                    f"found for {dag_id}. No cleanup needed."
-                )
-                return {
-                    "deleted_count": 0,
-                    "retention_days": RETENTION_DAYS
-                }
-            
-            log.info(
-                f"Found {total_old} successful run(s) older than "
-                f"{RETENTION_DAYS} days for {dag_id}. Deleting..."
-            )
-            
-            deleted_count = 0
-            for dag_run in old_successful_runs:
-                try:
-                    run_id = dag_run.run_id
-                    execution_date = dag_run.execution_date
-                    age_days = (datetime.now() - execution_date).days
-                    log.info(
-                        f"  Deleting successful run: {run_id} "
-                        f"(execution_date: {execution_date}, age: {age_days} days)"
-                    )
-                    session.delete(dag_run)
-                    deleted_count += 1
-                except Exception as e:
-                    log.error(f"  ERROR deleting run {dag_run.run_id}: {e}")
-            
-            session.commit()
-            log.info(
-                f"Cleanup complete: Deleted {deleted_count} old successful "
-                f"run(s) older than {RETENTION_DAYS} days"
-            )
-            
-            return {
-                "deleted_count": deleted_count,
-                "retention_days": RETENTION_DAYS
-            }
-        
-        except Exception as e:
-            session.rollback()
-            log.error(f"ERROR during DAG run cleanup: {e}")
-            raise Exception(f"ERROR cleaning up old DAG runs: {e}")
-
     # Task flow:
     # 1. Authenticate first
     secret_key_ref = authenticate_coder()
@@ -758,11 +674,6 @@ def local_test_dag():
     
     # Set up the branching - delete_task only runs if branch returns task_id
     branch_result >> delete_task
-    
-    # 7. Cleanup old successful DAG runs (always runs at the end)
-    cleanup_task = cleanup_old_dag_runs()
-    # Cleanup runs after delete_task completes (or if skipped due to trigger_rule="all_done")
-    delete_task >> cleanup_task
 
 
 # Instantiate the DAG
