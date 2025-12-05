@@ -71,34 +71,38 @@ class VaultClient:
             # - AWS_ROLE_ARN environment variable
             # - AWS_ROLE_SESSION_NAME environment variable
             # boto3 will automatically use these credentials
+            session = boto3.Session()
+            credentials = session.get_credentials()
+            
+            if not credentials:
+                raise Exception(
+                    "No AWS credentials found. Ensure the pod's service account "
+                    "has an IAM role annotation configured (eks.amazonaws.com/role-arn)."
+                )
+            
+            # Get frozen credentials (access_key, secret_key, token)
+            # These are required by hvac's iam_login method
+            frozen_creds = credentials.get_frozen_credentials()
+            
+            log.info("Successfully retrieved AWS credentials from pod's service account")
+            
+            # Log the AWS identity (without exposing sensitive info)
             try:
-                # Create a boto3 session to get credentials
-                # This will use the pod's service account IAM role credentials
-                session = boto3.Session()
-                credentials = session.get_credentials()
-                
-                if credentials:
-                    log.info("Successfully retrieved AWS credentials from pod's service account")
-                    # Log the AWS identity (without exposing sensitive info)
-                    try:
-                        sts_client = session.client('sts')
-                        identity = sts_client.get_caller_identity()
-                        account_id = identity.get('Account', 'N/A')
-                        arn = identity.get('Arn', 'N/A')
-                        log.info(f"AWS Account: {account_id}, ARN: {arn}")
-                    except Exception as e:
-                        log.warning(f"Could not retrieve AWS identity: {e}")
-                else:
-                    log.warning("No AWS credentials found - will attempt to use default credential chain")
+                sts_client = session.client('sts')
+                identity = sts_client.get_caller_identity()
+                account_id = identity.get('Account', 'N/A')
+                arn = identity.get('Arn', 'N/A')
+                log.info(f"AWS Account: {account_id}, ARN: {arn}")
             except Exception as e:
-                log.warning(f"Could not retrieve AWS credentials via boto3: {e}")
-                log.info("Will attempt to use default AWS credential chain")
+                log.warning(f"Could not retrieve AWS identity: {e}")
             
             # Authenticate using AWS IAM method
-            # hvac's iam_login will use boto3 internally to generate the IAM signature
-            # It will automatically use credentials from the environment (IRSA) or
-            # the default credential chain
+            # hvac's iam_login requires explicit access_key, secret_key, and session_token
+            # These are obtained from boto3's credential chain (which uses IRSA)
             self.client.auth.aws.iam_login(
+                access_key=frozen_creds.access_key,
+                secret_key=frozen_creds.secret_key,
+                session_token=frozen_creds.token,
                 role=self.iam_role
             )
             
@@ -302,4 +306,3 @@ def vault_password_dag():
 
 # Instantiate the DAG
 vault_password_dag()
-
