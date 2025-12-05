@@ -2,6 +2,7 @@ import logging
 import os
 from datetime import datetime
 
+import boto3
 import hvac
 from airflow.sdk import Variable, dag, task
 from airflow.sdk.execution_time.secrets_masker import mask_secret
@@ -49,7 +50,9 @@ class VaultClient:
         """Authenticate with Vault using AWS IAM role.
         
         This method uses the IAM role attached to the pod/service account
-        to authenticate with Vault's AWS auth method.
+        (via OIDC annotation) to authenticate with Vault's AWS auth method.
+        Uses boto3 to get AWS credentials from the pod's environment, which
+        are automatically injected when using IRSA (IAM Roles for Service Accounts).
         
         Raises:
             Exception: If authentication fails
@@ -61,9 +64,40 @@ class VaultClient:
                 f"using IAM role: {self.iam_role}{namespace_info}"
             )
             
+            # Get AWS credentials from the pod's service account
+            # When using IRSA (IAM Roles for Service Accounts) on EKS,
+            # AWS credentials are automatically injected via:
+            # - AWS_WEB_IDENTITY_TOKEN_FILE environment variable
+            # - AWS_ROLE_ARN environment variable
+            # - AWS_ROLE_SESSION_NAME environment variable
+            # boto3 will automatically use these credentials
+            try:
+                # Create a boto3 session to get credentials
+                # This will use the pod's service account IAM role credentials
+                session = boto3.Session()
+                credentials = session.get_credentials()
+                
+                if credentials:
+                    log.info("Successfully retrieved AWS credentials from pod's service account")
+                    # Log the AWS identity (without exposing sensitive info)
+                    try:
+                        sts_client = session.client('sts')
+                        identity = sts_client.get_caller_identity()
+                        account_id = identity.get('Account', 'N/A')
+                        arn = identity.get('Arn', 'N/A')
+                        log.info(f"AWS Account: {account_id}, ARN: {arn}")
+                    except Exception as e:
+                        log.warning(f"Could not retrieve AWS identity: {e}")
+                else:
+                    log.warning("No AWS credentials found - will attempt to use default credential chain")
+            except Exception as e:
+                log.warning(f"Could not retrieve AWS credentials via boto3: {e}")
+                log.info("Will attempt to use default AWS credential chain")
+            
             # Authenticate using AWS IAM method
-            # This uses the IAM role credentials from the pod's service account
-            # (when running on EKS) or EC2 instance profile
+            # hvac's iam_login will use boto3 internally to generate the IAM signature
+            # It will automatically use credentials from the environment (IRSA) or
+            # the default credential chain
             self.client.auth.aws.iam_login(
                 role=self.iam_role
             )
