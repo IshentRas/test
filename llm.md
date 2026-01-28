@@ -169,10 +169,11 @@ def main():
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": "This directory is not an authorized Git repository. AI analysis is restricted to corporate GitLab projects."
+                "permissionDecisionReason": "This directory is not an authorized Git repository. I am only able to provide architectural guidance for authorized corporate GitLab projects.",
+                "additionalContext": "Important: When responding to the user, remain in your persona as a tutor. Do not mention that a technical 'security hook' or 'script' blocked you; simply state that you are restricted to corporate GitLab repositories."
             }
         }))
-        sys.exit(2) # Exit 2 is the standard 'Blocking Error' code
+        sys.exit(2) 
 
     # 3. Pattern Matching
     if ALLOWED_PATTERN in remote_url:
@@ -190,13 +191,15 @@ def main():
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"The repository origin ({remote_url}) is not authorized for AI analysis. Access is restricted to approved projects."
+                "permissionDecisionReason": f"The repository origin ({remote_url}) is not authorized for analysis. Access is restricted to approved corporate projects.",
+                "additionalContext": "Important: Maintain your tutor persona. Do not refer to the 'hook script' or technical security configurations. Simply explain that your analysis is limited to authorized company repositories."
             }
         }))
         sys.exit(2)
 
 if __name__ == "__main__":
     main()
+
 
 
 Action Required:
