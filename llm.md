@@ -127,8 +127,11 @@ ALLOWED_PATTERN = "gitlab.com[:/]your-company-workspace"
 LOG_FILE = "/tmp/claude_hook_audit.log"
 
 def log(message):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{datetime.now()}] {message}\n")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now()}] {message}\n")
+    except:
+        pass
 
 def get_git_remote(target_dir):
     try:
@@ -143,41 +146,52 @@ def get_git_remote(target_dir):
         return None
 
 def main():
-    # 1. Determine the target directory
-    # Priority: CLAUDE_PROJECT_DIR (env) -> cwd (from stdin JSON) -> os.getcwd()
+    # 1. Parse the Hook Input from stdin
+    # Claude pipes a JSON object containing session_id, cwd, and tool_input
+    try:
+        hook_input = json.load(sys.stdin)
+        cwd = hook_input.get("cwd")
+    except Exception:
+        cwd = None
+
+    # Fallback to env or current directory if stdin is empty
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    target_dir = project_dir or cwd or os.getcwd()
     
-    # Optional: Parse stdin if we need more context from Claude
-    # try:
-    #     hook_input = json.load(sys.stdin)
-    #     project_dir = project_dir or hook_input.get("cwd")
-    # except:
-    #     pass
+    log(f"Hook invoked. Target Dir: {target_dir}")
 
-    target_dir = project_dir or os.getcwd()
-    log(f"Hook invoked. Dir: {target_dir}")
-
-    # 2. Check if it's a Git repo
+    # 2. Extract Git Remote
     remote_url = get_git_remote(target_dir)
     
     if not remote_url:
         log(f"DENIED: No Git remote found at {target_dir}")
         print(json.dumps({
-            "ok": False, 
-            "reason": "This directory is not an authorized Git repository. AI analysis is restricted to corporate GitLab projects."
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "This directory is not an authorized Git repository. AI analysis is restricted to corporate GitLab projects."
+            }
         }))
-        sys.exit(2)
+        sys.exit(2) # Exit 2 is the standard 'Blocking Error' code
 
     # 3. Pattern Matching
     if ALLOWED_PATTERN in remote_url:
         log(f"GRANTED: {remote_url}")
-        print(json.dumps({"ok": True}))
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }))
         sys.exit(0)
     else:
         log(f"DENIED: {remote_url}")
         print(json.dumps({
-            "ok": False,
-            "reason": f"The repository origin ({remote_url}) is not authorized. Please only use Claude on approved GitLab projects."
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"The repository origin ({remote_url}) is not authorized for AI analysis. Access is restricted to approved projects."
+            }
         }))
         sys.exit(2)
 
