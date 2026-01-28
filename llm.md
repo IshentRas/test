@@ -1,4 +1,15 @@
-SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the implementation of a governed, read-only AI tutor environment using Claude Code, Coder, Bedrock, and LiteLLM.1. System-Level Lockdown (Managed Policy)This file must be created by an administrator (root) within the Coder image to ensure it cannot be modified by the user.File: /etc/claude-code/managed-settings.json
+SPIKE: "Read-Only Architect" AI Environment Setup Guide
+
+This guide outlines the implementation of a governed, read-only AI tutor environment using Claude Code, Coder, Bedrock, and LiteLLM.
+
+1. System-Level Lockdown (Managed Policy)
+
+This file must be created by an administrator (root) within the Coder image.
+
+Logic: We jail Claude to /home/coder using absolute path permissions (//) and then apply a Python-based Git Sentinel hook to validate the origin of any code being read.
+
+File: /etc/claude-code/managed-settings.json
+
 {
   "model": "haiku-tutor",
   "outputStyle": "Explanatory",
@@ -10,7 +21,7 @@ SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the i
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/local/bin/validate-origin.sh"
+            "command": "python3 /usr/local/bin/validate_origin.py"
           }
         ]
       }
@@ -38,31 +49,118 @@ SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the i
     "CLAUDE-TUTOR ACTIVE: Read-Only Analysis Mode for Authorized Repositories Only."
   ]
 }
-2. Git-Origin Sentinel (Validation Script)This script is triggered on every tool call to verify that the project Claude is interacting with belongs to your organization.File: /usr/local/bin/validate-origin.sh#!/bin/bash
-# Hook context: CLAUDE_PROJECT_DIR is provided by Claude Code
 
-# 1. Get the remote URL of the current project
-REMOTE_URL=$(git -C "$CLAUDE_PROJECT_DIR" remote get-url origin 2>/dev/null)
 
-# 2. Define the allowed GitLab workspace/group pattern
-# Change this to match your GitLab organization
-ALLOWED_PATTERN="gitlab.com[:/]your-company-workspace"
+2. Git-Origin Sentinel (Python Implementation)
 
-# 3. Validation Logic
-if [[ "$REMOTE_URL" =~ $ALLOWED_PATTERN ]]; then
-    exit 0 # Path Authorized
-else
-    # This message is displayed directly to the user in the terminal
-    echo "SECURITY ALERT: Repository ($REMOTE_URL) is NOT authorized for AI analysis." >&2
-    exit 1 # Blocks the tool execution
-fi
-Action Required: sudo chmod +x /usr/local/bin/validate-origin.sh3. Persona Injection (Kubernetes ConfigMap)Mount this file into the workspace using a Kubernetes ConfigMap with a subPath to ensure it is persistent and read-only.File Target: /home/coder/CLAUDE.md# Engineering Tutor Rules
-1. **Role:** You are a Read-Only Software Architect and Tutor.
-2. **Focus:** Only analyze and explain code logic within `/home/coder`.
-3. **Restriction:** You cannot write or edit files. You cannot execute bash commands.
-4. **Workflow:** Explain the "Why" and the "How." For actual code implementation or bug fixes, direct the user to use **GitLab Duo**.
-5. **Scope:** Only discuss approved company repositories as validated by your internal security hooks.
-4. Coder Environment ConfigurationEnsure your Coder workspace exports the following variables (likely via your custom LiteLLM virtual key module):export ANTHROPIC_API_KEY="sk-your-litellm-virtual-key"
-export ANTHROPIC_BASE_URL="[https://your-litellm-proxy.internal/v1](https://your-litellm-proxy.internal/v1)"
-export ANTHROPIC_MODEL="haiku-tutor"
-5. SPIKE Verification Protocol (Acid Tests)Test 1: The "Imposter" Repo (Security Check)Action: git clone https://github.com/django/django (or any public repo).Action: Run claude "Explain this project"Expected Result: The validate-origin.sh hook should trigger, and Claude should report a Security Alert denying access.Test 2: The "Hands-Tied" Test (Permission Check)Action: In an authorized repo, ask Claude: "Delete the README.md" or "Create a new file named test.py".Expected Result: Claude should state it does not have permission to use the Write or Bash tools.Test 3: The "Tutor Style" Test (Persona Check)Action: Ask Claude: "How does the database connection logic work?"Expected Result: Claude should provide a narrative explanation (due to Explanatory mode) and explicitly mention that you should use GitLab Duo if you want to modify it.Test 4: The "Budget Hard-Stop" (Financial Check)Action: Monitor the LiteLLM dashboard for the specific virtual key.Expected Result: Verify that spend is correctly attributed to that user/key. (Manually lower a test key's budget to $0.01 to verify the 429 error handling).Next Steps: Once these tests are validated, we will proceed to draft the Executive Summary focusing on Cognitive Safety, Financial Control, and IP Protection.
+Using Python provides better JSON handling and more reliable path resolution. Claude Code passes CLAUDE_PROJECT_DIR in the environment, and the full hook context via stdin.
+
+File: /usr/local/bin/validate_origin.py
+
+import os
+import sys
+import subprocess
+import json
+from datetime import datetime
+
+# --- CONFIGURATION ---
+ALLOWED_PATTERN = "gitlab.com[:/]your-company-workspace"
+LOG_FILE = "/tmp/claude_hook_audit.log"
+
+def log(message):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{datetime.now()}] {message}\n")
+
+def get_git_remote(target_dir):
+    try:
+        # Get the remote URL for 'origin'
+        result = subprocess.check_output(
+            ["git", "-C", target_dir, "remote", "get-url", "origin"],
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        return result.strip()
+    except Exception:
+        return None
+
+def main():
+    # 1. Determine the target directory
+    # Priority: CLAUDE_PROJECT_DIR (env) -> cwd (from stdin JSON) -> os.getcwd()
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    
+    # Optional: Parse stdin if we need more context from Claude
+    # try:
+    #     hook_input = json.load(sys.stdin)
+    #     project_dir = project_dir or hook_input.get("cwd")
+    # except:
+    #     pass
+
+    target_dir = project_dir or os.getcwd()
+    log(f"Hook invoked. Dir: {target_dir}")
+
+    # 2. Check if it's a Git repo
+    remote_url = get_git_remote(target_dir)
+    
+    if not remote_url:
+        log(f"DENIED: No Git remote found at {target_dir}")
+        print(json.dumps({
+            "ok": False, 
+            "reason": "This directory is not an authorized Git repository. AI analysis is restricted to corporate GitLab projects."
+        }))
+        sys.exit(2)
+
+    # 3. Pattern Matching
+    if ALLOWED_PATTERN in remote_url:
+        log(f"GRANTED: {remote_url}")
+        print(json.dumps({"ok": True}))
+        sys.exit(0)
+    else:
+        log(f"DENIED: {remote_url}")
+        print(json.dumps({
+            "ok": False,
+            "reason": f"The repository origin ({remote_url}) is not authorized. Please only use Claude on approved GitLab projects."
+        }))
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+
+
+Action Required:
+
+sudo chmod 755 /usr/local/bin/validate_origin.py
+
+touch /tmp/claude_hook_audit.log && chmod 666 /tmp/claude_hook_audit.log
+
+3. Persona Injection (Kubernetes ConfigMap)
+
+File Target: /home/coder/CLAUDE.md (Read-Only Mount)
+
+# Engineering Tutor Rules
+1. **Role:** Read-Only Architect & Tutor.
+2. **Focus:** Explain code logic within `/home/coder`.
+3. **Workflow:** For code changes, use GitLab Duo. Do not ask for Bash or Write permissions.
+4. **Scope:** Only corporate GitLab repositories are approved for analysis.
+
+
+4. Verification Protocol (Acid Tests)
+
+Test 1: Absolute Path Check
+
+Action: claude "Read /etc/shadow"
+
+Expected Result: Immediate permission error (JSON Deny rule).
+
+Test 2: Git Remote Check
+
+Action: git clone a public repo into /home/coder/external-code.
+
+Action: Run claude "Analyze this repo".
+
+Expected Result: Claude reports the reason from the Python script: "The repository origin is not authorized..."
+
+Test 3: The "/init" Check
+
+Action: Run /init in an empty folder.
+
+Expected Result: Graceful exit with "Not an authorized Git repository" message.
