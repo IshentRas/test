@@ -61,12 +61,9 @@ import re
 from datetime import datetime
 
 # --- CONFIGURATION ---
-# Base domain of your internal GitLab (Escaped for Regex)
 BASE_INTERNAL_URL = r"app\.internal\.com"
-# Path to the K8s ConfigMap mount
 GOVERNANCE_CONFIG = "/etc/ai-governance/config.json"
 LOG_FILE = "/tmp/claude_hook_audit.log"
-# Debug file to capture the exact JSON sent by Claude Code
 DEBUG_INPUT_FILE = "/tmp/claude_last_input.json"
 
 def log(message):
@@ -89,46 +86,66 @@ def get_allowed_paths():
     # Fallback default: match nothing if config is missing to be safe
     return []
 
-def get_git_remote(target_dir):
+def get_git_remote(target_path):
+    """Finds the nearest git root for a specific path and returns its origin URL."""
     try:
+        # 1. Find the top-level directory of the repository containing target_path
+        git_root = subprocess.check_output(
+            ["git", "-C", target_path, "rev-parse", "--show-toplevel"],
+            stderr=subprocess.STDOUT,
+            text=True
+        ).strip()
+        
+        # 2. Get the remote URL for that specific root
         result = subprocess.check_output(
-            ["git", "-C", target_dir, "remote", "get-url", "origin"],
+            ["git", "-C", git_root, "remote", "get-url", "origin"],
             stderr=subprocess.STDOUT,
             text=True
         )
         return result.strip()
     except Exception:
+        # Not a git repo or no remote origin
         return None
 
 def main():
     # 1. Context Resolution & Debug Capture
-    # Reading stdin as a string first to save it for debugging
-    raw_input = None
+    target_path = None
     try:
         if not sys.stdin.isatty():
             raw_input = sys.stdin.read()
-            # Save the raw input to a file for architectural inspection
+            # Log the raw input for architectural debugging
             with open(DEBUG_INPUT_FILE, "w") as f:
                 f.write(raw_input)
             
             hook_input = json.loads(raw_input)
-            cwd = hook_input.get("cwd")
+            
+            # Extract the specific path Claude is touching from tool_input
+            # Different tools use different keys: 'file_path' for Read, 'path' for LS/Glob/Grep
+            tool_input = hook_input.get("tool_input", {})
+            target_path = tool_input.get("file_path") or tool_input.get("path")
+            
+            # Fallback to CWD provided in hook input if tool_input lacks a path
+            if not target_path:
+                target_path = hook_input.get("cwd")
         else:
-            cwd = None
+            target_path = os.getcwd()
     except Exception as e:
         log(f"Input Parsing Error: {str(e)}")
-        cwd = None
+        target_path = os.getcwd()
 
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
-    target_dir = project_dir or cwd or os.getcwd()
-    
-    log(f"Hook invoked. Target Dir: {target_dir}")
+    # Ensure we are working with an absolute path for git resolution
+    if target_path:
+        target_path = os.path.abspath(target_path)
+    else:
+        target_path = os.getcwd()
+
+    log(f"Hook invoked. Target Path: {target_path}")
 
     # 2. Extract Remote URL
-    remote_url = get_git_remote(target_dir)
+    remote_url = get_git_remote(target_path)
     
     if not remote_url:
-        log(f"DENIED: No Git remote at {target_dir}")
+        log(f"DENIED: No Git remote for {target_path}")
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
