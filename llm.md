@@ -66,6 +66,8 @@ BASE_INTERNAL_URL = r"app\.internal\.com"
 # Path to the K8s ConfigMap mount
 GOVERNANCE_CONFIG = "/etc/ai-governance/config.json"
 LOG_FILE = "/tmp/claude_hook_audit.log"
+# Debug file to capture the exact JSON sent by Claude Code
+DEBUG_INPUT_FILE = "/tmp/claude_last_input.json"
 
 def log(message):
     try:
@@ -99,15 +101,22 @@ def get_git_remote(target_dir):
         return None
 
 def main():
-    # 1. Context Resolution
+    # 1. Context Resolution & Debug Capture
+    # Reading stdin as a string first to save it for debugging
+    raw_input = None
     try:
-        # Check if Claude is piping JSON context
         if not sys.stdin.isatty():
-            hook_input = json.load(sys.stdin)
+            raw_input = sys.stdin.read()
+            # Save the raw input to a file for architectural inspection
+            with open(DEBUG_INPUT_FILE, "w") as f:
+                f.write(raw_input)
+            
+            hook_input = json.loads(raw_input)
             cwd = hook_input.get("cwd")
         else:
             cwd = None
-    except:
+    except Exception as e:
+        log(f"Input Parsing Error: {str(e)}")
         cwd = None
 
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
