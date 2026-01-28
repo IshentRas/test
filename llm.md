@@ -169,6 +169,7 @@ By making the domain a constant in the script, the ConfigMap managed by Airflow 
 
 ConfigMap Data (config.json):
 
+```json
 {
   "allowed_paths": [
     "engineering/.*",
@@ -176,7 +177,7 @@ ConfigMap Data (config.json):
     "architecture/guidelines/.*"
   ]
 }
-
+```
 
 4. Persona Injection (CLAUDE.md)
 
