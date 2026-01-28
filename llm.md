@@ -1,4 +1,5 @@
-SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the implementation of a governed, read-only AI tutor environment using Claude Code, Coder, Bedrock, and LiteLLM.1. System-Level Lockdown (Managed Policy)This file must be created by an administrator (root) within the Coder image to ensure it cannot be modified by the user.File: /etc/claude-code/managed-settings.json{
+SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the implementation of a governed, read-only AI tutor environment using Claude Code, Coder, Bedrock, and LiteLLM.1. System-Level Lockdown (Managed Policy)This file must be created by an administrator (root) within the Coder image to ensure it cannot be modified by the user.File: /etc/claude-code/managed-settings.json
+{
   "model": "haiku-tutor",
   "outputStyle": "Explanatory",
   "allowManagedHooksOnly": true,
@@ -16,8 +17,21 @@ SPIKE: "Read-Only Architect" AI Environment Setup GuideThis guide outlines the i
     ]
   },
   "permissions": {
-    "allow": ["Read", "LS", "Grep", "Glob"],
-    "deny": ["Bash", "WebFetch", "Edit", "Write", "Task"],
+    "allow": [
+      "Read(/home/coder/**)",
+      "LS(/home/coder/**)",
+      "Grep",
+      "Glob"
+    ],
+    "deny": [
+      "Read(//* )",
+      "LS(//* )",
+      "Bash",
+      "WebFetch",
+      "Edit",
+      "Write",
+      "Task"
+    ],
     "disableBypassPermissionsMode": "disable"
   },
   "companyAnnouncements": [
