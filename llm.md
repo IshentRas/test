@@ -61,17 +61,29 @@ import re
 from datetime import datetime
 
 # --- CONFIGURATION ---
+# Base domain of your internal GitLab (Escaped for Regex)
 BASE_INTERNAL_URL = r"app\.internal\.com"
+# Path to the K8s ConfigMap mount (Managed by Airflow)
 GOVERNANCE_CONFIG = "/etc/ai-governance/config.json"
+HOME_CODER = "/home/coder"
 LOG_FILE = "/tmp/claude_hook_audit.log"
 DEBUG_INPUT_FILE = "/tmp/claude_last_input.json"
 
 def log(message):
     try:
+        # Scrub common token patterns from logs (e.g., glpat-...)
+        scrubbed = re.sub(r'glpat-[\w-]+', '[REDACTED_TOKEN]', message)
         with open(LOG_FILE, "a") as f:
-            f.write(f"[{datetime.now()}] {message}\n")
+            f.write(f"[{datetime.now()}] {scrubbed}\n")
     except:
         pass
+
+def scrub_url(url):
+    """Removes credentials/tokens from Git URLs for safe echoing."""
+    if not url:
+        return ""
+    # Matches http(s)://user:token@domain or user:token@domain
+    return re.sub(r'(https?://|git@)?[\w-]+:[\w-]+@', r'\1', url)
 
 def get_allowed_paths():
     """Reads authorized path suffixes from the mounted ConfigMap."""
@@ -82,90 +94,107 @@ def get_allowed_paths():
                 return config.get("allowed_paths", [])
     except Exception as e:
         log(f"Config Error: {str(e)}")
-    
-    # Fallback default: match nothing if config is missing to be safe
     return []
 
 def get_git_remote(target_path):
     """Finds the nearest git root for a specific path and returns its origin URL."""
     try:
-        # 1. Find the top-level directory of the repository containing target_path
+        curr = target_path
+        while curr and not os.path.isdir(curr) and curr != "/":
+            curr = os.path.dirname(curr)
+        
+        search_dir = curr if curr and os.path.isdir(curr) else os.getcwd()
+        
         git_root = subprocess.check_output(
-            ["git", "-C", target_path, "rev-parse", "--show-toplevel"],
+            ["git", "-C", search_dir, "rev-parse", "--show-toplevel"],
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
+            timeout=2
         ).strip()
         
-        # 2. Get the remote URL for that specific root
         result = subprocess.check_output(
             ["git", "-C", git_root, "remote", "get-url", "origin"],
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
+            timeout=2
         )
         return result.strip()
     except Exception:
-        # Not a git repo or no remote origin
         return None
 
 def main():
-    # 1. Context Resolution & Debug Capture
     target_path = None
+    cwd = os.getcwd()
+    tool_name = "Unknown"
+    
     try:
         if not sys.stdin.isatty():
             raw_input = sys.stdin.read()
-            # Log the raw input for architectural debugging
             with open(DEBUG_INPUT_FILE, "w") as f:
                 f.write(raw_input)
             
-            hook_input = json.loads(raw_input)
+            data = json.loads(raw_input)
+            cwd = data.get("cwd", os.getcwd())
+            tool_name = data.get("tool_name", "")
+            tool_input = data.get("tool_input", {})
             
-            # Extract the specific path Claude is touching from tool_input
-            # Different tools use different keys: 'file_path' for Read, 'path' for LS/Glob/Grep
-            tool_input = hook_input.get("tool_input", {})
-            target_path = tool_input.get("file_path") or tool_input.get("path")
+            raw_path = None
+            if tool_name in ["Read", "Write", "Edit", "MultiEdit"]:
+                raw_path = tool_input.get("file_path")
+            elif tool_name in ["Glob", "Grep", "LS"]:
+                raw_path = tool_input.get("path")
+                if not raw_path and tool_name == "Glob":
+                    pattern = tool_input.get("pattern", "")
+                    if pattern.startswith("**/"):
+                        raw_path = os.path.join(cwd, pattern[3:])
+                        raw_path = re.sub(r'[*?\[].*', '', raw_path)
             
-            # Fallback to CWD provided in hook input if tool_input lacks a path
-            if not target_path:
-                target_path = hook_input.get("cwd")
+            target_path = raw_path if raw_path else cwd
         else:
             target_path = os.getcwd()
     except Exception as e:
         log(f"Input Parsing Error: {str(e)}")
         target_path = os.getcwd()
 
-    # Ensure we are working with an absolute path for git resolution
-    if target_path:
-        target_path = os.path.abspath(target_path)
-    else:
-        target_path = os.getcwd()
+    target_path = os.path.abspath(target_path or os.getcwd())
+    log(f"Hook [{tool_name}]: Resolving target {target_path}")
 
-    log(f"Hook invoked. Target Path: {target_path}")
-
-    # 2. Extract Remote URL
-    remote_url = get_git_remote(target_path)
-    
-    if not remote_url:
-        log(f"DENIED: No Git remote for {target_path}")
+    # 2. FAST FAIL: Path Jail Check
+    if not target_path.startswith(HOME_CODER):
+        log(f"FAST FAIL: {target_path} is outside of {HOME_CODER}")
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": "This directory is not an authorized Git repository. Analysis is restricted to internal GitLab projects."
+                "permissionDecisionReason": "Access denied. I am restricted to analyzing files within your home directory for security reasons."
             }
         }))
         sys.exit(2)
 
-    # 3. Validation Logic
-    allowed_paths = get_allowed_paths()
+    # 3. Extract Remote URL
+    remote_url = get_git_remote(target_path)
+    safe_remote_url = scrub_url(remote_url)
     
-    # Matches domain followed by SSH (:) or HTTPS (/) separator + allowed path
+    if not remote_url:
+        log(f"DENIED: No Git remote found for {target_path}")
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "This directory is not an authorized Git repository. I am only able to provide architectural guidance for authorized corporate projects. (Instructions: Stay in persona as a tutor. Do not mention technical security hooks.)"
+            }
+        }))
+        sys.exit(2)
+
+    # 4. Validation Logic
+    allowed_paths = get_allowed_paths()
     is_authorized = any(
         re.search(fr"{BASE_INTERNAL_URL}[:/]{path}", remote_url) 
         for path in allowed_paths
     )
 
     if is_authorized:
-        log(f"GRANTED: {remote_url}")
+        log(f"GRANTED: {safe_remote_url}")
         print(json.dumps({
             "hookSpecificOutput": { 
                 "hookEventName": "PreToolUse", 
@@ -174,13 +203,13 @@ def main():
         }))
         sys.exit(0)
     else:
-        log(f"DENIED: {remote_url}")
+        log(f"DENIED: {safe_remote_url}")
+        # Only echo back the 'safe' version of the URL to prevent token leaking
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"The repository origin ({remote_url}) is not authorized for analysis.",
-                "additionalContext": "Important: Maintain your tutor persona. Simply state that your analysis is limited to authorized internal repositories. Do not mention technical scripts or hooks."
+                "permissionDecisionReason": f"The repository at {BASE_INTERNAL_URL} is not authorized for analysis. (Instructions: Maintain your tutor persona. State simply that you are limited to authorized internal projects.)"
             }
         }))
         sys.exit(2)
