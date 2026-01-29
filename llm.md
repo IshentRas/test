@@ -72,7 +72,8 @@ DEBUG_INPUT_FILE = "/tmp/claude_last_input.json"
 def log(message):
     try:
         # Scrub common token patterns from logs (e.g., glpat-...)
-        scrubbed = re.sub(r'glpat-[\w-]+', '[REDACTED_TOKEN]', message)
+        # Updated to include '.' as glpat tokens often contain them
+        scrubbed = re.sub(r'glpat-[\w.-]+', '[REDACTED_TOKEN]', message)
         with open(LOG_FILE, "a") as f:
             f.write(f"[{datetime.now()}] {scrubbed}\n")
     except:
@@ -83,7 +84,8 @@ def scrub_url(url):
     if not url:
         return ""
     # Matches http(s)://user:token@domain or user:token@domain
-    return re.sub(r'(https?://|git@)?[\w-]+:[\w-]+@', r'\1', url)
+    # Includes '.' in the token match group
+    return re.sub(r'(https?://|git@)?[\w.-]+:[\w.-]+@', r'\1', url)
 
 def get_allowed_paths():
     """Reads authorized path suffixes from the mounted ConfigMap."""
@@ -100,6 +102,7 @@ def get_git_remote(target_path):
     """Finds the nearest git root for a specific path and returns its origin URL."""
     try:
         curr = target_path
+        # Traverse up to find a valid directory
         while curr and not os.path.isdir(curr) and curr != "/":
             curr = os.path.dirname(curr)
         
@@ -142,14 +145,26 @@ def main():
             if tool_name in ["Read", "Write", "Edit", "MultiEdit"]:
                 raw_path = tool_input.get("file_path")
             elif tool_name in ["Glob", "Grep", "LS"]:
-                raw_path = tool_input.get("path")
-                if not raw_path and tool_name == "Glob":
-                    pattern = tool_input.get("pattern", "")
-                    if pattern.startswith("**/"):
-                        raw_path = os.path.join(cwd, pattern[3:])
-                        raw_path = re.sub(r'[*?\[].*', '', raw_path)
-            
-            target_path = raw_path if raw_path else cwd
+                # Logic for tools that search or list
+                raw_path = tool_input.get("path") or tool_input.get("pattern")
+                
+                if tool_name == "Glob" and raw_path:
+                    # Handle shorthand glob patterns
+                    if raw_path.startswith("**/"):
+                        raw_path = os.path.join(cwd, raw_path[3:])
+                    
+                    # Strip wildcards to resolve a base path for Git validation
+                    raw_path = re.sub(r'[*?\[].*', '', raw_path)
+
+            # Resolve to Absolute Path: 
+            # If the tool provided a relative path (doesn't start with /), anchor it to CWD
+            if raw_path:
+                if not os.path.isabs(raw_path):
+                    target_path = os.path.join(cwd, raw_path)
+                else:
+                    target_path = raw_path
+            else:
+                target_path = cwd
         else:
             target_path = os.getcwd()
     except Exception as e:
