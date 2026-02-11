@@ -21,6 +21,8 @@ Variable Dependencies: Identify any environment variables or secrets (e.g., VAUL
 YAML Style Constraint: > Keep the output strictly technical and machine-readable. Use a flat structure. The goal is to create a "Truth Table" that maps what the user types to what the system includes.
 
 
+=====
+
 ---
 name: gitlab-internal-specialist
 description: Expert in debugging pipelines and component logic on [Company] GitLab Dedicated.
@@ -47,7 +49,6 @@ description: Expert in debugging pipelines and component logic on [Company] GitL
 ## 4. Troubleshooting Workflow
 - **Identity Check**: Confirm the user is authenticated via MCP to access the requested project and the centralized component repository.
 - **Commit Precision**: Retrieve the `CI_COMMIT_SHA` from the pipeline details to analyze the user's application code (e.g., Dockerfiles, manifests) as it existed at the time of failure.
-
 
 
 /my-agent-spike/
