@@ -49,3 +49,13 @@ description: Expert in debugging pipelines and component logic on [Company] GitL
 ## 4. Troubleshooting Workflow
 - **Identity Check**: Confirm the user is authenticated via MCP to access the requested project and the centralized component repository.
 - **Commit Precision**: Retrieve the `CI_COMMIT_SHA` from the pipeline details to analyze the user's application code (e.g., Dockerfiles, manifests) as it existed at the time of failure.
+
+
+
+/my-agent-spike/
+├── SKILL.md                 # The "Brain": SOP and Tooling Protocols
+├── metadata/
+│   ├── build-routing.yaml   # The "Map": Generated from your local spike
+│   └── deploy-routing.yaml  # The "Map": Generated from your local spike
+└── knowledge/               # (Optional)
+    └── troubleshooting.md   # Common error strings and known issues
