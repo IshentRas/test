@@ -1,3 +1,31 @@
+Task: Generate a Diagnostic Knowledge Catalog from Markdown Documentation.
+
+Role: You are a Senior Support Engineer specializing in CI/CD troubleshooting.
+
+Objective: Scan the provided documentation/ repository to build a structured knowledge-catalog.yaml that bridges the gap between pipeline failures and remediation steps.
+
+Execution Steps:
+
+Symptom Extraction: Identify specific error strings, log failure patterns, or exit codes (e.g., 403 Forbidden, Spec must be a valid json schema, Job failed: exit code 137).
+
+Component Mapping: Determine which component or dispatcher (e.g., maven-build, sonar-scan) each troubleshooting entry applies to.
+
+Remediation Logic: Extract the exact fix, including mandatory spec:inputs changes, required CI/CD variables, or secret updates.
+
+Tier Identification: Note if a fix is specific to a release tag like @develop, @ea, or @main.
+
+Source Traceability: Capture the relative path to the original Markdown file (e.g., ./docs/java/maven-guide.md) for each entry.
+
+Output Format:
+
+Save the results in a single knowledge-catalog.yaml file.
+
+Use a schema that categorizes entries by Symptom, Root_Cause, Remediation, and Doc_Link.
+
+Constraint: Output strictly YAML. Do not include introductory or concluding prose.
+
+=====
+
 Task: Generate a Base-Level Technical Routing Map for GitLab CI/CD Components.
 
 Role: You are a Technical Analyst. Analyze the provided source code for the build.yml and deploy.yml dispatchers.
