@@ -1,0 +1,27 @@
+Task: Generate a Multi-Tier Technical Routing Map for GitLab CI/CD Components.
+
+Role: You are a Principal Platform Engineer. Analyze the provided source code for the build.yml and deploy.yml dispatchers.
+
+Context: Our architecture uses a "Dispatcher" model where inputs and environment gates (branches/tags) determine which sub-templates are included. We operate on three tiers: develop (unstable), ea (early adopter/beta), and main (stable).
+
+Objective: Create two structured YAML files (build-routing.yaml and deploy-routing.yaml) that serve as a lookup table for an AI Support Agent.
+
+Output Requirements for each file:
+
+Input Schema: List every spec:input found in the dispatcher, including its type, default value, and any mandatory requirements.
+
+Logical Flow Mapping: Create a list of 'Flows'. For each flow, identify:
+
+ID: A descriptive name (e.g., java-maven-ea-flow).
+
+Environment Gates: Explicitly document rules tied to $CI_COMMIT_TAG, $CI_COMMIT_BRANCH, or specific component versions (e.g., @develop). Treat these as primary triggers.
+
+Logic Triggers: The specific combination of user inputs required to activate this path.
+
+Resulting Includes: A list of the sub-template files that are actually pulled in.
+
+Dependency Extraction: Identify any environment variables, secrets (e.g., VAULT_, ARTIFACTORY_), or runner tags that the resulting templates expect.
+
+Complex Rule Resolution: If a rules block is nested or uses complex boolean logic (&&, ||), simplify it into a "Truth Table" format within the YAML description.
+
+YAML Style Constraint: Keep the structure flat and highly organized. Use clear, consistent keys. Avoid long prose; the goal is for another agent to be able to "query" this YAML to find out which templates should be present in a user's pipeline.
