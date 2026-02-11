@@ -21,8 +21,6 @@ Variable Dependencies: Identify any environment variables or secrets (e.g., VAUL
 YAML Style Constraint: > Keep the output strictly technical and machine-readable. Use a flat structure. The goal is to create a "Truth Table" that maps what the user types to what the system includes.
 
 
-
-
 ---
 name: gitlab-internal-specialist
 description: Expert in debugging pipelines and component logic on [Company] GitLab Dedicated.
