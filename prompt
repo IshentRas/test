@@ -21,6 +21,38 @@ Variable Dependencies: Identify any environment variables or secrets (e.g., VAUL
 YAML Style Constraint: > Keep the output strictly technical and machine-readable. Use a flat structure. The goal is to create a "Truth Table" that maps what the user types to what the system includes.
 
 
+Task: Remote Contract Discovery for External GitLab Components.
+
+Role: You are a CI/CD Systems Integration Agent.
+
+Objective: Use the GitLab MCP to discover the inputs and requirements for five external components referenced in our primary dispatcher.
+
+Discovery Loop (Repeat for each of the 5 components):
+
+Target Identification: Extract the project path and version (e.g., @v2.1 or @main) from the include: component line in our internal templates/build.yml.
+
+Fetch Template Logic: Use the gitlab.get_file_content tool to retrieve the YAML content from the templates/ directory of the external project at that specific version.
+
+Input Contract Extraction: Parse the spec:inputs section. List:
+
+Mandatory: Inputs without a default.
+
+Optional: Inputs with a default.
+
+Types: Ensure data types match expected usage (e.g., string, boolean).
+
+Implicit Dependency Audit: Search the script or before_script for hardcoded environment variables or secrets (e.g., VAULT_ADDR, ARTIFACTORY_USER) that are not formally declared in the spec.
+
+Output Mapping: Create a YAML contract for this component.
+
+Output Constraint:
+
+Save each result as external-routing-[component-name].yaml in the ./routing/external/ directory of the skill folder.
+
+Ensure the schema is identical to our internal build-routing.yaml for consistency.
+
+
+
 =====
 
 ---
