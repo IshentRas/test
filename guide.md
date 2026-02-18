@@ -1,3 +1,49 @@
+
+terraform {
+  required_providers {
+    coder      = { source = "coder/coder" }
+    kubernetes = { source = "hashicorp/kubernetes" }
+  }
+}
+
+# 1. Get Coder User Identity
+data "coder_workspace_owner" "me" {}
+
+# 2. Execute Python Decryption Logic
+data "external" "decrypted_vault" {
+  program = ["python3", "${path.module}/decrypt_secrets.py"]
+
+  query = {
+    email       = data.coder_workspace_owner.me.email
+    public_key  = data.coder_workspace_owner.me.ssh_public_key
+    private_key = data.coder_workspace_owner.me.ssh_private_key
+  }
+}
+
+# 3. Create Kubernetes Secret
+resource "kubernetes_secret" "vault" {
+  metadata {
+    name      = "user-vault-decrypted"
+    namespace = "default"
+    labels = {
+      "app.kubernetes.io/managed-by" = "terraform"
+      "coder.owner"                  = data.coder_workspace_owner.me.name
+    }
+  }
+
+  # data.external.vault.result is a map like {"JIRA_TOKEN": "...", "GITLAB_TOKEN": "..."}
+  data = data.external.decrypted_vault.result
+
+  type = "Opaque"
+}
+
+# 4. Output the Secret Name for Deployment usage
+output "secret_name" {
+  description = "Name of the secret to be used in env_from"
+  value       = kubernetes_secret.vault.metadata[0].name
+}
+
+
 Hybrid Terraform Module: Secure Secret Retrieval & Decryption
 
 This document outlines a solution for retrieving encrypted secrets from AWS Secrets Manager (ASM), decrypting them locally using a user's Coder-managed SSH keys, and provision them as a Kubernetes Secret.
