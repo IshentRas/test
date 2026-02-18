@@ -1,4 +1,4 @@
-
+```hcl
 terraform {
   required_providers {
     coder      = { source = "coder/coder" }
@@ -42,7 +42,7 @@ output "secret_name" {
   description = "Name of the secret to be used in env_from"
   value       = kubernetes_secret.vault.metadata[0].name
 }
-
+```
 
 Hybrid Terraform Module: Secure Secret Retrieval & Decryption
 
