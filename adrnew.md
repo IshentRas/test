@@ -42,39 +42,65 @@ This custom authentication hook is deployed to the LiteLLM proxy to handle ident
 import ipaddress, hashlib, os
 from fastapi import Request, HTTPException
 
-# Corporate CIDR ranges (EKS Pods / Node IPs)
+# CIDR ranges for EKS Pods / Node IPs
 ALLOWED_CIDR = [ipaddress.ip_network(os.getenv("ALLOWED_CIDR", "10.0.0.0/8"))]
 
 async def user_api_key_auth(request: Request, api_key: str):
-    # 1. Network Lock (IP Provenance)
+    """
+    Custom authentication for LiteLLM.
+    Handles First-Use (Registry check) vs Cache-Miss (Redis check) correctly.
+    """
+    # 1. GATE 1: Network Lock (IP Provenance)
+    # Cheapest check: verify the request comes from the VPC.
     client_ip = ipaddress.ip_address(request.client.host)
     if not any(client_ip in net for net in ALLOWED_CIDR):
-        raise HTTPException(status_code=403, detail="VPC Access Required")
+        raise HTTPException(status_code=403, detail="VPC Access Required.")
 
-    # 2. Fast Path (Redis Cache)
-    auth_result = await litellm.proxy.proxy_server.user_api_key_cache.get_cache(api_key)
-    if auth_result and auth_result.get("metadata", {}).get("is_verified"):
-        return auth_result
+    # 2. GATE 2: Redis Cache Check (Ultra-Fast Path)
+    # We check if this specific key has already been verified in the last 12 hours.
+    cached_result = await litellm.proxy.proxy_server.user_api_key_cache.get_cache(api_key)
+    
+    if cached_result and cached_result.get("metadata", {}).get("is_verified"):
+        return cached_result
 
-    # 3. Identity Lock (Signature vs Metadata)
+    # 3. GATE 3: Registry Check (The "First Use" or "Cache Miss" Path)
+    # If not in Redis or not verified, we check the persistent LiteLLM database.
+    # This ensures we distinguish between a 'Fresh Key' and a 'Deleted Key'.
+    db_result = await litellm.proxy.proxy_server.db.get_api_key(api_key=api_key)
+    
+    if not db_result:
+        # Key has been deleted by Coder 'destroy' or is invalid.
+        raise HTTPException(status_code=401, detail="Invalid API Key: Not found in registry.")
+
+    # 4. GATE 4: Identity Lock (Slow Path: RSA Handshake)
+    # The key exists in the registry, now we verify the person using it matches the session.
     sig_header = request.headers.get("x-coder-signature")
-    if not sig_header: raise HTTPException(status_code=401)
+    if not sig_header: 
+        raise HTTPException(status_code=401, detail="Missing x-coder-signature header.")
 
     # Decrypt RSA Payload: [session_token]:[user_id]:[timestamp]:[nonce]
-    # (decrypt_rsa is a helper function using the Vault Private Key)
-    sig_token, _, _, _ = decrypt_rsa(sig_header) 
+    try:
+        # Note: decrypt_rsa is a helper utilizing the EKS/Vault-mounted Private Key
+        sig_token, _, _, _ = decrypt_rsa(sig_header) 
+    except Exception:
+        raise HTTPException(status_code=403, detail="Failed to decrypt session signature.")
     
-    # Cross-reference Session Token Hash
-    expected_hash = auth_result.get("metadata", {}).get("session_token_hash")
+    # Cross-reference Signature Token Hash vs Registry Metadata
+    # We retrieve the hash from the DB record's metadata
+    expected_hash = db_result.get("metadata", {}).get("session_token_hash")
     current_hash = hashlib.sha256(sig_token.encode()).hexdigest()
 
     if current_hash != expected_hash:
-        raise HTTPException(status_code=403, detail="Identity Mismatch")
+        print(f"SECURITY ALERT: Identity Mismatch for key {api_key[:8]}...")
+        raise HTTPException(status_code=403, detail="Identity Mismatch: Access denied.")
 
-    # 4. Promotion (Save verified state to Redis for 12 hours)
-    auth_result["metadata"]["is_verified"] = True
-    await litellm.proxy.proxy_server.user_api_key_cache.set_cache(api_key, auth_result, ttl=43200)
-    return auth_result
+    # 5. PROMOTION (Update Redis)
+    # We've verified identity. Promote to Redis to avoid DB/RSA hits for 12 hours.
+    # We merge the DB result with the verification flag.
+    db_result["metadata"]["is_verified"] = True
+    await litellm.proxy.proxy_server.user_api_key_cache.set_cache(api_key, db_result, ttl=43200)
+    
+    return db_result
 ```
 
 4. Implementation: External Path (Go Security Proxy) 🐹
