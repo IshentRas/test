@@ -1,5 +1,25 @@
 ODS (Octopus Deployment System) - Managed Octopus Deploy Service
 
+In modern DevOps pipelines, hardcoding secrets is a risk we can’t afford. Enter JWT-based authentication between Octopus Deploy and HashiCorp Vault — a clean solution to the Secret Zero Problem.
+
+🔐 What is the Secret Zero Problem?
+The “Secret Zero Problem” refers to the bootstrapping challenge: how does your system safely authenticate to a secrets manager without already needing a secret? If your CI/CD tool requires a Vault token or API key to retrieve secrets, you’ve just shifted the risk, not solved it.
+
+❌ Problem:
+Hardcoded secrets in pipelines
+Static tokens with long lifespans
+Rotation and revocation nightmares
+✅ Solution: Use JWT as Identity
+Octopus Cloud acts as a trusted identity provider.
+It generates short-lived JWT tokens with contextual claims (e.g., project, space).
+Vault verifies the JWT and issues a Vault token dynamically.
+👷 Scenario: Secure Deployment with No Hardcoded Secrets
+Let’s walk through how a pipeline in Octopus Cloud can:
+
+Authenticate to Vault using a JWT.
+Retrieve secrets scoped to that project.
+Use them securely in a deployment.
+
 This repository documents the architecture and engineering standards for ODS, a centralized managed deployment service powered by Octopus Deploy.
 
 1. Introduction
