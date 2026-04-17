@@ -1,0 +1,11 @@
+# Go build/test artifacts
+coverage.out
+*.test
+*.out
+
+# Local binaries
+test
+main
+
+# macOS
+.DS_Store
