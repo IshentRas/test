@@ -1,0 +1,89 @@
+Here is the Architecture Decision Record (ADR) capturing this zero-trust integration pattern. It avoids deep code syntax and focuses entirely on the structural topology, cryptographic handshakes, and platform governance mechanics.
+Architecture Decision Record (ADR)
+Title: Zero-Trust Workload Identity Federation for Ephemeral Coder Workspaces via GitLab Components
+Status: Proposed / Approved
+Context Date: May 2026
+Author: Platform Engineering Team
+1. Context & Problem Statement
+Our platform engineering team requires a secure mechanism to inject sensitive, scope-restricted GitLab Personal Access Tokens (PATs) into ephemeral Coder developer workspaces. These workspaces run highly autonomous tasks using advanced software generation agents like Claude Code.
+The Traditional Anti-Pattern
+Typically, a pipeline runner passes sensitive API variables down into an execution environment via standard plain-text transport layers, static secrets, or long-lived keys. If an autonomous AI agent or an underlying script leaks the environmental block or stores tracking files incorrectly inside the container workspace, the credentials become exposed, broadening the organization's blast radius.
+Architectural Objectives
+Zero Static Credentials: No pre-shared or long-lived infrastructure access tokens can be stored on the GitLab runner host or inside the persistent Coder database profiles.
+Identity Attestation: Every network interface calling the backend infrastructure must cryptographically prove exactly who it is and how it was executed.
+End-to-End Encryption: Credentials must remain opaque while traveling across network planes, decrypting only inside the dedicated target workspace memory space.
+2. Proposed Design Strategy
+We are implementing an asymmetric, workload-federated identity broker model. This architecture relies on an automated Bootstrap Service, a platform-managed GitLab CI/CD Component, and the native cryptographic key generation functions embedded directly into Coder.
+Architectural Topology
+
+
+
+[ GitLab Pipeline Job ]
+         |
+    (1) Authenticates via OIDC JWT
+         v
+  [ Bootstrap Service ] <==== (Periodic Sync) ====> [ HashiCorp Vault ]
+         |                                             (Keychain Engine)
+    (2) Verifies JWT Signature & Audience
+    (3) Provisions 12h Coder Token
+    (4) Pulls Coder Headless User Ed25519 PubKey
+         |
+         v
+[ GitLab Pipeline Job ]
+    (5) Extracts Project PAT from Team Vault Namespace
+    (6) Performs Birational Map: Ed25519 ➔ X25519
+    (7) Seals PAT via Asymmetric Curve Encryption
+    (8) Launches Coder Task via Ephemeral Coder Token
+         |
+         v
+[ Ephemeral Coder Workspace ]
+    (9) Injects Encrypted PAT Blob to Environment Memory
+   (10) Workspace local agent mounts unique native Private Key
+   (11) Decrypts PAT in-memory using matching X25519 conversion
+   (12) Claude Code executes tasks safely
+         |
+    (13) Pipeline concludes -> Hard revokes Coder Token via Bootstrap
+
+
+3. Detailed Component Breakdown
+A. The Bootstrap Service (Identity Broker)
+The Bootstrap service functions as an isolated validation gate between GitLab and Coder. It does not store application state or transaction assets.
+Token Minting: Upon validating an incoming OpenID Connect (OIDC) JSON Web Token (JWT) from a runner, the service contacts Coder as an administrator to create a short-lived session token (e.g., 12-hour expiration window) mapped specifically to a unique headless service account tracking that project.
+Audience-Bound Verification: To guarantee the bootstrap service only accepts traffic originating directly from our corporate GitLab architecture, it evaluates the aud (audience) claim within the OIDC payload.
+B. The GitLab Component & The Cryptographic Trademark
+To prevent engineers from bypassing our architectural frameworks and calling the bootstrap API manually using generic curl commands, we enforce a strict cryptographic signature inside the OIDC payload itself.
+The Go CLI Helper: The platform team distributes a compiled Go command-line tool embedded inside the central GitLab Component engine.
+The Encrypted Audience Handshake: At runtime, this Go helper reads the active timestamp and the global $CI_PIPELINE_ID, encrypts this payload using a symmetric signing key, and passes the resulting ciphertext string to GitLab as the requested aud target parameter.
+The Dynamic Vault Keychain: An isolated Apache Airflow DAG generates a new key weekly and commits it to a HashiCorp Vault Key-Value (v2) path. The Go helper compiles against the latest version via compiler linker flags (-ldflags). Concurrently, the Bootstrap service executes a Dual-Trigger Refresh Strategy—reading the metadata trail on application startup and running an internal hourly background sweep loop to build a rolling 3-week verification keychain. This matrix easily validates the component's identity while effortlessly absorbing weekly rotation shifts without breaking active pipelines.
+C. Birational Elliptic Curve Encryption (Ed25519 ➔ X25519)
+We leverage Coder's native security framework: Coder automatically creates an Ed25519 elliptic curve key pair for every service account. The public key is easily queryable via control plane endpoints, while the private key is securely injected exclusively into that specific workspace's runtime container instance.
+The Cryptographic Hurdle: Ed25519 is architected for signature verification, not data encryption.
+The Conversion: The GitLab component extracts the public key from the bootstrap response and runs a birational mapping calculation, transitioning the Ed25519 keyspace into an X25519 keyspace suitable for Diffie-Hellman anonymous sealed-box encryption. The project PAT is encrypted using this derived key.
+In-Memory Decryption: The workspace container reads its local, natively mounted private key string, maps it to X25519, and strips away the cryptographic seal inside the process memory space. The plain-text asset is never committed to a physical storage disk or exposed to standard process trees where an automated tool or third-party package could intercept it.
+D. Active Invalidation Lifecycle
+We actively bind the lifecycle of access privileges to the physical lifespan of the automation run. While tokens carry a maximum 12-hour failure fallback window, the GitLab Component includes a declarative teardown command inside the global after_script pipeline phase. This final command targets the unique tracking ID mapping (tied directly to the unique, global $CI_PIPELINE_ID) and issues a hard revocation command back to Coder, destroying the active session instantly upon job completion.
+4. Why This Architecture Embodies "Zero Trust"
+Vector
+Traditional Model Risk
+This Federated Approach
+Transport Security
+Credentials can be captured via server logs, intermediate reverse proxies, or network dumps.
+Data is encrypted at the source using keys that belong solely to the target workspace container. It travels as opaque ciphertext across all routers.
+Secret Longevity
+Stored PATs or static API tokens remain valid until manually rotated, resulting in permanent risk windows if leaked.
+Tokens are dynamic and expire within hours if left unmanaged, or are destroyed instantly via active cleanup hooks.
+Identity Verification
+Anyone holding an active security string can impersonate a system from any terminal.
+The system verifies the GitLab OIDC root keys, validates the exact executing project signature, and matches the component's cryptographic trademark proof before granting access.
+Workspace Boundary
+Credentials sit as plain-text system configuration files (.gitconfig or .env maps) accessible to any running task.
+The secret token is decrypted straight into transient execution memory. The workspace private key handles the operation natively without writing a private seed to a physical file.
+
+5. Consequences & Trade-offs
+Positive Impact
+Zero Standing Risk: Eliminates manual secret rotation cycles and configuration management databases for CI/CD keys.
+Granular Auditing: Central operations teams can easily inspect the Coder event stream and trace active token IDs back to a specific, unique GitLab pipeline instance.
+Complete Workspace Isolation: An LLM engine like Claude Code can run high-privilege operations within its localized sandbox without ever possessing the capability to scrape or extract the organization's overarching credential infrastructure.
+Constraints / Operational Guardrails
+Cryptographic Complexity: Teams writing or supporting the underlying components must understand elliptic curve conversions (Ed25519 to X25519) rather than basic password hashing blocks.
+System Dependencies: Smooth operation requires consistent availability across both HashiCorp Vault and the custom Bootstrap API layers during initial pipeline launch phases. This is mitigated by our fallback caching mechanism, which ensures the bootstrap service retains existing valid key material if a sudden network failure hits Vault during a routine background check.
