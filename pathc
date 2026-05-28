@@ -1,0 +1,139 @@
+Context
+
+A subset of developers must run workloads locally on Windows workstations (using tools like claude-code) rather than inside isolated Linux container environments in Coder. To support this without expanding our attack surface, we must enforce two-stage IP-to-machine location binding and prevent the reuse of encrypted Vault credentials outside of authorized locations.
+
+Additionally:
+
+We must avoid exposing raw LLM keys to the local laptop filesystem.
+
+We cannot rely on brittle Active Directory (AD) Keytab files, which require heavy governance and lengthy enterprise approval pipelines.
+
+We cannot rely on querying active Coder workspace status on the runtime "hot path" because developers may shut down their workspaces to save compute costs while continuing to execute local laptop tools using the same network IP.
+
+The proxy must self-heal seamlessly after a crash/restart without forcing the developer to re-execute a manual synchronization loop.
+
+Decision
+
+We will implement an Out-of-Band Workspace-Signed Handshake with Stateless Rehydration Cookies (Path C). This architecture uses asymmetric cryptography (the user's workspace SSH key pair), dynamic network IP locking, and server-side encrypted session states.
+
+1. The Core Lifecycle States
+
+Phase A: Workspace Signature Generation
+
+Inside the active Coder workspace, the developer runs a native signature utility. This utility reads their private SSH key (~/.ssh/id_ed25519) and cryptographically signs a payload containing their corporate ciphertext and a timestamp:
+
+
+$$\text{Signed Message} = \text{Ciphertext} + \text{":"} + \text{Timestamp}$$
+
+
+The script outputs the resulting signature block and timestamp.
+
+Phase B: The Laptop Sync Handshake (/api/v1/sync)
+
+On their local workstation, the developer runs a lightweight native Go utility (sync-ip.exe) that detects their local MachineName (hostname) and sends a lean packet to the proxy:
+
+{
+  "machine_name": "LT-WALT-01",
+  "timestamp": "2026-05-28T23:30:00Z",
+  "signature": "AAAAH3NzaC1lZDI1NTE5..."
+}
+
+
+The Go Proxy processes this payload:
+
+Identity Resolution: It looks up "LT-WALT-01" in a configuration ledger to resolve the owner (e.g., walter@corp.com).
+
+Key Retrieval: It queries the Coder API to pull Walter's registered public SSH keys.
+
+Decryption & Extraction: It verifies the signature. If valid, it extracts the raw ENC(...) ciphertext envelope directly from the verified signature payload.
+
+ARM Memory Mapping: It computes the SHA256 hash of the extracted ciphertext and registers a map entry in local RAM where the unsealed key is left blank:
+
+laptopRegistry.sessions["LT-WALT-01"] = &LaptopSession{
+    MachineName:    "LT-WALT-01",
+    LockedClientIP: clientIP,             // Extracted from TCP connection socket
+    CiphertextHash: sha256(extractedCiphertext),
+    DecryptedKey:   "",                   // LEFT BLANK
+    Expiration:     time.Now().Add(24 * time.Hour),
+}
+
+
+Sealed Cookie Generation: It packages the session metadata (MachineName, clientIP, ciphertext_hash, expiration) into an opaque token encrypted with SERVER_MASTER_KEY (AES-GCM) and returns it to the client as an X-Session-State cookie token.
+
+Phase C: Runtime Hot Path & JIT Unwrapping
+
+When the developer runs claude-code, the tool passes the headers:
+
+X-Machine-ID: LT-WALT-01
+
+X-Session-State: [Opaque Cookie String]
+
+Authorization: Bearer ENC(...)
+
+The proxy checks its in-memory map. If the incoming IP matches the LockedClientIP and the hash of the incoming ENC(...) matches the CiphertextHash:
+
+If DecryptedKey is blank, it calls Vault Transit to unseal the key, caches it in RAM, and forwards it to the upstream LLM provider.
+
+If DecryptedKey is populated, it instantly swaps the authorization header in microseconds.
+
+Phase D: Stateless Rehydration (Crash Recovery)
+
+If the Go Proxy crashes, auto-scales, or recycles, its volatile local RAM cache is wiped. When the next request arrives:
+
+The proxy encounters a cache miss for LT-WALT-01.
+
+It decrypts the incoming X-Session-State header using SERVER_MASTER_KEY.
+
+It validates that the incoming request IP matches the token's embedded LockedClientIP and that the SHA256 of the incoming ciphertext matches CiphertextHash.
+
+If they match, the proxy instantly rehydrates the RAM map row on the fly, performs the JIT Vault unseal, and routes the traffic seamlessly.
+
+Technical Architecture Overview
+
+                               STATE EVOLUTION LIFE CYCLE
+                               
+   [Workspace]              [Laptop CLI]            [Go Proxy Gateway]       [HashiCorp Vault]
+        |                        |                          |                        |
+        | 1. Generate Sig        |                          |                        |
+        |    (Signs Ciphertext)  |                          |                        |
+        |----------------------->|                          |                        |
+        |                        | 2. POST /api/v1/sync     |                        |
+        |                        |    (Sig & MachineName)   |                        |
+        |                        |------------------------->|                        |
+        |                        |                          | 3. Query Coder (Pub Key)
+        |                        |                          | 4. Verify & Parse Sig  |
+        |                        |                          | 5. Generate State Cookie
+        |                        | 6. Return State Cookie   |                        |
+        |                        |<-------------------------|                        |
+        |                        |                          |                        |
+        |                        | 7. Claude API Request    |                        |
+        |                        |    (Headers: State Cookie|                        |
+        |                        |     Machine, Ciphertext) |                        |
+        |                        |------------------------->|                        |
+        |                        |                          | 8. Verify IP & Hash    |
+        |                        |                          | 9. JIT Vault Unseal    |
+        |                        |                          |----------------------->|
+        |                        |                          | 10. Cache plain key    |
+        |                        |                          |<-----------------------|
+        |                        |                          |                        |
+        |                        |                          | 11. Stream Upstream    |
+        |                        |                          |------------------------> [Anthropic]
+
+
+Consequences
+
+Security Posture
+
+Cryptographic Binding: Stolen ciphertexts cannot be replayed or hijacked on unauthorized laptops because an attacker cannot sign the sync request without owning the corresponding private SSH key inside an active workspace.
+
+Zero Credential Exposure: The raw LLM key is never written to disk, and is only unsealed into the volatile, short-lived memory of the proxy cluster.
+
+Independence from Active Directory: No dedicated domain computer objects, Service Principal Names (SPNs), or AD Keytab mounts are required inside the EKS cluster.
+
+Operations & Resilience
+
+Airtight Crash Resilience: Developers experience zero session dropouts during proxy crashes, scaling, or rolling deployments. The X-Session-State cookie serves as the ultimate stateless recovery vector.
+
+High-Performance Scaling: Rehydration checks are completely decentralised; any scaled proxy replica pod sharing the same SERVER_MASTER_KEY can decrypt the incoming state cookie and rehydrate its own local RAM cache inline on the fly.
+
+VPC Self-Service Updates: If a developer's home IP shifts, they simply rerun the sync tool. The proxy seamlessly overwrites the old memory row and generates a fresh 24-hour cookie.
