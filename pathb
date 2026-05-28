@@ -1,0 +1,123 @@
+Architecture Decision Record (ADR-005): Zero-Trust Stateful Decryptor Proxy (Path B)
+
+Status
+
+Approved (v5.0 - Dynamic Handshake, Lifecycle Anchoring & Self-Healing Rehydration)
+
+Context
+
+Our platform integrates third-party LLM providers (e.g., Anthropic) with developer tooling inside Coder workspaces. Because these vendor-issued keys (like sk-ant-...) are long-lived and cannot be instantly revoked or dynamically managed at the source, we face a critical risk of credentials leaking outside our corporate boundaries.
+
+Our original "Path B" proposal suggested encrypting the raw keys using HashiCorp Vault Transit and injecting them into workspaces as ENC(...) environment variables to be intercepted and decrypted JIT by an internal Go Proxy.
+
+The Cryptographic & Replay Flaw (Crucial Realization)
+
+During security review, we identified a fatal architectural flaw: the Go Proxy was acting as a "blind decryptor." If an engineer extracted the ENC(vault:v1:...) string from their workspace environment variables and shared it with an unauthorized user, that attacker could use the ciphertext from anywhere. The proxy would decrypt it indiscriminately because it had no mechanism for verifying who was passing the ciphertext, only that the ciphertext itself was valid. This stripped away non-repudiation and made the gateway vulnerable to credential reuse and location-tampering.
+
+Decision
+
+We decided to implement a Stateful Zero-Trust Gatekeeper pattern in our Go Proxy. Instead of static, blind decryption, we enforce a dynamic two-stage handshake that strictly binds a workspace's identity, its live build state, its cryptographic payload integrity, and its network origin.
+
+1. Key Design Tenets
+
+Stateless Key Delivery: The Go Proxy stores no master encryption keys or plain-text LLM tokens on disk. It delegates all cryptographic operations to HashiCorp Vault's Transit Secret Engine via AWS IAM authentication (IRSA).
+
+Cryptographic Context Binding: The proxy instructs Vault Transit to decrypt the payload using the WorkspaceID as the cryptographic context. Vault Transit mathematically rejects the decryption if the Workspace ID does not match.
+
+Blank-Slate Handshake (Dynamic IP Anchoring): We do not pre-register client IP addresses. At startup, the proxy seeds a blank entry. The network location is dynamically captured and permanently locked to that workspace on its first active API request.
+
+Integrity Validation (SHA256 Hash Matching): To prevent spoofing, the proxy hashes the incoming ciphertext and verifies it against the immutable ciphertext_hash stored as metadata inside the Coder Control Plane.
+
+Self-Healing Recovery (Lazy Rehydration): If the proxy crashes or restarts, its in-memory table is wiped. Instead of failing active developer sessions, the next API request triggers a lazy rehydration workflow that queries Coder, verifies the hash, and dynamically restores the locked session state in memory.
+
+Transition Synchronization: Coder modules explicitly hit the proxy's /api/v1/lifecycle endpoint during workspace mutations (start, stop, delete) to ensure real-time state purging.
+
+Technical Architecture & State Machine
+
+                              CODER RUNTIME LIFE CYCLE
+                              
+  [Coder Module]                  [Go Decryptor Proxy]               [Vault Transit]
+        |                                  |                                |
+        | 1. POST /api/v1/lifecycle        |                                |
+        |--------------------------------->|                                |
+        |                                  | 2. Query Coder (Verify State)  |
+        |                                  | 3. Seed Blank-Slate Entry      |
+        |                                  |    (IP="", Key="")             |
+        |                                  |                                |
+  [Developer CLI]                          |                                |
+        |                                  |                                |
+        | 4. First HTTP Request (Claude)   |                                |
+        |--------------------------------->|                                |
+        |                                  | 5. HANDSHAKE PHASE:            |
+        |                                  |    - Read client IP            |
+        |                                  |    - Verify SHA256 vs Coder    |
+        |                                  |    - Decrypt via Transit Context|
+        |                                  |------------------------------->|
+        |                                  |                                |
+        |                                  | 6. Save (IP, DecryptedKey)     |
+        |                                  |    Cache TTL = 24h             |
+        |                                  |<-------------------------------|
+        |                                  |                                |
+        | 7. Forward (Decrypted Key)       |                                |
+        |------------------------------------------------------------------------> [LLM]
+
+
+The State Evaluation Matrix (Request Path)
+
+Memory Record Exists?
+
+IP is Blank?
+
+Incoming IP Matches?
+
+Action Taken
+
+No
+
+N/A
+
+N/A
+
+Trigger Lazy Rehydration: The proxy likely restarted. Query Coder, verify the SHA256 hash of the ciphertext, decrypt via Transit, rebuild the session, and lock the current IP.
+
+Yes
+
+Yes
+
+N/A
+
+Dynamic Handshake: This is the first request. Out-of-band validate the workspace state with Coder, decrypt via Transit, and lock the incoming IP to the session record.
+
+Yes
+
+No
+
+Yes
+
+Hot Path Forward: The request matches the locked profile. Swap the header instantly and stream to the upstream LLM (sub-millisecond latency).
+
+Yes
+
+No
+
+No
+
+Security Breach Block: Network location has changed mid-session. Corrupt the authorization header and drop/reject the traffic.
+
+Consequences
+
+Security Posture (Zero-Trust)
+
+Non-Repudiation Guaranteed: Every API call routed to the upstream LLM is mathematically tied to a specific Workspace ID and validated client IP.
+
+Zero Credential Usability Outside VPC: Stolen ciphertexts are completely inert; an attacker cannot utilize them without owning a valid running workspace, passing a strict SHA256 integrity check, and matching the dynamically anchored network location.
+
+No Secret Sprawl: Static private keys are removed from the filesystem. The proxy uses temporary, auto-refreshing Vault tokens via IAM authentication.
+
+Performance & Scalability
+
+Extremely Low Overhead: For 99.9% of traffic, the proxy executes a simple lockless map check and string substitution. High-speed, non-blocking Go channels stream SSE payloads (chat typing effect) to the client with zero buffering delay.
+
+Long Cache Lifespan (24 Hours): Since we explicitly handle real-time eviction through Coder lifecycle endpoints and self-heal after proxy crashes, a long-lived 24-hour cache TTL is safe, significantly reducing Vault and Coder API load.
+
+Horizontal Scaling: The proxy is stateless across multiple pods. Multiple proxy replicas can run behind an AWS NLB because any pod can independently rehydrate any active session if a load balancer routes traffic to a replica missing the local cache entry.
