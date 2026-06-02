@@ -1,0 +1,30 @@
+The 3 Core Pillars of the Pitch
+Pillar 1: Attestation vs. Cryptographic Enforcement (The Key Risk)
+The Current Posture: The standard approach relies on user attestation—asking developers to sign a policy promising they won't share keys, leak data, or misbehave.
+The Coder Reality: In a bank, an "honor system" is a compliance failure. With Coder, we have moved to cryptographic enforcement. The developer and the agent never see, hold, or touch the upstream enterprise API keys. They are abstracted away entirely and injected at runtime via Vault. If you don't possess the key, you cannot leak it.
+Pillar 2: Data Provenance & Repo Guardrails (The Code Protection Risk)
+The Current Posture: Tools like Claude Code out-of-the-box rely on the developer's behavior to not point the agent at sensitive codebases (like core ledger repositories, HR data, or proprietary trading algorithms).
+The Coder Reality: We don't rely on developer behavior. We built an automated provenance check directly into the orchestration plane. Coder maintains an ironclad deny-list of restricted repositories. The moment an agent requests context, the control plane automatically validates the repository's origin. If it matches a restricted corporate asset, the request is dropped immediately before a single line of code is sent to the LLM. It is systematic, not behavioral.
+Pillar 3: Endpoint Vulnerability vs. Hardened Cloud Architecture (The System Risk)
+The Current Posture: Securing a developer's physical laptop against an autonomous agent is a security nightmare. Agents running locally have broad system access, making ingress/egress filtering incredibly difficult to enforce at the machine level.
+The Coder Reality: Coder shifts the risk completely off the endpoint. The developer workspace doesn't run on the laptop; it runs in the cloud as a strictly non-privileged container (pod).
+Isolation: The agent operates inside a locked-down sandbox with zero root privileges, making local system tampering impossible.
+Network Perimeter: Because the workspace lives in our cloud infrastructure, we have absolute control over ingress and egress. We dictate exactly what networks the workspace can talk to, entirely bypassing the vulnerabilities of local endpoint security.
+Security Vector
+The Out-of-the-Box Approach
+The Coder Framework
+Credential Safety
+Attestation: "Please don't leak the keys."
+Enforcement: Keys are hidden in Vault; zero local exposure.
+Code Governance
+Behavioral: Relying on the dev to avoid sensitive repos.
+Provenance-Based: Hard deny-lists block restricted repos at the proxy layer.
+Blast Radius
+High Risk: Agent runs locally on the physical endpoint.
+Contained: Agent runs in a non-privileged, isolated cloud pod.
+Network Control
+Fragmented: Hard to police egress on local laptops.
+Absolute: Tight cloud perimeter controls all data flowing in and out.
+
+Closing the Meeting
+The question isn't whether the bank will adopt agentic tools like Claude Code—engineers will always find a way to use them to move faster. The question is whether we do it via an unenforceable honor system on local laptops, or through a hardened control plane like Coder where security boundaries are cryptographically and structurally enforced. We are ready to demonstrate this control in a isolated, audited pilot.
