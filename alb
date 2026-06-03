@@ -1,0 +1,47 @@
+Migration of coder Control Plane Ingress from AWS NLB to AWS ALB
+
+Status
+Proposed
+
+Context
+The coder control plane (based on Coder Open Source) currently runs inside an Amazon EKS cluster deployed on AWS Bottlerocket nodes. Ingress traffic was historically managed via an AWS Network Load Balancer (NLB) operating at Layer 4.
+
+Following a Distributed Denial of Service (DDoS) event on the control plane, the team attempted to mitigate the attack by enabling application-layer rate limiting. However, this implementation was blocked due to a critical infrastructure conflict:
+
+IP Masking: By default, the NLB targets pods using internal cluster IP addresses, masking the true client origin IP in application logs and rate-limiters.
+
+Asymmetric Routing: Attempting to enable packet-level Client IP Preservation (preserve_client_ip: true) on the NLB causes an asymmetric routing failure on our Bottlerocket nodes. Because coder developer workspaces live inside the same EKS cluster network space, traffic originating from a workspace container routing out to the NLB returns to the cluster with its native pod source IP intact. The host Linux kernel attempts an internal routing "shortcut" back to the workspace container rather than passing the packet back through the load balancer, leading to mismatched signatures and instant connection drops.
+
+Proxy Protocol Complications: Forcing Layer 4 Proxy Protocol v2 onto the NLB breaks socket communication at the Coder pod entrance, as Coder expects standard TCP/TLS frames rather than prepended binary routing metadata at its entry listener.
+
+We require a solution that cleanly exposes the client's true IP for application rate-limiting without breaking internal workspace-to-control-plane communication.
+
+Decision
+We will migrate the coder control plane ingress layer from an AWS Network Load Balancer (NLB) to an AWS Application Load Balancer (ALB) utilizing the AWS Load Balancer Controller.
+
+The implementation will enforce the following architectural patterns:
+
+L7 Termination: The ALB will handle TLS termination and connection management at the AWS infrastructure edge.
+
+HTTP Header Injection: The ALB will natively inject the original client's IP into the standard HTTP X-Forwarded-For header.
+
+Standard Internal Routing: The ALB will establish completely distinct, new internal connections to the EKS nodes using standard private VPC IPs, resolving the Bottlerocket asymmetric routing bug entirely.
+
+Coder Native Limiting: The Coder Helm deployment will be updated to explicitly trust the ALB's internal network CIDR range using CODER_PROXY_TRUSTED_HEADERS and CODER_PROXY_TRUSTED_ORIGINS.
+
+Consequences
+Positive Changes
+DDoS Hardening: Coder can now natively track unique external client IPs and successfully apply 429 Too Many Requests rate limiting to malicious actors without inadvertently blocking the entire load balancer footprint.
+
+VPC Routing Stability: Internal workspace-to-control-plane traffic remains completely healthy and un-impacted by TCP signature drops.
+
+Simpler Footprint: Avoids the operational overhead, resource consumption, and maintenance of building or managing a custom Go throttling proxy or in-cluster NGINX daemonsets.
+
+WAF Compatibility: Moving to an ALB opens up a clean future path to attach AWS WAF directly at the AWS cloud edge, dropping volumetric attacks before they consume EKS compute or database connections.
+
+Negative Changes / Trade-offs
+Layer 7 Overhead: Moving from Layer 4 (NLB) to Layer 7 (ALB) introduces minor protocol handling latency, though negligible for the coder web and workspace routing patterns.
+
+Public Domain Mapping: Requires shifting DNS targets and TLS certificate mapping rules from the old NLB target groups to the newly generated ALB ingress endpoint.
+
+Let me know if you need to adjust any specific security or naming conventions to match your internal wiki style!
