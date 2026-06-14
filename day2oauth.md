@@ -1,12 +1,5 @@
 # Architecture Decision Record (ADR)
 
-**Document ID:** `ADR-2026-004`  
-**Status:** `APPROVED`  
-**Title:** Day 2 Dynamic OAuth2 Token Rotation for Long-Running Model Context Protocol (MCP) Servers via Go Loopback Proxy  
-**Date:** June 14, 2026  
-**Author:** Platform Engineering Architecture Team  
-
----
 
 ## 1. Context and Problem Statement
 
