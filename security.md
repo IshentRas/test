@@ -111,6 +111,7 @@ If a developer or a rogue agentic script attempts a privilege escalation or host
 * **Stateless Compute Execution:** Secure Coder separates compute from state. Workspaces are completely ephemeral; upon every manual restart, automated stop, or lifecycle timeout, the container compute layer is entirely destroyed. A pristine container built from the latest, fully patched master image is deployed in its place.
 * **Bloat Isolation:** Persistent user state is strictly isolated to a single volume mount at `/home/coder`. Any configuration drift, untrusted caching, or malicious binaries written to filesystem roots outside this specific path are wiped clean during the recycle phase.
 * **Wiz Hybrid Defense Matrix:** On AWS, **Wiz** takes agentless snapshots of underlying EBS storage blocks out-of-band to scan `/home/coder` for malicious payloads. Concurrently, a **Wiz Kubernetes Runtime Sensor** runs live on the workspace namespace, utilizing eBPF to monitor active processes inside the running container for real-time threat detection.
+* **Wiz Container Registry SCA Scanning:** Before any master workspace image is registered and approved in the enterprise container registry for deployment, it undergoes automated Software Composition Analysis (SCA) via **Wiz**. Images containing high-severity vulnerabilities or unapproved packages are blocked from provisioning.
 
 ### Layer 5: The Vault Transit Token Moat (Path B & Path C)
 
@@ -163,6 +164,35 @@ Secure Coder implements strict control logic that is fundamentally impossible to
 * **Repository Provenance Interdiction Hook:** Managed infrastructure settings inject a pre-execution hook that validates the remote metadata of any Git repository the agent attempts to interact with. If a developer attempts to clone or process an unvetted public fork or a blacklisted repository, the hook intercepts the operation, blocks the action, and **instantly disables the Claude agent engine**.
 * **Git Pre-Hook Quarantine Trigger:** Secure Coder forces mandatory Git pre-hooks (for secrets scanning, code quality, and branch compliance). If a developer or a rogue script attempts to tamper with, comment out, or delete these security pre-hooks, an internal watcher triggers the **Platform Quarantine Protocol**: the user's account is instantly suspended globally, active workspace containers are forcefully terminated, and the underlying storage state is frozen strictly for SecOps forensic investigation.
 * **Pure OAuth2 Authentication:** The platform eliminates the use of long-lived Personal Access Tokens (PATs) or static SSH keys inside `~/.ssh`. All git operations are authenticated via short-lived, scoped OAuth2 tokens generated dynamically during the Coder-GitLab handshake.
+
+### Layer 7: Approved LLM Gateway Governance (LiteLLM & Bedrock)
+
+Rather than allowing developer workspaces to execute direct, unmonitored HTTP requests to public external AI vendor endpoints, Secure Coder routes all LLM API traffic through a centralized, hardened gateway:
+
+* **Inference Endpoint Decoupling:** Workspaces communicate only with an internal Go Proxy sidecar, which forwards requests to a central **LiteLLM Proxy** hosted securely in our corporate AWS perimeter.
+* **PII & Data Loss Prevention (DLP):** The LiteLLM Proxy inspects outbound requests, automatically detecting and redacting sensitive parameters, credentials, or PII before forwarding them upstream.
+* **Centralized Compliance Auditing:** Prompt and completion telemetry is logged to a secure, write-once AWS S3 bucket. This ensures full compliance visibility and allows SecOps to audit AI behavior without introducing local laptop logging agents.
+* **Strict Egress Pinning:** Outbound traffic from the Go Proxy is constrained at the network level to the LiteLLM gateway using AWS PrivateLink / VPC Endpoints, preventing workspaces from calling unauthorized external models.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Workspace as Workspace (Claude Code)
+    participant GoProxy as Go Decryptor Proxy (Sidecar)
+    participant LiteLLM as LiteLLM Gateway
+    participant Audit as S3 Compliance Audit Lake
+    participant Bedrock as AWS Bedrock (Claude)
+
+    Workspace->>GoProxy: Inference request (Ciphertext Key)
+    GoProxy->>GoProxy: Decrypts key JIT via Vault
+    GoProxy->>LiteLLM: Passes payload to Gateway (Internal VPC)
+    LiteLLM->>LiteLLM: Runs DLP/PII sanitization sweep
+    LiteLLM->>Audit: Logs telemetry (Audit log)
+    LiteLLM->>Bedrock: Invokes model securely via IAM Role
+    Bedrock-->>LiteLLM: Streams completion tokens
+    LiteLLM-->>GoProxy: Forwards sanitized token stream
+    GoProxy-->>Workspace: Streams completion to Claude CLI
+```
 
 ---
 
