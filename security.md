@@ -15,118 +15,43 @@ The following diagram illustrates the complete data flow, identity validation, a
 
 ```mermaid
 graph TB
-    subgraph Corporate_Boundary ["Approved Corporate Infrastructure Pattern"]
-        subgraph Ingress ["Edge & Identity Control"]
-            ALB["AWS ALB / Local Proxy<br>(L7 Traffic Forwarder)"]
-            Ping["PingFederate IDP<br>(Enterprise SSO AuthN)"]
+    subgraph Corporate_Boundary ["Approved Corporate Perimeter"]
+        ALB["Enterprise ALB / Gateway<br>(SSO AuthN & Rate Limiting)"]
+        Control["Secure Coder Control Plane<br>(RBAC & Provisioning Engine)"]
+        
+        subgraph Security_Services ["Shared Security Boundary"]
+            Vault["HashiCorp Vault Enclave<br>(Transit & Dynamic Secret Engines)"]
+            Compliance["Compliance & Quarantine Services<br>(Airflow Sweeps & Account Freeze)"]
         end
 
-        subgraph Control_Plane ["Coder Open Source Control Plane"]
-            RL["Built-in Rate Limiter"]
-            RBAC["Custom RBAC Gatekeeper<br>(Terraform Execution Graph Interceptor)"]
-            C_Engine["Coder Core Daemon"]
-        end
-
-        subgraph Vault_Enclave ["Vault Security Boundary"]
-            Vault["HashiCorp Vault"]
-            Transit["Transit Secrets Engine<br>(Master Keys Non-Exportable)"]
-            DynamicDB["Database Secrets Engine<br>(Monthly DB Auto-Rotation)"]
-            DynamicLDAP["LDAP Secrets Engine<br>(Monthly AD Auto-Rotation)"]
-        end
-
-        subgraph Storage_State ["State & Core Dependencies"]
-            RDS["AWS RDS Metadata DB<br>(Dynamic Credentials Only)"]
-            AD["Active Directory<br>(Dynamic Credentials Only)"]
-        end
-
-        subgraph Orchestration ["Automated Policy Compliance"]
-            Airflow["Apache Airflow Scheduler<br>(Hourly Batch Access Sweep)"]
-            Quarantine["Quarantine & Suspension Engine<br>(Immediate Global Lockout & Freeze)"]
-        end
-
-        subgraph Execution_Targets ["Target Hosting Environments (Business Demand)"]
-            subgraph AWS_EKS ["AWS EKS Cluster"]
-                BR["Host OS: Bottlerocket<br>(Immutable / Read-Only Root)"]
-                EBS["EBS Volumes<br>(/home/coder persistence)"]
-                WizSnap["Wiz Agentless Block Scan"]
-            end
-
-            subgraph On_Prem_OCP ["Private Cloud OpenShift"]
-                RHCOS["Host OS: RHCOS<br>(Immutable / Read-Only Root)"]
-                PVC["On-Prem Storage Class<br>(/home/coder persistence)"]
-            end
-        end
-
-        subgraph Sandbox_Namespace ["Hardened Sandbox Namespace"]
-            WizSensor["Wiz K8s Runtime Sensor<br>(Live eBPF Behavioral Monitoring)"]
-            
+        subgraph K8s_OCP_Hosts ["Sandboxed Hosting Environments"]
+            direction TB
             subgraph Workspace_Pod ["Workspace Sandbox Pod"]
-                Config["Root-Owned ConfigMap<br>(0444 Read-Only Claude Profile)"]
-                Seccomp["Restricted V2 PSS / Seccomp<br>(Syscall Filter)"]
-                GoProxy["Go Proxy Sidecar<br>(Decoupled Vault Client)"]
-                GitHooks["Root-Managed Git Pre-Hooks<br>(Tamper Watch Sensor)"]
-                Workspace["Active Workarea<br>(Consuming Claude Code)"]
+                Workspace["Secure Developer Workspace<br>(Claude Code runtime)"]
+                GoProxy["Go Decryptor Proxy Sidecar"]
             end
+            Wiz["Wiz Runtime Security Sensors<br>(eBPF Process Monitoring)"]
         end
     end
 
     subgraph External_Network ["External Layers"]
-        Dev["Developer Browser / IDE"]
-        GitLab["Enterprise GitLab Registry<br>(OAuth2 Only)"]
+        Dev["Developer Desktop / IDE"]
+        GitLab["Enterprise GitLab Registry"]
         Anthropic["Anthropic Claude API"]
     end
 
-    %% Ingress & Auth Flow
-    Dev -->|TLS 1.3| ALB
-    ALB -->|Forward All| RL
-    RL --> C_Engine
-    C_Engine -->|AuthN Challenge| Ping
-    C_Engine -->|AuthZ Check| RBAC
-
-    %% Infrastructure Secrets Flow
-    Vault -->|Dynamic Short-Lived Creds| DynamicLDAP --> AD
-    Vault -->|Dynamic Short-Lived Creds| DynamicDB --> RDS
-    C_Engine -.->|Authenticate via Vault dynamic token| RDS
-
-    %% Custom RBAC & Triple-Path Suspension Core
-    RBAC -->|Path A: Just-In-Time Block<br>Zero Templates / Access Deviation| Quarantine
-    Airflow -->|Path B: Hourly Audit Run| Quarantine
-    GitHooks -->|Path C: Tamper Alarm Trigger| Quarantine
-    Quarantine -->|Enforce Policy| Lock["User Account Suspended<br>(Sessions Dropped & Vol Frozen)"]
-
-    %% Workspace Provisioning & Runtime Injection
-    C_Engine -->|Deploy Instance via Template| AWS_EKS
-    C_Engine -->|Deploy Instance via Template| On_Prem_OCP
-    BR --> Workspace_Pod
-    RHCOS --> Workspace_Pod
+    %% Flow connections
+    Dev -->|Access Portal| ALB
+    ALB -->|Authenticate & Intercept Graph| Control
+    Control -->|Audit & Sync State| Compliance
+    Control -->|Retrieve Active Directory & RDS Tokens| Vault
+    Control -->|Deploy ephemeral workspace| K8s_OCP_Hosts
     
-    %% Storage Inspection Split
-    EBS -.->|Snapshot Scan| WizSnap
-    
-    %% Hardened Runtime Inner-Loop
-    WizSensor -.->|Deep Process Inspection| Workspace_Pod
-    Workspace_Pod --> Config
-    Workspace_Pod --> Seccomp --> Workspace
-    Workspace -->|Git operations via OAuth2| GitLab
-
-    %% Token Cryptography & Inference Paths
-    C_Engine -->|Dynamic Vault Transit Request| Transit
-    Transit -->|Return Token Ciphertext Only| C_Engine
-    C_Engine -->|Inject Ciphertext Env Var| Workspace
-    
-    Workspace -->|Inference Stream Request| GoProxy
-    GoProxy -->|Validate & Request Decrypt| Transit
-    GoProxy -->|Proxy Outbound Stream| Anthropic
-
-    classDef infrastructure fill:#f5f5f5,stroke:#9e9e9e,stroke-width:2px;
-    classDef control fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
-    classDef security fill:#ffebee,stroke:#c62828,stroke-width:2px;
-    classDef automation fill:#fff3e0,stroke:#ff9800,stroke-width:2px;
-    class Execution_Targets,Storage_State infrastructure;
-    class Control_Plane,Vault_Enclave control;
-    class Sandbox_Namespace,Workspace_Pod security;
-    class Orchestration automation;
-
+    Workspace_Pod -.->|Deep Process Inspection| Wiz
+    Workspace -->|Scoped OAuth2 code push| GitLab
+    Workspace -->|LLM Inference Stream| GoProxy
+    GoProxy -->|Dynamic Decryption Check| Vault
+    GoProxy -->|Direct Secured Outbound Egress| Anthropic
 ```
 
 ---
