@@ -6,7 +6,7 @@ ECC Isolation: We use Ed25519-to-X25519 birational mapping to encrypt tokens dir
 
 Zero-Knowledge Proxy: The Coder Server retrieves the encrypted blob from AWS using a centralized role but lacks the user's private key to decrypt it. This reduces our IAM attack surface by 99% compared to IRSA.
 
-Obfuscation: Secret names are a one-way deterministic hash (rdx-sha256(email + pub_key)), preventing secret enumeration by AWS admins.
+Obfuscation: Secret names are a one-way deterministic hash (secure-coder-sha256(email + pub_key)), preventing secret enumeration by AWS admins.
 
 RAM-only Residency: Decryption occurs strictly in tmpfs. Plaintext tokens never touch persistent storage.
 

@@ -139,7 +139,7 @@ def main():
     
     results = {}
     for feature, env_name in feature_map.items():
-        secret_name = f"rdx-{feature}-{wallet_id}"
+        secret_name = f"secure-coder-{feature}-{wallet_id}"
         try:
             resp = client.get_secret_value(SecretId=secret_name)
             results[env_name] = decrypt_payload(resp['SecretString'], x25519_priv)
