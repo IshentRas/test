@@ -29,6 +29,31 @@ Upon every incoming packet transaction, the proxy intercepts the pipeline, utili
 > [!NOTE]
 > **Coder's Platform Lifecycle:** Calling the Coder Agent REST API ensures that if the token is nearing expiration, the central Coder control plane transparently initiates a background OAuth2 token refresh with GitLab before delivering the payload, abstracting credential management away from the client entirely.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Claude as Claude Code (Agent)
+    participant MCP as GitLab MCP Server (npx)
+    participant Proxy as Go Loopback Proxy (127.0.0.1:8089)
+    participant Coder as Coder Agent API (Internal)
+    participant GitLab as GitLab Enterprise (External)
+
+    Claude->>MCP: Prompts tool use (e.g. read/write repo)
+    Note over MCP: Configured with:<br>GITLAB_URL = http://127.0.0.1:8089<br>GITLAB_TOKEN = bypass-boot-check-string
+    MCP->>Proxy: Outbound GitLab API Request
+    
+    Proxy->>Coder: GET /api/v2/workspaceagents/me/external-auth?id=gitlab
+    Note over Coder: Authenticated via $CODER_AGENT_TOKEN
+    Note over Coder: Automatically triggers OAuth2 refresh if token is nearing expiration
+    Coder-->>Proxy: Returns fresh access_token
+    
+    Proxy->>Proxy: Swaps 'Authorization: Bearer <access_token>' in-memory
+    Proxy->>GitLab: Forwards Request with active Token (TLS)
+    GitLab-->>Proxy: Returns API Response
+    Proxy-->>MCP: Forwards API Response
+    MCP-->>Claude: Returns tool results
+```
+
 ---
 
 ## 4. Complete Go Proxy Implementation (`main.go`)
