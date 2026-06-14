@@ -6,7 +6,7 @@ Approved (v5.0 - Dynamic Handshake, Lifecycle Anchoring & Self-Healing Rehydrati
 
 Context
 
-Our platform integrates third-party LLM providers (e.g., Anthropic) with developer tooling inside Coder workspaces. Because these vendor-issued keys (like sk-ant-...) are long-lived and cannot be instantly revoked or dynamically managed at the source, we face a critical risk of credentials leaking outside our corporate boundaries.
+Our platform integrates Claude via an enterprise LLM gateway (LiteLLM proxy routing to AWS Bedrock) with developer tooling inside Coder workspaces. Because per-user LiteLLM keys are long-lived and cannot be instantly revoked or dynamically managed at the source, we face a critical risk of credentials leaking outside our corporate boundaries.
 
 Our original "Path B" proposal suggested encrypting the raw keys using HashiCorp Vault Transit and injecting them into workspaces as ENC(...) environment variables to be intercepted and decrypted JIT by an internal Go Proxy.
 
@@ -47,6 +47,8 @@ Technical Architecture & State Machine
   [Developer CLI]                          |                                |
         |                                  |                                |
         | 4. First HTTP Request (Claude)   |                                |
+        |    (ENC LiteLLM key as           |                                |
+        |     ANTHROPIC_API_KEY)           |                                |
         |--------------------------------->|                                |
         |                                  | 5. HANDSHAKE PHASE:            |
         |                                  |    - Read client IP            |
@@ -58,8 +60,12 @@ Technical Architecture & State Machine
         |                                  |    Cache TTL = 24h             |
         |                                  |<-------------------------------|
         |                                  |                                |
-        | 7. Forward (Decrypted Key)       |                                |
-        |------------------------------------------------------------------------> [LLM]
+        |                                  | 7. Forward plaintext LiteLLM key
+        |                                  |    (Anthropic-compatible API)  |
+        |                                  |------------------------> [LiteLLM]
+        |                                  |                                |
+        |                                  |                                | [AWS Bedrock]
+        |                                  |                                | (Claude models)
 
 
 The State Evaluation Matrix (Request Path)
@@ -94,7 +100,7 @@ No
 
 Yes
 
-Hot Path Forward: The request matches the locked profile. Swap the header instantly and stream to the upstream LLM (sub-millisecond latency).
+Hot Path Forward: The request matches the locked profile. Swap the encrypted LiteLLM key for the JIT-decrypted plaintext key and stream to LiteLLM (Anthropic-compatible API), which routes to AWS Bedrock.
 
 Yes
 

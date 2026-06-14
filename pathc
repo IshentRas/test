@@ -4,7 +4,7 @@ A subset of developers must run workloads locally on Windows workstations (using
 
 Additionally:
 
-We must avoid exposing raw LLM keys to the local laptop filesystem.
+We must avoid exposing raw LiteLLM keys to the local laptop filesystem. Claude Code is configured with `ANTHROPIC_API_KEY` for client compatibility, but that value is an encrypted per-user LiteLLM proxy credential—not a native Anthropic (`sk-ant-...`) token.
 
 We cannot rely on brittle Active Directory (AD) Keytab files, which require heavy governance and lengthy enterprise approval pipelines.
 
@@ -72,7 +72,7 @@ Authorization: Bearer ENC(...)
 
 The proxy checks its in-memory map. If the incoming IP matches the LockedClientIP and the hash of the incoming ENC(...) matches the CiphertextHash:
 
-If DecryptedKey is blank, it calls Vault Transit to unseal the key, caches it in RAM, and forwards it to the upstream LLM provider.
+If DecryptedKey is blank, it calls Vault Transit to unseal the LiteLLM key, caches it in RAM, and forwards it to the LiteLLM proxy (Anthropic-compatible API), which routes upstream to AWS Bedrock Claude models.
 
 If DecryptedKey is populated, it instantly swaps the authorization header in microseconds.
 
@@ -95,7 +95,8 @@ Technical Architecture Overview
    [Workspace]              [Laptop CLI]            [Go Proxy Gateway]       [HashiCorp Vault]
         |                        |                          |                        |
         | 1. Generate Sig        |                          |                        |
-        |    (Signs Ciphertext)  |                          |                        |
+        |    (Signs encrypted    |                          |                        |
+        |     LiteLLM key)       |                          |                        |
         |----------------------->|                          |                        |
         |                        | 2. POST /api/v1/sync     |                        |
         |                        |    (Sig & MachineName)   |                        |
@@ -108,16 +109,20 @@ Technical Architecture Overview
         |                        |                          |                        |
         |                        | 7. Claude API Request    |                        |
         |                        |    (Headers: State Cookie|                        |
-        |                        |     Machine, Ciphertext) |                        |
+        |                        |     Machine, ENC key as  |                        |
+        |                        |     ANTHROPIC_API_KEY)   |                        |
         |                        |------------------------->|                        |
         |                        |                          | 8. Verify IP & Hash    |
         |                        |                          | 9. JIT Vault Unseal    |
         |                        |                          |----------------------->|
-        |                        |                          | 10. Cache plain key    |
+        |                        |                          | 10. Cache plain LiteLLM key
         |                        |                          |<-----------------------|
         |                        |                          |                        |
-        |                        |                          | 11. Stream Upstream    |
-        |                        |                          |------------------------> [Anthropic]
+        |                        |                          | 11. Stream to LiteLLM  |
+        |                        |                          |------------------------> [LiteLLM]
+        |                        |                          |                                |
+        |                        |                          |                                | [AWS Bedrock]
+        |                        |                          |                                | (Claude models)
 
 
 Consequences
@@ -126,7 +131,7 @@ Security Posture
 
 Cryptographic Binding: Stolen ciphertexts cannot be replayed or hijacked on unauthorized laptops because an attacker cannot sign the sync request without owning the corresponding private SSH key inside an active workspace.
 
-Zero Credential Exposure: The raw LLM key is never written to disk, and is only unsealed into the volatile, short-lived memory of the proxy cluster.
+Zero Credential Exposure: The raw LiteLLM key is never written to disk, and is only unsealed into the volatile, short-lived memory of the proxy cluster before forwarding to LiteLLM → AWS Bedrock.
 
 Independence from Active Directory: No dedicated domain computer objects, Service Principal Names (SPNs), or AD Keytab mounts are required inside the EKS cluster.
 

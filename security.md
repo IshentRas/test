@@ -37,7 +37,11 @@ graph TB
     subgraph External_Network ["External Layers"]
         Dev["Developer Desktop / IDE"]
         GitLab["Enterprise GitLab Registry"]
-        Anthropic["Anthropic Claude API"]
+    end
+
+    subgraph LLM_Gateway ["Approved LLM Gateway (AWS)"]
+        LiteLLM["LiteLLM Proxy<br>(Anthropic-compatible API)"]
+        Bedrock["AWS Bedrock<br>(Claude models)"]
     end
 
     %% Flow connections
@@ -49,9 +53,10 @@ graph TB
     
     Workspace_Pod -.->|Deep Process Inspection| Wiz
     Workspace -->|Scoped OAuth2 code push| GitLab
-    Workspace -->|LLM Inference Stream| GoProxy
+    Workspace -->|"LLM Inference Stream<br>(ENC LiteLLM key as ANTHROPIC_API_KEY)"| GoProxy
     GoProxy -->|Dynamic Decryption Check| Vault
-    GoProxy -->|Direct Secured Outbound Egress| Anthropic
+    GoProxy -->|JIT decrypt & forward plaintext LiteLLM key| LiteLLM
+    LiteLLM -->|Route to configured backend| Bedrock
 ```
 
 ---
@@ -109,10 +114,12 @@ If a developer or a rogue agentic script attempts a privilege escalation or host
 
 ### Layer 5: The Vault Transit Token Moat (Path B & Path C)
 
-To maintain non-repudiation and prevent developers from copying high-privilege corporate Anthropic tokens to local devices, Secure Coder uses **HashiCorp Vault’s Transit Secrets Engine**. API keys never exist as plaintext in application environments.
+To maintain non-repudiation and prevent developers from copying high-privilege corporate LLM credentials to local devices, Secure Coder uses **HashiCorp Vault’s Transit Secrets Engine**. API keys never exist as plaintext in application environments.
 
-* **Cryptographic Decoupling:** The master private key remains sealed within Vault. Coder handles the token exclusively as an opaque, non-exportable ciphertext (`vault:v1:...`).
-* **Path B (In-Sandbox Flow):** When Claude Code executes inside the container sandbox, it reads only the ciphertext. When an inference request is fired, a local, root-managed **Go Proxy sidecar** intercepts the stream. The Go Proxy passes the ciphertext to Vault along with its authenticated Kubernetes Service Account token to decrypt the stream out-of-band. The raw key is never exposed to the container environment or system logs.
+Although Claude Code is configured with `ANTHROPIC_API_KEY`, that value is **not** a native Anthropic (`sk-ant-...`) token. It is a **per-user LiteLLM proxy key**, stored and injected exclusively as ciphertext (`ENC(...)` / `vault:v1:...`). At runtime, the Go Proxy decrypts it on the fly and forwards requests to **LiteLLM**, which routes upstream to **AWS Bedrock** Claude models.
+
+* **Cryptographic Decoupling:** The master private key remains sealed within Vault. Coder handles the LiteLLM key exclusively as an opaque, non-exportable ciphertext (`vault:v1:...`).
+* **Path B (In-Sandbox Flow):** When Claude Code executes inside the container sandbox, it reads only the encrypted LiteLLM key (presented as `ANTHROPIC_API_KEY`). When an inference request is fired, a local, root-managed **Go Proxy sidecar** intercepts the stream. The Go Proxy passes the ciphertext to Vault along with its authenticated Kubernetes Service Account token to decrypt the stream out-of-band. The plaintext LiteLLM key is never exposed to the container environment or system logs.
 * **Path C (Secure Local Laptop Breakout):** For localized visualization suites (e.g., Tableau) or desktop analytics tools (like `claude-code`) that cannot be containerized inside a Secure Coder workspace:
   * The developer generates an out-of-band cryptographic signature of their ciphertext and timestamp using their workspace private SSH key.
   * A lightweight local utility (`sync-ip.exe`) registers the signature and machine hostname with the Go Proxy to dynamically anchor the developer's laptop network IP.
@@ -127,6 +134,8 @@ sequenceDiagram
     participant WS as Active Coder Workspace
     participant Proxy as Go Proxy sidecar
     participant Vault as Vault Transit
+    participant LiteLLM as LiteLLM Proxy
+    participant Bedrock as AWS Bedrock
 
     WS->>WS: Signs ciphertext + timestamp using ~/.ssh/id_ed25519
     WS-->>Developer: Outputs Signature Block
@@ -140,9 +149,10 @@ sequenceDiagram
     Developer->>Proxy: Inference Request (Cookie, Ciphertext, Machine ID)
     Proxy->>Proxy: Decrypts Cookie, validates requesting IP & Ciphertext Hash
     Proxy->>Vault: JIT Unseal ciphertext (context: WorkspaceID)
-    Vault-->>Proxy: Returns decrypted plaintext LLM token (RAM only)
-    Proxy->>Proxy: Caches plain token in RAM (24h TTL)
-    Proxy->>External LLM: Forward stream to Anthropic
+    Vault-->>Proxy: Returns decrypted plaintext LiteLLM key (RAM only)
+    Proxy->>Proxy: Caches plain LiteLLM key in RAM (24h TTL)
+    Proxy->>LiteLLM: Forward stream (Anthropic-compatible API)
+    LiteLLM->>Bedrock: Route to AWS Bedrock Claude models
 ```
 
 ### Layer 6: Tamper-Proof Managed Hooks & Repository Provenance
@@ -163,7 +173,7 @@ To summarize the platform's posture for security approval, this table outlines w
 | Security Vector | The Corporate Laptop Threat Profile | The Secure Coder Managed Sandbox Posture |
 | --- | --- | --- |
 | **Identity & Git Access** | Long-lived SSH keys and plaintext GitLab PATs sit unencrypted in local user profiles, highly vulnerable to scraping. | **Pure OAuth2 Exchange:** No static keys are used. Tokens are short-lived, scoped, and generated dynamically during login handshakes. |
-| **LLM Key Protection** | Plaintext API keys can be easily copied locally, leaked in terminal output, or harvested from environment states. | **Decoupled Vault Transit:** Keys exist only as ciphertexts. Inline decryption and routing are handled out-of-band by the Go Proxy sidecar. |
+| **LLM Key Protection** | Plaintext API keys can be easily copied locally, leaked in terminal output, or harvested from environment states. | **Decoupled Vault Transit:** LiteLLM keys exist only as ciphertexts (`ANTHROPIC_API_KEY` naming is client-compat only). JIT decryption and routing to LiteLLM → Bedrock are handled out-of-band by the Go Proxy sidecar. |
 | **Infrastructure Secrets** | Static configuration passwords linger in files. High risk of leakages across distributed development environments. | **Dynamic Secrets Engines:** Zero static passwords. Core connections to Active Directory and RDS rotate monthly via Vault. |
 | **Patching & Drift** | Vulnerable to patching fatigue, user-postponed updates, local administration overrides, and software bloat. | **Automated Evergreening:** Compute layer is entirely stateless. Every cycle destroys the container and deploys a pristine, fully patched master image. |
 | **Supply Chain Defense** | **Blind Execution:** Local tools read any unvetted codebase or zip file. No native capability to block AI based on repository origin. | **Managed Provenance Hooks:** Root-owned verification hooks evaluate repository domains; if a repo is blacklisted, Claude is blocked instantly. |
