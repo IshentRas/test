@@ -1,0 +1,86 @@
+
+Thanks for raising this! It's a great opportunity to share the security threat model and the "why" behind this architectural evolution.
+
+Our number one requirement is non-repudiation—guaranteeing that LLM API keys cannot be shared, leaked, or used outside of authorized corporate boundaries. Here is the step-by-step journey of how we arrived at Path C to protect our keys:
+
+1. Path A (The Cloud-Only Gateway)
+
+The Context: We originally controlled the proxy gateway directly in our cloud VPC. Because we owned key rotation and execution within Coder, we had absolute non-repudiation—the raw LLM keys were never exposed to the workspace filesystem.
+
+The Pivot: The enterprise transitioned to a centrally managed LLM provider. We lost ownership of key rotation and were forced to use long-lived, static keys. If we injected these raw keys into Coder workspaces, we were back to square one: developers could easily copy and share them.
+
+2. Path B (The Encrypted Cloud Shield)
+
+The Context: To prevent developers from sharing long-lived keys, we invented Path B. We encrypted the keys using Vault Transit (ENC(...)). Even if a developer shared the ciphertext, the proxy checked the cloud CIDR and Coder signature, meaning it could only be unsealed from within Coder's cloud VPC.
+
+The Breakout: Some developers required local execution (like specialized IDE compilers or terminal tools) running directly on physical Windows laptops where we don't have a strict cloud VPC boundary.
+
+3. Path C (The Keyless, Laptop-Binding Handshake)
+
+The Solution: We faced a choice: surrender our security posture and hand developers the decrypted plaintext keys for local use, or build a secure bridge. We engineered Path C.
+
+How it works: We use the running Coder workspace as our dynamic root of trust:
+
+The user generates a dynamic signature inside their active workspace using their private SSH key (signing the ciphertext + timestamp).
+
+The local laptop sync utility pushes this signature to the proxy, which fetches their public key from Coder to verify their identity.
+
+Once verified, the proxy hashes the ciphertext and locks the workstation's IP in memory for 24 hours.
+
+Self-Healing: If the proxy recycles, it statelessly rehydrates its local memory cache using a secure server-encrypted state token (X-Session-State) passed back by the laptop, ensuring a flawless developer experience without degrading security.
+
+Summary Matrix
+
+Capability
+
+Path A (Cloud Only)
+
+Path B (VPC Locked)
+
+Path C (Workspace Bound)
+
+Execution Location
+
+Cloud Coder Workspace
+
+Cloud Coder Workspace
+
+Local Windows Laptop
+
+Non-Repudiation
+
+Guaranteed (No key exposure)
+
+Guaranteed (VPC CIDR fenced)
+
+Guaranteed (Workspace Signed + IP Locked)
+
+Mitigates Key Sharing
+
+Yes
+
+Yes
+
+Yes (Cannot unseal from home/unauthorized hosts)
+
+Operational Friction
+
+Zero
+
+Low
+
+Zero (Keyless; no Active Directory required)
+
+Proxy Crash Recovery
+
+High
+
+Low
+
+High (Self-healing via state token)
+
+Conclusion
+
+Path C is our pragmatic sweet spot for Windows developers. It gives us the uncompromising non-repudiation of Path B, prevents key sharing completely, and bypasses the administrative bottlenecks of traditional Active Directory mapping. It is keyless, self-service, and fully self-healing.
+
+Let me know if you have any questions or if you'd like to hop on a quick huddle to sync up!
