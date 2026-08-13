@@ -216,10 +216,33 @@ spec:
 | `hostUsers: false` | Real remapped userns (lab invariant). |
 | `allowPrivilegeEscalation: true` | With `false`, `NoNewPrivs=1` blocks `newuidmap` even if `SETUID`/`SETGID` are present. |
 | `SETUID` / `SETGID` | `newuidmap` / `newgidmap` filecaps path. |
-| `SYS_ADMIN` / `SYS_CHROOT` / `MKNOD` / `SETFCAP` | Nested runtime / mounts / caps inside userns. |
+| `SYS_ADMIN` | See **Why `SYS_ADMIN` is needed** below — seccomp gating + nested mounts/`unshare`. |
+| `SYS_CHROOT` / `MKNOD` / `SETFCAP` | Nested runtime / device / filecap paths inside userns. |
 | FUSE resource | Overlay storage for rootless containers. |
 | `super_t` | Avoid Bottlerocket SELinux denials that look like “random EPERM.” |
 | Localhost seccomp | Keeps filter on; must allow nested-runtime syscalls (see §7). |
+
+### Why `SYS_ADMIN` is needed
+
+`SYS_ADMIN` here is **not** “full host root.” With `drop: [ALL]` and `runAsUser: 1000`, the container’s effective caps are often empty (`CapEff: 0` in the lab). What matters is that **`CAP_SYS_ADMIN` is in the capability bounding set (`CapBnd`)**. Two linked reasons:
+
+#### 1. Seccomp (the hard constraint on EKS)
+
+Stock **RuntimeDefault** only allows several syscalls nested Podman needs when `CAP_SYS_ADMIN` is present in the container’s capability set:
+
+- `clone` / `clone3`
+- `unshare`
+- `mount` (and related)
+
+Those RuntimeDefault rules are shaped like: allow **if** `includes.caps: [CAP_SYS_ADMIN]`. If you never add `SYS_ADMIN` after `drop: [ALL]`, those syscalls stay **denied by seccomp** even though the names appear in the profile. That surfaces as failures such as `cannot clone: Operation not permitted` or a failed `unshare` before nested Podman gets far.
+
+Our flattened Localhost profile treated those allows as unconditional (because the pod already had `SYS_ADMIN`), but the same capability is still required for any path that stays on true RuntimeDefault-style conditional filters.
+
+#### 2. Nested runtime work inside the user namespace
+
+After `podman unshare`, the process is root **inside the user namespace** and needs admin-ish operations there (overlay/FUSE mounts, namespace setup, etc.). Caps inside the userns are still limited by the outer **`CapBnd`**. Without `SYS_ADMIN` in the bounding set, userns-root cannot exercise those ops.
+
+**Short version:** add `SYS_ADMIN` so RuntimeDefault (and nested mounts/`unshare`) actually allow the syscalls nested rootless Podman needs under a non-Unconfined profile — not to grant privileged host access.
 
 ### Nested uid map we observed
 
