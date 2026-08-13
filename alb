@@ -1,1 +1,544 @@
-[na]
+# Lab overview — EKS Bottlerocket rootless Podman (`hostUsers: false`)
+
+**Purpose of this document:** single reviewable record of what we built, what we proved, what failed, and the exact config patterns that mattered.  
+**Repo:** `eks-podman-coder-lab`  
+**Primary dates:** 2026-08-12 → 2026-08-13  
+**Final infra state:** destroyed (`terraform destroy`, 99 resources; cluster gone)
+
+---
+
+## 1. Goal and non-goals
+
+### Goal
+
+Prove that **nested rootless Podman** can run inside a Kubernetes pod on:
+
+| Layer | Choice |
+| --- | --- |
+| Cluster | Amazon EKS **1.34** |
+| Nodes | **Bottlerocket** (`aws-k8s-1.34`) |
+| Autoscaling | **Karpenter 1.8.0** |
+| Pod userns | **`hostUsers: false` only** (no fallback to `hostUsers: true`) |
+| Seccomp | Custom profile via **Security Profiles Operator** (not `Unconfined`) |
+| Storage / overlay | **FUSE** via fuse device plugin (`github.com/fuse`) |
+| Networking (desired) | Pasta / tun when possible |
+
+### Fixed decisions (from plan)
+
+- Do **not** flip to `hostUsers: true` to “make pasta work.”
+- Prefer pasta when tun works; do **not** treat pasta + `netns=host` as the happy path.
+- Out of scope: privileged DinD, Sysbox, OpenShift SCC productization (reuse syscall lessons only).
+
+### What “success” meant
+
+1. Pod runs as uid **1000** with a **remapped** `/proc/self/uid_map` (`hostUsers: false`).
+2. Seccomp is **active** (`Seccomp: 2`), not unconfined.
+3. `/dev/fuse` is present and usable.
+4. `podman unshare` produces a multi-line nested uid map (`newuidmap` path works).
+5. Nested `podman run` works somehow without abandoning pod userns.
+6. Ideally: pasta / tun under the same constraints.
+
+---
+
+## 2. Architecture (what we deployed)
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ VPC (terraform-aws-modules/vpc)                             │
+│  private subnets tagged karpenter.sh/discovery              │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│ EKS 1.34                                                     │
+│  ├─ system MNG (Bottlerocket) — Karpenter controller        │
+│  ├─ Karpenter Helm 1.8.0 + IAM (inline controller policy)   │
+│  ├─ cert-manager + Security Profiles Operator               │
+│  ├─ fuse-device-plugin DS (nodes labeled smarter-device…)   │
+│  └─ spo-seccomp-materialize DS (Bottlerocket symlink fix)   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│ NodePool coder-workspaces (taint workload=coder)            │
+│  EC2NodeClass bottlerocket@latest                           │
+│  ids-per-pod=131072, user.max_user_namespaces=65536         │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│ Namespace coder                                              │
+│  ├─ (Lab 1) Coder 2.36 + Postgres                            │
+│  ├─ SeccompProfile nested-podman → Localhost JSON on node    │
+│  └─ Pod podman-rootless-test (hostUsers: false, fuse, …)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Repo layout
+
+```text
+eks-podman-coder-lab/
+├── terraform/                 # VPC, EKS, Karpenter, SPO, fuse, (Coder)
+│   ├── main.tf
+│   ├── providers.tf           # kubeconfig-based k8s/helm/kubectl
+│   ├── karpenter_nodepool.tf
+│   ├── addons_spo.tf
+│   └── addons_coder_fuse.tf
+├── k8s/
+│   ├── spo/                   # SeccompProfile, ProfileBinding, materialize DS
+│   ├── fuse/daemonset.yaml
+│   └── workspace/podman-rootless-test.yaml
+├── coder-template/            # Coder workspace template (lab 1)
+├── scripts/apply-k8s.sh
+├── scripts/acceptance.sh
+├── LAB_RESULTS.md             # first full acceptance table
+└── LAB_OVERVIEW.md            # this file
+```
+
+---
+
+## 3. Timeline (two lab passes)
+
+### Lab 1 — full stack including Coder
+
+1. Terraform brought up VPC + EKS + Karpenter IAM/Helm + SPO + fuse + Coder.
+2. Several platform bugs fixed (see §6).
+3. Acceptance script run; results written to `LAB_RESULTS.md`.
+4. **Tun/pasta blocked** under `hostUsers: false`; nested `--network=host` worked.
+5. Stack **destroyed** (91 resources); one leftover Karpenter EC2 had to be terminated manually so subnet/SG could finish deleting.
+
+### Lab 2 — minimal re-test (no Coder) focused on seccomp
+
+1. Re-applied foundation **without Coder**.
+2. First apply partially failed (stale kubeconfig → old cluster DNS); re-apply after `aws eks update-kubeconfig` succeeded.
+3. Seccomp experiments:
+   - **OCP’s 10 extras only** (deny-by-default, no RuntimeDefault) → pod **StartError**.
+   - **Stock RuntimeDefault** → pod + `podman unshare` OK; nested run failed on **`keyctl`**.
+   - **RuntimeDefault-equivalent Localhost + `keyctl` + `pivot_root`** → nested `podman run --network=host` **OK**.
+4. Stack **destroyed** again (99 resources); cluster confirmed gone.
+
+---
+
+## 4. Results summary
+
+### Lab 1 acceptance (`LAB_RESULTS.md`)
+
+| Check | Result |
+| --- | --- |
+| `id -u` = 1000 | **PASS** |
+| Pod `uid_map` remapped (`hostUsers: false`) | **PASS** |
+| `Seccomp: 2` (Localhost profile) | **PASS** |
+| FUSE `/dev/fuse` | **PASS** |
+| Tun `open()` / pasta default net | **FAIL (blocker)** |
+| `podman unshare` multi-line uid_map | **PASS** |
+| Nested `podman run --network=host` | **PASS** |
+| `podman run --user 1000` | **PASS** |
+| `user.max_user_namespaces` = 65536 | **PASS** |
+
+### Lab 2 seccomp matrix
+
+| Profile | Pod starts? | `podman unshare` | Nested `podman run --network=host` |
+| --- | --- | --- | --- |
+| OCP 10 syscalls only (`SCMP_ACT_ERRNO` default) | **No** (`StartError`) | n/a | n/a |
+| Kubernetes `RuntimeDefault` | **Yes** | **Yes** | **No** — `crun: join keyctl … Operation not permitted` |
+| Flattened RuntimeDefault-like + **`keyctl`** only | **Yes** (after dropping bad `clone3→ENOSYS` rule) | **Yes** | **No** — `crun: pivot_root: Operation not permitted` |
+| Same + **`keyctl` + `pivot_root`** | **Yes** | **Yes** | **Yes** (`OK_HOST_NET`) |
+
+**Final working nested command (lab 2):**
+
+```bash
+kubectl -n coder exec podman-rootless-test -- \
+  podman run --network=host --rm alpine:3.20 echo OK_HOST_NET
+```
+
+---
+
+## 5. Working test pod (security posture)
+
+This is the shape that matched the successful nested-Podman path (`k8s/workspace/podman-rootless-test.yaml`):
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podman-rootless-test
+  namespace: coder
+spec:
+  hostUsers: false                    # REQUIRED — remapped pod userns
+  serviceAccountName: coder-workspace
+  nodeSelector:
+    workload: coder
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: coder
+      effect: NoSchedule
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: Localhost
+      localhostProfile: operator/nested-podman.json
+  containers:
+    - name: podman
+      image: quay.io/podman/stable:latest
+      command: ["sleep", "infinity"]
+      securityContext:
+        allowPrivilegeEscalation: true   # NoNewPrivs=0 — needed for newuidmap
+        runAsUser: 1000
+        runAsGroup: 1000
+        capabilities:
+          drop: ["ALL"]
+          add:
+            - SETUID
+            - SETGID
+            - SYS_CHROOT
+            - NET_ADMIN
+            - NET_RAW
+            - SYS_ADMIN
+            - MKNOD
+            - SETFCAP
+        seccompProfile:
+          type: Localhost
+          localhostProfile: operator/nested-podman.json
+        seLinuxOptions:
+          type: super_t                  # Bottlerocket SELinux
+      resources:
+        limits:
+          github.com/fuse: 1
+        requests:
+          github.com/fuse: 1
+```
+
+### Why these knobs mattered
+
+| Knob | Why |
+| --- | --- |
+| `hostUsers: false` | Real remapped userns (lab invariant). |
+| `allowPrivilegeEscalation: true` | With `false`, `NoNewPrivs=1` blocks `newuidmap` even if `SETUID`/`SETGID` are present. |
+| `SETUID` / `SETGID` | `newuidmap` / `newgidmap` filecaps path. |
+| `SYS_ADMIN` / `SYS_CHROOT` / `MKNOD` / `SETFCAP` | Nested runtime / mounts / caps inside userns. |
+| FUSE resource | Overlay storage for rootless containers. |
+| `super_t` | Avoid Bottlerocket SELinux denials that look like “random EPERM.” |
+| Localhost seccomp | Keeps filter on; must allow nested-runtime syscalls (see §7). |
+
+### Nested uid map we observed
+
+```text
+         0       1000          1
+         1          1        999
+      1000       1001      64535
+```
+
+`/etc/subuid` + `/etc/subgid` must exist **in the image** (Podman stable image has them); `newuidmap` applies them.
+
+---
+
+## 6. Platform / infra fixes worth keeping
+
+### 6.1 Providers: prefer kubeconfig
+
+Exec-based AWS auth for Helm/kubectl providers deadlocked on some applies. Final pattern:
+
+```hcl
+provider "kubernetes" {
+  config_path    = "~/.kube/config"
+  config_context = local.kube_context
+}
+
+provider "helm" {
+  kubernetes = {
+    config_path    = "~/.kube/config"
+    config_context = local.kube_context
+  }
+}
+```
+
+**Operational lesson:** after destroy/recreate, always refresh kubeconfig before Helm apply:
+
+```bash
+aws eks update-kubeconfig --region us-east-1 --name eks-podman-coder-lab
+```
+
+Lab 2’s first targeted apply failed with `lookup <OLD>.gr7.us-east-1.eks.amazonaws.com: no such host` because kubeconfig still pointed at the destroyed cluster.
+
+### 6.2 Karpenter IAM policy size
+
+```hcl
+module "karpenter" {
+  # ...
+  enable_inline_policy = true  # managed policy > 6144 chars
+}
+```
+
+### 6.3 Karpenter 1.8.0 featureGates panic
+
+Empty string for `staticCapacity` panics the controller. Explicit booleans:
+
+```yaml
+settings:
+  featureGates:
+    reservedCapacity: true
+    spotToSpotConsolidation: false
+    nodeRepair: false
+    nodeOverlay: false
+    staticCapacity: false
+```
+
+### 6.4 Bottlerocket AMI alias
+
+Use `bottlerocket@latest` (not a bogus `bottlerocket@1.34.0` alias).
+
+### 6.5 NodePool / userns sysctls
+
+```yaml
+# EC2NodeClass userData (Bottlerocket)
+[settings.kubernetes]
+ids-per-pod = 131072
+[settings.kernel.sysctl]
+"user.max_user_namespaces" = "65536"
+```
+
+Coder nodes are tainted `workload=coder` and labeled `smarter-device-manager=enabled` so the fuse plugin schedules there.
+
+### 6.6 SPO needs cert-manager + coder taint toleration
+
+`spod` must tolerate `workload=coder` or seccomp never lands on workspace nodes:
+
+```bash
+kubectl -n security-profiles-operator patch spod spod --type=json -p='[
+  {"op":"add","path":"/spec/scheduling/tolerations/-",
+   "value":{"key":"workload","operator":"Equal","value":"coder","effect":"NoSchedule"}}
+]'
+```
+
+### 6.7 Bottlerocket seccomp materialize DaemonSet
+
+SPO often installs under `/var/lib/security-profiles-operator` and may symlink `/var/lib/kubelet/seccomp/operator`. On Bottlerocket, kubelet did **not** reliably see that symlink from its mount namespace. Workaround: copy into a **real directory**:
+
+```yaml
+# k8s/spo/seccomp-materialize-ds.yaml (concept)
+SRC=/host/var/lib/security-profiles-operator
+DST=/host/var/lib/kubelet/seccomp/operator
+# if DST is a symlink → remove and mkdir; then cp -a SRC/. DST/
+```
+
+Localhost path from SPO status was:
+
+```text
+operator/nested-podman.json
+```
+
+(not `operator/coder/nested-podman.json`).
+
+### 6.8 Fuse + Karpenter chicken/egg
+
+Pods requesting `github.com/fuse: 1` cannot schedule until the fuse device plugin has registered on a node — but the plugin only runs on coder nodes. Bootstrap:
+
+```yaml
+# pause / bootstrap pod: same nodeSelector/tolerations, NO fuse resource
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+```
+
+After the node is Ready and fuse DS is Running, schedule the real workspace/test pod.
+
+---
+
+## 7. Seccomp deep dive (lab 2)
+
+### 7.1 OpenShift’s “10 extras” are not a full profile
+
+The list often discussed as nested-container extras:
+
+```text
+add_key, chroot, clone, clone3, keyctl, mount, pivot_root,
+request_key, setgroups, unshare
+```
+
+Applied **alone** with `defaultAction: SCMP_ACT_ERRNO` (no RuntimeDefault base), the container cannot start — no `execve` / `read` / `write` / `exit_group` / etc. Observed:
+
+```text
+StartError: cannot start a stopped process  (exit 128)
+```
+
+Those 10 are **additions on top of RuntimeDefault**, not a replacement.
+
+### 7.2 What RuntimeDefault already contains
+
+Against containerd/moby RuntimeDefault (EKS `seccompProfile.type: RuntimeDefault`):
+
+| Already in RuntimeDefault | Cap-gated? | Not in RuntimeDefault |
+| --- | --- | --- |
+| `chroot` | `CAP_SYS_CHROOT` | `add_key` |
+| `clone` | `CAP_SYS_ADMIN` | `keyctl` |
+| `clone3` | `CAP_SYS_ADMIN` | `pivot_root` |
+| `mount` | `CAP_SYS_ADMIN` | `request_key` |
+| `setgroups` | (unconditional) | |
+| `unshare` | `CAP_SYS_ADMIN` | |
+
+So with our pod caps, **6/10** are already available under stock RuntimeDefault; the true missing names are the keyring trio + `pivot_root`.
+
+### 7.3 What we actually needed for nested `podman run --network=host`
+
+Hypothesis that `add_key` / `keyctl` / `request_key` / `pivot_root` are “only for `network=none`” was **partially wrong**:
+
+| Syscall | Needed for `--network=host` in this lab? |
+| --- | --- |
+| `keyctl` | **Yes** — crun joins a keyring (`join keyctl … EPERM`) |
+| `pivot_root` | **Yes** — OCI rootfs setup (`pivot_root: Operation not permitted`) |
+| `add_key` | Not hit in our successful host-net path |
+| `request_key` | Not hit in our successful host-net path |
+
+### 7.4 Working Localhost profile approach
+
+Kubernetes cannot stack `type: RuntimeDefault` **and** extra Localhost rules on one container. Options:
+
+1. SPO `SeccompProfile` with `baseProfileName` (local or `oci://…`) + extras.
+2. Emit a **flattened** RuntimeDefault-equivalent JSON/YAML and add the extras (what we did).
+
+We generated a SeccompProfile from moby/containerd’s default allow-list (flattening cap-gated allows into unconditional allows — safe *given our pod already has those caps*), then added `keyctl` and `pivot_root`.
+
+**Pitfall:** moby’s default also has a `clone3 → SCMP_ACT_ERRNO (ENOSYS)` rule used so glibc falls back to `clone`. If you flatten naively and leave that ERRNO rule **ahead of** / conflicting with ALLOW, containers fail to start. We **removed** the unconditional `clone3` ENOSYS rule once we were allowing `clone3`.
+
+Final annotation on the CR:
+
+```yaml
+annotations:
+  description: RuntimeDefault-equivalent (flattened moby default) + keyctl + pivot_root
+```
+
+Snippet of the allow list (truncated):
+
+```yaml
+spec:
+  defaultAction: SCMP_ACT_ERRNO
+  syscalls:
+    - action: SCMP_ACT_ALLOW
+      names:
+        # … hundreds of RuntimeDefault names including execve, read, write, …
+        - keyctl      # nested crun
+        - pivot_root  # nested OCI rootfs
+        # deliberately omitted in final host-net profile:
+        # - add_key
+        # - request_key
+```
+
+### 7.5 Without SPO — how to install the same profile on EKS nodes
+
+Put JSON under kubelet’s seccomp root and reference it:
+
+```yaml
+seccompProfile:
+  type: Localhost
+  localhostProfile: nested-podman.json   # → /var/lib/kubelet/seccomp/nested-podman.json
+```
+
+**Recommended without SPO:** privileged DaemonSet (or bootstrap userData) that copies from a ConfigMap into `/var/lib/kubelet/seccomp/`. On Bottlerocket, write a **real directory**, don’t rely on SPO-style symlinks.
+
+---
+
+## 8. Tun / pasta blocker (still open under `hostUsers: false`)
+
+This blocked the pasta happy-path in lab 1 and was **not** fixed by seccomp extras.
+
+### Failure modes
+
+1. **hostPath CharDevice `/dev/net/tun`** into an idmapped userns pod:
+
+   ```text
+   failed to set MOUNT_ATTR_IDMAP on /dev/net/tun: invalid argument
+   ```
+
+2. **Creating the device inside the userns:**
+
+   ```text
+   mknod /dev/net/tun c 10 200  →  Operation not permitted
+   ```
+
+   Kernel denies char-device `mknod` inside a user namespace even with `CAP_MKNOD` in the userns.
+
+### Workaround used (keeps pod userns)
+
+```bash
+podman run --network=host --rm alpine:3.20 echo HOSTNET_OK
+```
+
+Nested containers share the **pod** network namespace; the pod itself remains `hostUsers: false`. Pasta as `default_rootless_network_cmd` was therefore not the successful path.
+
+---
+
+## 9. Acceptance checks (script)
+
+`scripts/acceptance.sh` encodes the gates:
+
+```bash
+# identity
+kubectl -n coder exec podman-rootless-test -- id -u          # expect 1000
+kubectl -n coder exec podman-rootless-test -- cat /proc/self/uid_map
+
+# seccomp on
+kubectl -n coder exec podman-rootless-test -- grep '^Seccomp' /proc/self/status
+# expect Seccomp: 2
+
+# fuse
+kubectl -n coder exec podman-rootless-test -- ls -l /dev/fuse
+
+# nested userns
+kubectl -n coder exec podman-rootless-test -- podman unshare cat /proc/self/uid_map
+
+# nested container (host-net workaround if tun blocked)
+kubectl -n coder exec podman-rootless-test -- \
+  podman run --rm --network=host alpine:3.20 echo HOSTNET_OK
+```
+
+---
+
+## 10. Coder (lab 1 only)
+
+- Coder **2.36** + Postgres 16 in namespace `coder`.
+- Workspace template under `coder-template/` mirrored the test pod posture (uid 1000, fuse, SPO seccomp, containers.conf).
+- Lab 2 intentionally **skipped** Coder to isolate seccomp/runtime behavior.
+
+---
+
+## 11. Teardown notes
+
+```bash
+cd terraform
+# optional: delete NodePool first so Karpenter drains nodes
+kubectl delete nodepool coder-workspaces --wait=false || true
+terraform destroy -auto-approve
+```
+
+**Watch for:** Karpenter-created EC2 leftover after cluster delete → ENIs hold subnets/SGs. If destroy hangs on subnet/SG, terminate orphan instances tagged for the NodePool, then re-run destroy / wait.
+
+Lab 2 destroy completed cleanly: **99 resources**, cluster `ResourceNotFoundException` afterward.
+
+---
+
+## 12. Conclusions for review
+
+### What we successfully proved
+
+1. **Rootless nested Podman on EKS 1.34 + Bottlerocket + Karpenter is viable** with `hostUsers: false`, FUSE, and a non-Unconfined seccomp profile.
+2. **`allowPrivilegeEscalation: true` + SETUID/SETGID** are required for `newuidmap` (NoNewPrivs must be 0).
+3. Stock **RuntimeDefault is not enough** for nested crun/Podman: need at least **`keyctl`** and **`pivot_root`** in the Localhost profile (or equivalent).
+4. OCP’s list of 10 is a useful **checklist**, but only meaningful **on top of RuntimeDefault** (or a full baseline).
+5. **Pasta/tun under remapped userns remains blocked** on this Bottlerocket path; use nested `--network=host` without abandoning pod userns.
+
+### What we did *not* claim
+
+- Production-hardened Coder rollout.
+- Pasta as default rootless networking under `hostUsers: false`.
+- That `add_key` / `request_key` are unnecessary forever — only that they were not required for our successful `--network=host` path.
+
+### Practical recommendation for a real EKS cluster (with or without SPO)
+
+1. Keep `hostUsers: false` + fuse + the capability set above.
+2. Install a Localhost profile = **RuntimeDefault-equivalent + `keyctl` + `pivot_root`** (add keyring `add_key`/`request_key` if you move to pasta/`network=none`).
+3. Prefer SPO *or* a DaemonSet that writes JSON under `/var/lib/kubelet/seccomp/` (Bottlerocket: real dir, not symlink-only).
+4. Document nested `--network=host` as the current networking workaround until tun/idmap is solved.
+
+---
