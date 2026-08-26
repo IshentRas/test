@@ -1,162 +1,158 @@
-# ADR-042: Zero-Trust Cryptographic Pod Attestation and Envelope Key Rehydration for Claude Code Workspaces
+## Context
 
-* **Status:** Accepted
-* **Date:** 2026-08-20
-* **Deciders:** Platform Engineering, Security Architecture
+Applications acting as senders execute a one-time startup bootstrap to retrieve sensitive initialization material from a single, dedicated receiver service. Subsequent requests only occur upon pod restart.
 
----
+Relying solely on projected Service Account tokens (JWTs) allows an exfiltrated token to be used in out-of-band requests (`curl`). Similarly, if an attacker acquires a new JWT inside the cluster, they must not be able to replay old ciphertext or craft unauthorized requests without access to active cryptographic keys.
 
-## Context and Problem Statement
+Key requirements:
 
-In containerized Cloud Development Environments (CDEs), developer tooling such as Claude Code and Model Context Protocol (MCP) servers interact with upstream LLM gateways (LiteLLM) via a central proxy. Previously, client isolation and in-memory rate-limiting/lazy-rehydration tables relied on source IP tracking (`X-Forwarded-For`) using AWS VPC CNI.
+1. **Confidentiality & Origin Authenticity:** Guaranteed via symmetric Authenticated Encryption with Associated Data (AES-256-GCM).
+2. **Cryptographic Token Binding (AAD):** The outbound request is bound to the exact projected Kubernetes Service Account JWT via GCM Additional Authenticated Data (AAD), preventing token-swapping and new-JWT replay attacks.
+3. **Dual Anti-Replay Guardrails:**
+* Strict $\le 120\text{s}$ fresh token window ($\vert{}T_{\text{recv}} - \text{claims}["\text{iat}"]\vert{} \le 120\text{s}$).
+* In-memory deduplication table locking the native `claims["jti"]` UUID for 120 seconds.
 
-Migrating workloads to enterprise Kubernetes distributions with overlay networking (e.g., OpenShift OVN-Kubernetes, Rancher Canal/Flannel) introduces Source Network Address Translation (SNAT) on node egress. Consequently, all pods on a given worker node share the Node IP, breaking IP-based anti-spoofing and introducing a residual risk of cross-pod session hijacking on multi-tenant nodes. Furthermore, plaintext API keys must never be exposed or accessible within the interactive workspace container.
 
----
-
-## Decision Drivers
-
-* **SNAT Immunity:** Identity and anti-spoofing must be cryptographically bound to the pod, independent of network source IP or overlay routing.
-* **Zero Plaintext Custody in Workspaces:** Neither developers nor workspace container processes should ever have access to unencrypted LiteLLM API keys or Vault transit master keys.
-* **Forced Helper Credentials:** Claude Code must obtain request credentials only from the OS-managed `apiKeyHelper`. A developer `export ANTHROPIC_API_KEY=...` or user-settings helper must not become the credential that leaves the box.
-* **Tamper-Proof Tooling Configuration:** Claude Code must be locked to route strictly through internal proxies without permitting developer-level overrides.
-* **Automatic Credential Lifecycle:** Projected Kubernetes tokens and decryption keys must rotate transparently without disrupting active interactive CLI sessions.
+4. **Lifecycle & Evergreen Alignment:** Monthly key rotation managed by Airflow, matching our **bi-weekly evergreen image rebuild cadence** (and CVE patch triggers).
+5. **Strict Retention Depth ($N-2$):** Vault KV-v2 and the receiver retain only the active key down to $N-2$ ($[N-2, N]$).
+6. **Zero External Runtime Dependencies:** No distributed caching layers (e.g., Redis); all state resides in receiver RAM.
 
 ---
 
-## Considered Options
+## Decision
 
-1. **Option 1 (Network-Only):** CNI masquerade tuning / EgressIP assignments per workspace namespace.
-2. **Option 2 (Full Service Mesh):** Istio/OpenShift Service Mesh with mTLS and SPIFFE ID validation.
-3. **Option 3 (Envelope Rehydration via Loopback Daemon & Central Gateway - Chosen):** Enforced OS-level managed settings, an in-container Go loopback daemon holding ciphertext in memory, Kubernetes Projected ServiceAccount Token attestation, and a centralized Go proxy leveraging HashiCorp Vault Transit for just-in-time decryption.
+We will implement an **AES-256-GCM** one-time bootstrap workflow where symmetric keys are rotated monthly via **Apache Airflow**, stored in **HashiCorp Vault KV-v2**, injected into sender binaries at build time via GitLab CI/CD, and validated by a **single receiver instance** using the token's native `jti` for in-memory deduplication.
 
----
+### 1. Wire Protocol & AAD Cryptographic Binding
 
-## Decision Outcome
+* **HTTP Headers:**
+* `Authorization: Bearer <PROJECTED_K8S_JWT>`
+* `X-Key-Version: <version_int>` (e.g., `4`)
+* `Content-Type: application/octet-stream`
 
-**Chosen Option:** **Option 3**.
 
-We implement a two-tier attestation and envelope-encryption architecture:
+* **HTTP Body (Raw Binary):**
+
+$$\text{Payload} = [\text{12-byte GCM Nonce/IV}] + [\text{AES-256-GCM Ciphertext}] + [\text{16-byte Auth Tag}]$$
+
+
+* **Additional Authenticated Data (AAD):**
+Both parties compute AAD in local memory:
+
+$$\text{AAD} = \text{KeyVersion} \mathbin{\Vert} \text{SHA-256}(\text{Raw JWT Bytes})$$
+
+
+
+*Any modification to the token, attempting to pair a new JWT with previous ciphertext, or changing the key version header causes GCM authentication to fail ($403\text{ Forbidden}$).*
+
+### 2. Key Lifecycle, Evergreen Builds & Retention Policy
+
+* **Monthly Airflow DAG:**
+1. Generates a fresh 256-bit key (`os.urandom(32)`).
+2. Increments version to $N+1$.
+3. Writes `{"data": "<version>:<base64_key>"}` to Vault KV-v2.
+4. Triggers the GitLab CI/CD pipeline API to rebuild and deploy the sender.
+
+
+* **Build & Deployment Cadence:**
+* Sender images are built on a **bi-weekly evergreen schedule**, upon **vulnerability remediation**, or upon **monthly Airflow key rotation**.
+* Builds inject the active key into the binary:
+```bash
+go build -trimpath -ldflags "-s -w -X main.InjectedSecret=${SECRET_VAL}" -o /app/sender .
 
 ```
-[ Developer Container ]
-  1. Claude Code CLI
-     │ (reads /etc/claude-code/managed-settings.json)
-     │ (env.ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN pinned to "")
-     │ (calls apiKeyHelper -> /var/run/secrets/tokens/workspace-token)
-     ▼
-  2. Local Loopback Go Daemon (127.0.0.1:9999)
-     │ • Ingests encrypted ciphertext from Digital Wallet on startup
-     │ • PR_SET_DUMPABLE=0 / in-memory custody
-     │ • Attaches X-Pod-Token (JWT) + X-Vault-Ciphertext
-     ▼
-[ Centralized Gateway ]
-  3. External Go Proxy
-     │ • Validates JWT signature & aud against cluster JWKS (/openid/v1/jwks)
-     │ • Asserts pod.uid claim matches Vault Transit decryption context
-     │ • Decrypts ciphertext -> Caches plaintext key in-memory
-     │ • Strips internal headers -> Injects Bearer <LiteLLM_Key>
-     ▼
-  4. LiteLLM Proxy / LLM Providers
+
+
+
+
+* **Strict $N-2$ Retention Ceiling:**
+* Vault KV-v2 retains `max_versions = 3`.
+* The receiver maintains an in-memory keychain containing strictly $[N-2, N]$. Key versions $< N-2$ are rejected.
+
+
+* **Sender Memory Hygiene:**
+* The sender parses `InjectedSecret` at startup into mutable byte buffers, initializes `cipher.NewGCM`, and immediately zeroes the intermediate raw key slice from memory.
+
+
+
+### 3. Receiver Verification & In-Memory Single-Use Locking
+
+* **Step 1: JWT & Claim Verification:**
+* Verifies cluster signature via K8s JWKS / public keys.
+* Validates namespace/service account claims against authorization policy.
+* Enforces startup freshness: $\vert{}T_{\text{recv}} - \text{claims}["\text{iat}"]\vert{} \le 120\text{s}$. If $> 120\text{s}$, returns `401 Unauthorized`.
+
+
+* **Step 2: Native `jti` Dedup Lock:**
+* Checks `TryAcquire(claims["jti"], TTL=120s)` on an in-memory `sync.Mutex` map.
+* Duplicate attempts with the same token within 120s return `409 Conflict`.
+
+
+* **Step 3: Keychain Lookup & AAD Decryption:**
+* Resolves `X-Key-Version` from memory keychain $[N-2, N]$.
+* Computes expected AAD: $\text{KeyVersion} \mathbin{\Vert} \text{SHA-256}(\text{Raw JWT Bytes})$.
+* Decrypts payload with `gcm.Open(...)`.
+* Returns decrypted secret bootstrap material via `HTTP 200 OK`.
+
+
+
+---
+
+## Architecture Flow
+
+```
++-----------------------------------------------------------------------------------+
+| 1. Key Lifecycle & Evergreen Build Pipeline                                       |
+|    [Airflow Monthly DAG] --> Generate Key N+1 / Write to Vault KV-v2 (Max=3)      |
+|             |                                                                     |
+|             +--(Trigger)---+                                                      |
+|                            v                                                      |
+|    [Bi-Weekly Evergreen / CVE Rebuild] --> [GitLab CI/CD Pipeline]                |
+|                                                    |                              |
+|                                                    +--> Fetch active key from KV  |
+|                                                    +--> go build -ldflags "-s -w" |
+|                                                    +--> Rolling deploy sender     |
++-----------------------------------------------------------------------------------+
+
++-----------------------------------------------------------------------------------+
+| 2. Sender One-Time Startup (Go)                                                   |
+|    - Parse & zero raw key memory -> Init AES-256-GCM                              |
+|    - Read fresh Projected K8s JWT from volume mount (/var/run/secrets/...)        |
+|    - Generate 12-byte random Nonce                                                |
+|    - Compute AAD: [kid + SHA256(JWT)]                                             |
+|    - Encrypt: gcm.Seal(nil, nonce, plaintext, AAD)                                |
+|    - Send Single HTTP POST (Headers: Auth Bearer, X-Key-Version) ------------->+  |
++---------------------------------------------------------------------------------|-+
+                                                                                  |
++---------------------------------------------------------------------------------v-+
+| 3. Single Receiver Workflow (Go)                                                  |
+|    a. Verify JWT signature via K8s JWKS & verify |Now - iat| <= 120s              |
+|    b. Dedup Lock: TryAcquire(claims["jti"], TTL=120s) -> 409 Conflict if seen     |
+|    c. Keychain Lookup: Match `X-Key-Version` against memory cache [N-2, N]        |
+|    d. Reconstruct AAD: [kid + SHA256(JWT)]                                        |
+|    e. GCM Decrypt: gcm.Open(nil, nonce, ciphertext+tag, AAD)                      |
+|    f. Return Secret Bootstrap Material & HTTP 200 OK                              |
++-----------------------------------------------------------------------------------+
+
 ```
 
 ---
 
-## Architectural Details
+## Consequences
 
-### 1. Workspace Configuration & Token Lifecycle
+### Positive
 
-* **Projected Volume:** Kubernetes projects a time-bound ServiceAccount token (`expirationSeconds: 3600`, `audience: "litellm-proxy"`) to `/var/run/secrets/tokens/workspace-token`.
-* **System-Wide Managed Settings:** Placed at `/etc/claude-code/managed-settings.json` (root-owned, not writable by the workspace user):
+* **Multi-Layer Replay Defense:**
+* Same request within 120s is blocked by the in-memory `jti` lock (`409 Conflict`).
+* Old request after 120s is blocked by the `iat` age check (`401 Unauthorized`).
+* Replaying old ciphertext with a freshly minted JWT fails AEAD tag validation due to the AAD hash mismatch (`403 Forbidden`).
 
-```json
-{
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "apiKeyHelper": "/usr/local/bin/get-pod-token.sh",
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:9999",
-    "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_AUTH_TOKEN": "",
-    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "300000"
-  },
-  "allowManagedPermissionRulesOnly": true
-}
-```
 
-* **API Key Helper:** `/usr/local/bin/get-pod-token.sh` reads the fresh projected token from disk. Claude Code runs this via `/bin/sh` and sends the stdout value as `X-Api-Key` and `Authorization: Bearer`. The CLI refreshes it on the interval set by `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` (5 minutes).
+* **Zero Custom Message IDs:** Eliminates the need for custom `X-Message-ID` headers by relying on the Kubernetes-managed `jti` and `iat` claims.
+* **Operational Alignment:** Key rotation integrates naturally with the bi-weekly evergreen container patching model.
+* **No External Infrastructure:** Replay protection and keychain caching require only standard Go memory primitives on the single receiver instance.
 
-#### Credential header binding (required)
+### Negative / Trade-offs
 
-Claude Code treats `apiKeyHelper` and `ANTHROPIC_API_KEY` as **two independent inputs**, not one override chain.
-
-| Source | What it controls | Can a developer override it? |
-| --- | --- | --- |
-| Managed `apiKeyHelper` | `Authorization: Bearer` (and `X-Api-Key` when no process key is set) | No. User/project `apiKeyHelper` is ignored. |
-| Process / shell `ANTHROPIC_API_KEY` | `X-Api-Key` | Yes, **unless** managed `env` pins `ANTHROPIC_API_KEY` to `""`. |
-| Managed `env.ANTHROPIC_BASE_URL` | Request target | No. User settings and shell `ANTHROPIC_BASE_URL` lose. |
-
-Empirically, if managed settings omit the empty pin:
-
-1. `apiKeyHelper` still runs.
-2. `Authorization: Bearer` is still the projected pod JWT.
-3. A developer `export ANTHROPIC_API_KEY=sk-...` **wins `X-Api-Key`**.
-
-Anthropic-compatible gateways typically authenticate on `X-Api-Key`. Leaving that header writable would let a workspace user substitute a credential even though the helper JWT is also present on `Authorization`.
-
-Therefore this ADR **requires** managed settings to pin:
-
-* `ANTHROPIC_API_KEY: ""`
-* `ANTHROPIC_AUTH_TOKEN: ""`
-
-Managed `env` is written into the Claude Code process at startup and replaces the inherited shell values. After that pin, both outbound headers carry the helper JWT.
-
-Workspace images must **not** start Claude Code with `--bare`. Bare mode only honors `apiKeyHelper` from `--settings`, which would skip `/etc/claude-code/managed-settings.json`.
-
-### 2. In-Container Go Loopback Daemon
-
-* **Startup Initialization:** Started in the background during container entrypoint; calls the internal Digital Wallet API to retrieve the opaque `ciphertext` blob (`vault:v1:...`) and retains it exclusively in memory.
-* **Process Hardening:** Sets `prctl(PR_SET_DUMPABLE, 0)` at initialization to prevent `ptrace` attachment and `/proc/$PID/mem` dumps by non-root same-UID processes.
-* **Loopback Intercept:** Binds strictly to `127.0.0.1:9999`. On inbound requests, attaches the pod's current JWT (`X-Pod-Token`) and ciphertext (`X-Vault-Ciphertext`), streaming chunked HTTP/SSE payloads to the external gateway.
-
-### 3. External Go Proxy & Vault Decryption
-
-* **JWT Verification:** Validates the signature and audience of `X-Pod-Token` using cached cluster OIDC public keys (`/openid/v1/jwks`).
-* **Contextual Decryption:** Extracts `claims["kubernetes.io"]["pod"]["uid"]` and passes it as the context string to HashiCorp Vault Transit (`/transit/decrypt/workspace-meter`). Decryption fails if the ciphertext was generated under a different pod or workspace context.
-* **Lazy Rehydration Cache:** Decrypted keys are cached in-memory keyed by `pod.uid` + `hash(ciphertext)` with an LRU TTL matching the token lifespan.
-* **Upstream Forwarding:** Strips all internal attestation headers, replaces them with standard upstream credentials, and routes to LiteLLM.
-
----
-
-## Consequences & Security Posture
-
-### Positive Consequences
-
-* **Immunity to SNAT / IP Collisions:** Workspaces on shared nodes cannot spoof identity; identity is cryptographically derived from the K8s API-signed JWT.
-* **Zero Plaintext Secret Exposure:** Workspace processes and developers only ever interact with ciphertext. Plaintext LiteLLM keys reside solely in the central proxy memory.
-* **Forced Helper Credentials:** Managed `apiKeyHelper` plus pinned-empty `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` bind both `Authorization` and `X-Api-Key` to the projected pod JWT. User-settings helpers and shell exports do not win.
-* **Non-Repudiation & Auditability:** All token consumption in LiteLLM is strictly bound to verified `pod.uid` and `serviceaccount.name` claims.
-* **Bypass Resistance:** `allowManagedPermissionRulesOnly: true` prevents users from redirecting traffic to unauthorized endpoints. Managed `ANTHROPIC_BASE_URL` keeps model traffic on loopback.
-
-### Negative Consequences & Mitigations
-
-* **Digital Wallet Dependency on Boot:** If the Digital Wallet is unreachable at pod startup, the loopback daemon fails to acquire the ciphertext.
-* *Mitigation:* The daemon returns a structured `503 Service Unavailable` with retry-after headers rather than crashing.
-
-* **Streaming Latency Overhead:** Adding a loopback hop before the external proxy.
-* *Mitigation:* The Go daemon uses `net/http/httputil.ReverseProxy` with immediate buffer flushing (`FlushInterval: -1`), adding <0.5ms latency.
-
-* **Header-split footgun if the empty pin is omitted:** `apiKeyHelper` can look enforced while `X-Api-Key` still carries a developer export.
-* *Mitigation:* Treat empty `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in managed settings as a mandatory control, not an optional hardening. Image builds and admission checks must reject a managed-settings file that omits those keys.
-
----
-
-## Validation (managed settings slice)
-
-The kind lab in this repository validates the Claude Code control plane only: managed settings, `apiKeyHelper`, and loopback header capture. It does not exercise the Go daemon, Vault Transit, or LiteLLM.
-
-Observed against Claude Code `2.1.236`:
-
-1. Managed `apiKeyHelper` runs; a user-settings helper does not.
-2. Managed `ANTHROPIC_BASE_URL=http://127.0.0.1:9999` wins over user settings and a hostile shell `ANTHROPIC_BASE_URL`.
-3. Without the empty pin, `Authorization: Bearer` is the projected JWT and `X-Api-Key` is the shell export.
-4. With `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` pinned to `""`, both headers are the projected JWT (`aud: litellm-proxy`, `kubernetes.io.pod.uid` present).
+* **Node Clock Synchronization:** K8s worker nodes must maintain accurate NTP synchronization to keep token `iat` evaluation within the 120-second validity window.
+* **Single Receiver Topology:** The deduplication table resides in process RAM. If horizontal scaling of the receiver is ever required, this map must be moved to a shared store.
