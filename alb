@@ -1,158 +1,277 @@
-## Context
+# ADR-002: Distributed Read-Only Git Storage via In-Cluster Replica, Decoupled Node FUSE Daemons, and Thin CSI
 
-Applications acting as senders execute a one-time startup bootstrap to retrieve sensitive initialization material from a single, dedicated receiver service. Subsequent requests only occur upon pod restart.
-
-Relying solely on projected Service Account tokens (JWTs) allows an exfiltrated token to be used in out-of-band requests (`curl`). Similarly, if an attacker acquires a new JWT inside the cluster, they must not be able to replay old ciphertext or craft unauthorized requests without access to active cryptographic keys.
-
-Key requirements:
-
-1. **Confidentiality & Origin Authenticity:** Guaranteed via symmetric Authenticated Encryption with Associated Data (AES-256-GCM).
-2. **Cryptographic Token Binding (AAD):** The outbound request is bound to the exact projected Kubernetes Service Account JWT via GCM Additional Authenticated Data (AAD), preventing token-swapping and new-JWT replay attacks.
-3. **Dual Anti-Replay Guardrails:**
-* Strict $\le 120\text{s}$ fresh token window ($\vert{}T_{\text{recv}} - \text{claims}["\text{iat}"]\vert{} \le 120\text{s}$).
-* In-memory deduplication table locking the native `claims["jti"]` UUID for 120 seconds.
-
-
-4. **Lifecycle & Evergreen Alignment:** Monthly key rotation managed by Airflow, matching our **bi-weekly evergreen image rebuild cadence** (and CVE patch triggers).
-5. **Strict Retention Depth ($N-2$):** Vault KV-v2 and the receiver retain only the active key down to $N-2$ ($[N-2, N]$).
-6. **Zero External Runtime Dependencies:** No distributed caching layers (e.g., Redis); all state resides in receiver RAM.
+* **Status:** Accepted
+* **Date:** 2026-08-27
+* **Deciders:** Architecture & Platform Engineering Teams
 
 ---
 
-## Decision
+## Context and Problem Statement
 
-We will implement an **AES-256-GCM** one-time bootstrap workflow where symmetric keys are rotated monthly via **Apache Airflow**, stored in **HashiCorp Vault KV-v2**, injected into sender binaries at build time via GitLab CI/CD, and validated by a **single receiver instance** using the token's native `jti` for in-memory deduplication.
+Apps across a multi-node Kubernetes cluster need fast, read-only access to versioned config, schemas, and asset trees from a trunk-based GitLab monorepo.
 
-### 1. Wire Protocol & AAD Cryptographic Binding
+When an MR merges to `main`, those updates must show up for workloads **without** each pod cloning Git, rebuilding images, or restarting.
 
-* **HTTP Headers:**
-* `Authorization: Bearer <PROJECTED_K8S_JWT>`
-* `X-Key-Version: <version_int>` (e.g., `4`)
-* `Content-Type: application/octet-stream`
+### What we must satisfy
 
+* **No pull storms on GitLab.** Hundreds of nodes/pods cloning corporate GitLab at once causes rate limits, WAN cost, and saturation. We want **one** (or few) in-cluster mirror(s); nodes pull from that.
+* **Unprivileged apps.** Application pods stay locked down (`runAsNonRoot`, drop all caps, no `/dev/fuse`, no `hostPath`). Privileged work stays in platform DaemonSets (`git-csi-system`).
+* **Upgradeable platform without breaking reads.** Rolling the CSI driver or sync logic must not cut live file I/O in apps.
+* **Stable views when needed.** Some apps boot-lock to one Git version for their lifetime; others may track live trunk.
+* **Developers pick version in app config.** No annotations / CSI attributes for tag or SHA — apps use `CONFIG_PATH`.
+* **Protect the node OS disk.** Git objects and caches live on **dedicated** node storage so root (`/`) does not fill and trigger `NodeHasDiskPressure`.
 
-* **HTTP Body (Raw Binary):**
+---
 
-$$\text{Payload} = [\text{12-byte GCM Nonce/IV}] + [\text{AES-256-GCM Ciphertext}] + [\text{16-byte Auth Tag}]$$
+## Plain-language building blocks
 
+These terms show up throughout the decision. The substance is technical; the analogies are only for orientation.
 
-* **Additional Authenticated Data (AAD):**
-Both parties compute AAD in local memory:
+| Term | Plain meaning | Analogy |
+| --- | --- | --- |
+| **In-cluster Git replica** | A Git server **inside** the cluster that holds a copy of the monorepo | A **branch library** in the building: everyone borrows from it instead of driving across town to HQ (GitLab) |
+| **FUSE** | A small privileged process that makes a **virtual folder** look like a real filesystem (reads are answered in userspace) | A **librarian at a desk**: when you open a path under `/mnt/git`, the librarian fetches the right page. If the librarian leaves, the desk is still there but reading fails |
+| **CSI** | Kubernetes plug-in that attaches storage into a pod when it starts | The **building keycard system**: it does not own the library; it only unlocks “put this folder at `/mnt/git` inside this apartment (pod)” |
+| **Bind-mount** | “Same folder, second door” — the pod sees the node’s FUSE export at `/mnt/git` | Pointing a second doorway at the same room |
+| **DaemonSet** | One platform pod **per node**, always | A **building engineer on every floor** |
+| **`CONFIG_PATH`** | Env var telling the app *which* path under `/mnt/git` to use (live trunk, tag, or SHA) | Which shelf in the library you agreed to read from |
+| **`nsenter` (host mount namespace)** | Run mount work as if on the **node itself**, not only inside a container’s private view | Operating the real building HVAC, not a mock panel in a closet that the lobby never sees |
 
-$$\text{AAD} = \text{KeyVersion} \mathbin{\Vert} \text{SHA-256}(\text{Raw JWT Bytes})$$
+**How the pieces fit (one sentence):** the replica feeds each node; **FUSE** publishes a virtual Git tree on that node; **CSI** attaches that tree into each app pod; the app chooses a path via **`CONFIG_PATH`**.
 
+---
 
+## Architecture Decision
 
-*Any modification to the token, attempting to pair a new JWT with previous ciphertext, or changing the key version header causes GCM authentication to fail ($403\text{ Forbidden}$).*
+We adopt a **two-tier** design:
 
-### 2. Key Lifecycle, Evergreen Builds & Retention Policy
+1. **Tier 1 — In-cluster Git replica:** One Git HTTP service in the cluster, on a dedicated block volume (`ReadWriteOnce`, e.g. gp3). Corporate GitLab is only the north–south source (mirror push / webhook on merge).
+2. **Tier 2 — Three node DaemonSets:** On every worker, three separate jobs (sync, FUSE export, CSI attach) so they can fail and upgrade independently. Apps get a normal folder at `/mnt/git` via a CSI ephemeral volume.
 
-* **Monthly Airflow DAG:**
-1. Generates a fresh 256-bit key (`os.urandom(32)`).
-2. Increments version to $N+1$.
-3. Writes `{"data": "<version>:<base64_key>"}` to Vault KV-v2.
-4. Triggers the GitLab CI/CD pipeline API to rebuild and deploy the sender.
+```
+[Primary GitLab (Trunk `main`)]
+               │
+               ▼ (North-South: 1 Mirror Push / Webhook on Merge)
+┌─────────────────────────────────────────────────────────────┐
+│ In-Cluster Git Replica Pod (per Cluster)                    │
+│   ├── Dedicated Block PVC (RWO, gp3/NVMe)                   │
+│   ├── Bare Repository (/data/repo.git)                      │
+│   └── post-receive hook -> ConfigMap: `git-release-state`   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼ (K8s API Watch + Intra-Cluster East-West Pull)
+┌─────────────────────────────────────────────────────────────┐
+│ Worker Node (Host Mount Namespace via `nsenter`)            │
+│ Dedicated Storage: /mnt/git-storage/{backend,fuse}          │
+│                                                             │
+│  ┌───────────────────────┐   ┌───────────────────────────┐  │
+│  │   git-reconciler DS   │   │        git-fuse DS        │  │
+│  │ (Watch + Git CLI Pull)│   │ (Long-lived FUSE Engine)  │  │
+│  └───────────┬───────────┘   └─────────────┬─────────────┘  │
+│              │ Updates                     │ Exports        │
+│              ▼                             ▼                │
+│     /mnt/git-storage/backend     /mnt/git-storage/fuse      │
+│                                            │                │
+│                              ┌─────────────┴─────────────┐  │
+│                              │        git-csi DS         │  │
+│                              │  (Thin Bind-Mount gRPC)   │  │
+│                              └─────────────┬─────────────┘  │
+│                                            │ Bind-mount     │
+│                                            ▼                │
+│                     Kubelet Pod Volume (/mnt/git/)          │
+└────────────────────────────────────────────┬────────────────┘
+                                             ▼
+                        [Application Pod] (100% Unprivileged)
+                        Reads /mnt/git via $CONFIG_PATH
 
+```
 
-* **Build & Deployment Cadence:**
-* Sender images are built on a **bi-weekly evergreen schedule**, upon **vulnerability remediation**, or upon **monthly Airflow key rotation**.
-* Builds inject the active key into the binary:
+---
+
+## Proven Implementation vs. Target Production Design
+
+Lab work validated the **shape** of the system (replica → node sync → FUSE → CSI → app). Some internals used simpler stand-ins; production still targets the full design:
+
+| Subsystem | Lab-proven baseline (kind & EKS) | Target production design |
+| --- | --- | --- |
+| **In-cluster Git replica** | Dumb HTTP static server + ConfigMap seeding | Smart HTTP (`git-http-backend` / Nginx) + automated `post-receive` hook |
+| **FUSE engine** | Loopback FUSE over materialized commit directories | `go-fuse` lazy `git cat-file` over the bare object DB (no full tree materialize) |
+| **Garbage collection** | Static retention / manual prune | Automated keep-set (trunk + tags + TTL + FUSE open-inode refs) |
+
+---
+
+## Node Subsystem: Three Upgrade Domains
+
+Think of three building staff with different blast radii:
+
+| DaemonSet | Job (plain) | Job (technical) | Privileges | Upgrade |
+| --- | --- | --- | --- | --- |
+| **`git-reconciler`** | Keeps the local Git cache up to date | Watches ConfigMap, `git fetch`, writes `/mnt/git-storage/backend` | Host FS R/W | **Roll freely** — FUSE stays up |
+| **`git-csi`** | Attaches the library door into each apartment | CSI `NodeServer`: host-ns bind-mount into the pod | `hostPID` + mount ns | **Roll freely** — active reads continue |
+| **`git-fuse`** | Runs the librarian (virtual filesystem) | Owns `/dev/fuse`; exports `/mnt/git-storage/fuse` | `privileged`, `hostPID` | **Controlled only** — restart ⇒ local `ENOTCONN` |
+
+**Why three processes, not one:** if FUSE and CSI share a pod, every CSI roll restarts FUSE and disconnects every app on that node. Splitting them is the core upgrade-domain decision.
+
+---
+
+## Host Mount Namespace & Node Prerequisites
+
+### 1. Host namespace + ban on CSI-local FUSE binds
+
+Mount work must be visible to **kubelet on the node**, not only inside a container.
+
+* `git-fuse` and `git-csi` use `hostPID: true` and run mounts via:
+
 ```bash
-go build -trimpath -ldflags "-s -w -X main.InjectedSecret=${SECRET_VAL}" -o /app/sender .
-
+nsenter --mount=/proc/1/ns/mnt -- /usr/local/bin/git-fuse /mnt/git-storage/fuse
 ```
 
+* **Do not** bind-mount `/mnt/git-storage/fuse` into the `git-csi` container. After FUSE remounts on the host, that container-local view can stay `ENOTCONN` forever while the host export is healthy. CSI publish and health checks must go through the **host** namespace (`nsenter`).
 
+### 2. Node disk and OS packages (AL2023 / Enterprise Linux)
 
+* **Dedicated volume** per worker (e.g. extra EBS gp3) at `/mnt/git-storage` with `backend/` and `fuse/`.
+* **Native host FUSE packages** (glibc), installed at bootstrap:
 
-* **Strict $N-2$ Retention Ceiling:**
-* Vault KV-v2 retains `max_versions = 3`.
-* The receiver maintains an in-memory keychain containing strictly $[N-2, N]$. Key versions $< N-2$ are rejected.
+```bash
+dnf install -y fuse fuse-libs fuse3 fuse3-libs
+```
 
-
-* **Sender Memory Hygiene:**
-* The sender parses `InjectedSecret` at startup into mutable byte buffers, initializes `cipher.NewGCM`, and immediately zeroes the intermediate raw key slice from memory.
-
-
-
-### 3. Receiver Verification & In-Memory Single-Use Locking
-
-* **Step 1: JWT & Claim Verification:**
-* Verifies cluster signature via K8s JWKS / public keys.
-* Validates namespace/service account claims against authorization policy.
-* Enforces startup freshness: $\vert{}T_{\text{recv}} - \text{claims}["\text{iat}"]\vert{} \le 120\text{s}$. If $> 120\text{s}$, returns `401 Unauthorized`.
-
-
-* **Step 2: Native `jti` Dedup Lock:**
-* Checks `TryAcquire(claims["jti"], TTL=120s)` on an in-memory `sync.Mutex` map.
-* Duplicate attempts with the same token within 120s return `409 Conflict`.
-
-
-* **Step 3: Keychain Lookup & AAD Decryption:**
-* Resolves `X-Key-Version` from memory keychain $[N-2, N]$.
-* Computes expected AAD: $\text{KeyVersion} \mathbin{\Vert} \text{SHA-256}(\text{Raw JWT Bytes})$.
-* Decrypts payload with `gcm.Open(...)`.
-* Returns decrypted secret bootstrap material via `HTTP 200 OK`.
-
-
+Do **not** copy Alpine/musl `fusermount` onto an AL2023 host — the dynamic linker will reject it.
 
 ---
 
-## Architecture Flow
+## Virtual Filesystem Layout & How Apps Consume It
+
+Apps see a normal directory tree at `/mnt/git/` (they do not speak Git or FUSE):
 
 ```
-+-----------------------------------------------------------------------------------+
-| 1. Key Lifecycle & Evergreen Build Pipeline                                       |
-|    [Airflow Monthly DAG] --> Generate Key N+1 / Write to Vault KV-v2 (Max=3)      |
-|             |                                                                     |
-|             +--(Trigger)---+                                                      |
-|                            v                                                      |
-|    [Bi-Weekly Evergreen / CVE Rebuild] --> [GitLab CI/CD Pipeline]                |
-|                                                    |                              |
-|                                                    +--> Fetch active key from KV  |
-|                                                    +--> go build -ldflags "-s -w" |
-|                                                    +--> Rolling deploy sender     |
-+-----------------------------------------------------------------------------------+
-
-+-----------------------------------------------------------------------------------+
-| 2. Sender One-Time Startup (Go)                                                   |
-|    - Parse & zero raw key memory -> Init AES-256-GCM                              |
-|    - Read fresh Projected K8s JWT from volume mount (/var/run/secrets/...)        |
-|    - Generate 12-byte random Nonce                                                |
-|    - Compute AAD: [kid + SHA256(JWT)]                                             |
-|    - Encrypt: gcm.Seal(nil, nonce, plaintext, AAD)                                |
-|    - Send Single HTTP POST (Headers: Auth Bearer, X-Key-Version) ------------->+  |
-+---------------------------------------------------------------------------------|-+
-                                                                                  |
-+---------------------------------------------------------------------------------v-+
-| 3. Single Receiver Workflow (Go)                                                  |
-|    a. Verify JWT signature via K8s JWKS & verify |Now - iat| <= 120s              |
-|    b. Dedup Lock: TryAcquire(claims["jti"], TTL=120s) -> 409 Conflict if seen     |
-|    c. Keychain Lookup: Match `X-Key-Version` against memory cache [N-2, N]        |
-|    d. Reconstruct AAD: [kid + SHA256(JWT)]                                        |
-|    e. GCM Decrypt: gcm.Open(nil, nonce, ciphertext+tag, AAD)                      |
-|    f. Return Secret Bootstrap Material & HTTP 200 OK                              |
-+-----------------------------------------------------------------------------------+
-
+/mnt/git/
+  ├── CURRENT_SHA                   # Active trunk SHA (text file)
+  ├── current ──────────────────────► symlink → commits/<active-sha>/
+  │
+  ├── tags/
+  │     ├── v1.0.0 ─────────────────► ../commits/sha-111111/
+  │     ├── v1.2.0 ─────────────────► ../commits/sha-222222/
+  │     └── stable ─────────────────► ../commits/sha-222222/
+  │
+  └── commits/                      # Immutable trees per SHA
+        ├── sha-111111/
+        ├── sha-222222/
+        └── sha-333333/
 ```
+
+### Consumption patterns
+
+1. **Live trunk (default):** read `/mnt/git/current/...` — updates appear when that node flips `current`.
+2. **Boot snapshot (recommended for complex apps):** resolve once at startup and keep that directory for the process life:
+
+```python
+from pathlib import Path
+CONFIG_ROOT = Path("/mnt/git/current").resolve()
+# e.g. permanently /mnt/git/commits/sha-333333/
+```
+
+Later trunk flips do not move this process; a new pod picks up the latest.
+3. **Tag pin:** `CONFIG_PATH=/mnt/git/tags/v1.2.0`
+4. **SHA pin:** `CONFIG_PATH=/mnt/git/commits/sha-111111`
+
+### Atomic `current` flip
+
+```bash
+ln -sfn commits/<new-sha> /mnt/git-storage/fuse/current
+```
+
+Do **not** `mv` onto a directory symlink — it follows into the target and leaves `current` pointing at the old SHA.
 
 ---
 
-## Consequences
+## Consistency Model
 
-### Positive
+* **Model:** per-node **eventual consistency** (each node fetches and flips on its own).
+* **Lab baseline (3× m5.large EKS):** converge in about **2–6 seconds** after ConfigMap update (spread ≈ 3s).
+* **SLO stance:** multi-second mixed-version windows across nodes are **normal**. Sub-second cluster-wide atomic flips are **not** promised. Fleet-scale monorepo latency still needs characterization.
 
-* **Multi-Layer Replay Defense:**
-* Same request within 120s is blocked by the in-memory `jti` lock (`409 Conflict`).
-* Old request after 120s is blocked by the `iat` age check (`401 Unauthorized`).
-* Replaying old ciphertext with a freshly minted JWT fails AEAD tag validation due to the AAD hash mismatch (`403 Forbidden`).
+---
 
+## Tradeoff & Awareness: When FUSE Dies on One Node
 
-* **Zero Custom Message IDs:** Eliminates the need for custom `X-Message-ID` headers by relying on the Kubernetes-managed `jti` and `iat` claims.
-* **Operational Alignment:** Key rotation integrates naturally with the bi-weekly evergreen container patching model.
-* **No External Infrastructure:** Replay protection and keychain caching require only standard Go memory primitives on the single receiver instance.
+This is an intentional tradeoff of node-local FUSE, not a surprise failure mode.
 
-### Negative / Trade-offs
+### What happens
 
-* **Node Clock Synchronization:** K8s worker nodes must maintain accurate NTP synchronization to keep token `iat` evaluation within the 120-second validity window.
-* **Single Receiver Topology:** The deduplication table resides in process RAM. If horizontal scaling of the receiver is ever required, this map must be moved to a shared store.
+| Scope | Effect |
+| --- | --- |
+| **Apps on the bad node** | Reads fail with `ENOTCONN` / “transport endpoint is not connected.” The mount *looks* present (`findmnt` / `mountpoint` can still succeed) but content is dead. |
+| **Apps on other nodes** | **Unaffected** — FUSE is per-node. |
+| **Restarting FUSE alone** | Brings the librarian back for the **node**, but **does not** repair doors already unlocked into running pods. Those pods stay broken until replaced (or remounted) after cleanup. |
+
+### How apps get healthy again
+
+* **Move / reschedule the pod to a healthy node:** yes — that **fixes the app**. CSI publishes a fresh bind to that node’s live FUSE export.
+* **Stay on the same node:** only after FUSE is healthy again **and** stale CSI mounts are purged, then the pod is recreated. Restarting the app without cleanup can leave kubelet stuck on dead mount paths.
+
+### Runbook vs automation
+
+The **sequence** is mandatory (not optional Kubernetes magic):
+
+1. Evict or delete consumer pods on the affected node (or cordon + drain so they move elsewhere).
+2. If remounting on that node: lazy-unmount dead CSI targets under `/var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*/mount`.
+3. Confirm host export is readable (`/mnt/git-storage/fuse/CURRENT_SHA` — active read, not only `mountpoint`).
+4. Allow pods back (reschedule or recreate).
+
+This can be a **human runbook** or an **automated controller** that performs the same steps. What we do **not** get is silent in-place healing of dead FUSE file handles inside already-running pods.
+
+**Stakeholder takeaway:** CSI and reconciler upgrades are routine; **FUSE upgrades and FUSE crashes are a node maintenance event** (move workloads away, or drain–purge–remount on that node).
+
+---
+
+## Operational Runbooks & Failure Handling
+
+### 1. Health probes must read content
+
+`mountpoint -q` / `findmnt` can succeed on a **dead** FUSE mount. Probes and CSI checks must actively read, e.g.:
+
+```bash
+# From a pod: /mnt/git/CURRENT_SHA
+# From the host / fuse DaemonSet: /mnt/git-storage/fuse/CURRENT_SHA
+head -c 1 /mnt/git-storage/fuse/CURRENT_SHA >/dev/null 2>&1
+```
+
+### 2. CSI stale-mount recovery
+
+In `NodePublishVolume` / `NodeUnpublishVolume`:
+
+* Detect `ENOTCONN` on the target; `umount -l` before rebinding.
+* `NodeUnpublishVolume` must return OK even if the mount is already dead (otherwise pod deletion deadlocks).
+
+### 3. FUSE upgrade / same-node recovery procedure
+
+1. Drain/evict consumers on the target node.
+2. Lazy-unmount stale CSI mounts under kubelet as above.
+3. Restart `git-fuse`; verify host `CURRENT_SHA` is readable.
+4. Bring consumers back. With required 1-pod-per-node anti-affinity, prefer **Recreate** (or delete+create) over RollingUpdate to avoid scheduling deadlocks.
+
+---
+
+## Node Garbage Collection (Target Design)
+
+Periodic prune of `/mnt/git-storage/backend`. Keep a SHA if **any** of:
+
+1. It is the resolved `/mnt/git/current`.
+2. Any `/mnt/git/tags/*` points at it.
+3. It is within the last N commits on `main` (e.g. 10).
+4. It is inside a TTL window (e.g. 48h).
+5. FUSE still has open file descriptors / inodes for it.
+
+Everything else may be unlinked and removed via background `git prune` / `git repack` (not on the hot path of every fetch).
+
+---
+
+## Technical Stack Summary
+
+* **Git transport:** Smart HTTP on RWO PVC *(target)*; dumb HTTP proven in lab.
+* **Sync:** real `git` in `git-reconciler` (ConfigMap watch + periodic `git ls-remote`).
+* **Filesystem:** lazy `go-fuse` + `git cat-file` *(target)*; loopback FUSE over materialized trees proven in lab.
+* **CSI:** thin Go `NodeServer`; host-ns bind-mount via `nsenter`.
+* **Packaging:** Helm; system DaemonSets in `git-csi-system`.
