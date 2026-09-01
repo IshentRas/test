@@ -80,3 +80,60 @@ The same scripts are available as thin wrappers:
 ```
 
 Those delegate to `test/scripts/`.
+
+## Build and push images (org registry)
+
+You must build and push images from the parent quest repo. Bottlerocket does **not** ship `git-fuse` / `git-csi` — that logic lives in `fuse-csi/`.
+
+### All images (recommended)
+
+```bash
+cd test
+IMAGE_TAG=<your-tag> ./scripts/eks-push-images.sh
+```
+
+Writes `eks/images.env` with ECR URLs for render/apply.
+
+### `fuse-csi` only (manual)
+
+One image powers **both** `git-fuse` and `git-csi` DaemonSets:
+
+| Artifact in image | DaemonSet | Role |
+|---|---|---|
+| `git-fuse` | `git-fuse` | FUSE server (`DirectMountStrict` on Bottlerocket) |
+| `git-csi` | `git-csi` | CSI node plugin (bind-mount into pods) |
+| `adr001-busybox` | both | static busybox copied to `/mnt/git-storage/bins/busybox` for `nsenter` on host mount ns |
+
+```bash
+QUEST_ROOT=~/Projects/adr-001-git-csi-kind-quest   # or default `..`
+REGISTRY=<account>.dkr.ecr.<region>.amazonaws.com
+TAG=<your-tag>
+
+docker build --platform linux/amd64 \
+  -t "${REGISTRY}/adr001-fuse-csi:${TAG}" \
+  "${QUEST_ROOT}/fuse-csi"
+docker push "${REGISTRY}/adr001-fuse-csi:${TAG}"
+```
+
+Also push **`adr001-reconciler`** (materializes git backend). Production uses your real git remote instead of `fake-git`.
+
+```bash
+docker build --platform linux/amd64 \
+  -t "${REGISTRY}/adr001-reconciler:${TAG}" \
+  -f "${QUEST_ROOT}/reconciler/Dockerfile.ubi9" \
+  "${QUEST_ROOT}/reconciler"
+docker push "${REGISTRY}/adr001-reconciler:${TAG}"
+```
+
+### Bottlerocket deploy order
+
+Do **not** apply `eks/install-fuse.yaml` on Bottlerocket (no host `dnf`).
+
+1. `br-node-storage` — format/mount extra EBS → `/mnt/git-storage`
+2. `run-eks-br-probe.sh` (or karpenter probe) — gate: `PROBE_OK`
+3. `git-reconciler`
+4. `git-fuse` + `git-csi` (same `adr001-fuse-csi` image)
+5. app / workloads
+
+`br-node-storage` handles disk only; FUSE userspace comes from the `fuse-csi` image (`git-fuse` binary + `/dev/fuse` on the node).
+
