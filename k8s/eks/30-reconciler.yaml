@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: git-reconciler
+  namespace: adr001
+spec:
+  selector:
+    matchLabels:
+      app: git-reconciler
+  template:
+    metadata:
+      labels:
+        app: git-reconciler
+        upgrade-domain: reconciler
+    spec:
+      serviceAccountName: reconciler
+      nodeSelector:
+        adr002.io/role: git-worker
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: reconciler
+          image: ${RECONCILER_IMAGE}
+          imagePullPolicy: Always
+          env:
+            - name: EXPORT_ROOT
+              value: /mnt/git-storage/backend
+            - name: CACHE_ROOT
+              value: /var/git-cache
+            - name: GIT_REMOTE
+              value: http://fake-git.adr001.svc.cluster.local:8080/repo.git
+            - name: NAMESPACE
+              value: adr001
+            - name: CONFIGMAP
+              value: git-release-state
+          volumeMounts:
+            - name: backend
+              mountPath: /mnt/git-storage/backend
+            - name: cache
+              mountPath: /var/git-cache
+      volumes:
+        - name: backend
+          hostPath:
+            path: /mnt/git-storage/backend
+            type: DirectoryOrCreate
+        - name: cache
+          emptyDir: {}

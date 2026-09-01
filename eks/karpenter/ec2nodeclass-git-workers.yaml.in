@@ -1,0 +1,40 @@
+# Render with: CLUSTER=adr002-git-csi-karpenter ./scripts/eks-karpenter-render.sh
+# IMPORTANT: specify BOTH /dev/xvda and /dev/xvdb — partial blockDeviceMappings fall back
+# to AMI defaults for xvda (often 2Gi gp2). See karpenter-provider-aws#8747.
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: git-workers-bottlerocket
+spec:
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    # Pin to EKS 1.35 Bottlerocket line when possible; @latest drifts on AMI updates.
+    - alias: bottlerocket@latest
+  role: ${KARPENTER_NODE_ROLE}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER}
+  blockDeviceMappings:
+    # Bottlerocket control volume (kubelet/containerd).
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 80Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+    # Extra gp3 for Git cache/FUSE — same role as eksctl additionalVolumes on BR MNG lab.
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 40Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+  userData: |
+    [settings.host-containers.admin]
+    enabled = true
+  tags:
+    adr002.io/nodepool: git-workers
+    project: adr-002

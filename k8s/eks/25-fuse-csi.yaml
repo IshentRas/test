@@ -1,0 +1,194 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: git.csi.adr001.local
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  fsGroupPolicy: None
+  volumeLifecycleModes:
+    - Ephemeral
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: git-csi
+  namespace: adr001
+---
+# Long-lived FUSE on dedicated node disk (/mnt/git-storage/fuse).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: git-fuse
+  namespace: adr001
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: git-fuse
+  template:
+    metadata:
+      labels:
+        app: git-fuse
+        upgrade-domain: fuse
+    spec:
+      hostPID: true
+      nodeSelector:
+        adr002.io/role: git-worker
+      serviceAccountName: git-csi
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: fuse
+          image: ${FUSE_CSI_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              BINS=/var/lib/adr001-bins
+              mkdir -p "$BINS"
+              cp -f /usr/local/bin/adr001-busybox "$BINS/busybox" || cp -f /bin/busybox "$BINS/busybox"
+              cp -f /usr/local/bin/git-fuse "$BINS/git-fuse"
+              chmod 755 "$BINS/busybox" "$BINS/git-fuse"
+              # Bottlerocket: never call host sh/brush — only static busybox + git-fuse on host path.
+              BB=/mnt/git-storage/bins/busybox
+              HF=/mnt/git-storage/bins/git-fuse
+              nsenter --mount=/proc/1/ns/mnt -- "$BB" umount -l /mnt/git-storage/fuse 2>/dev/null || true
+              nsenter --mount=/proc/1/ns/mnt -- "$BB" mkdir -p /mnt/git-storage/fuse /mnt/git-storage/backend
+              nsenter --mount=/proc/1/ns/mnt -- "$BB" ln -sfn /mnt/git-storage/backend /var/git-backend
+              nsenter --mount=/proc/1/ns/mnt -- "$BB" ln -sfn /mnt/git-storage/fuse /var/git-fuse
+              exec nsenter --mount=/proc/1/ns/mnt -- "$HF" \
+                -backend=/mnt/git-storage/backend \
+                -mountpoint=/mnt/git-storage/fuse
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: bins
+              mountPath: /var/lib/adr001-bins
+            - name: fuse-device
+              mountPath: /dev/fuse
+          livenessProbe:
+            exec:
+              command:
+                - nsenter
+                - --mount=/proc/1/ns/mnt
+                - --
+                - /mnt/git-storage/bins/busybox
+                - sh
+                - -c
+                - findmnt /mnt/git-storage/fuse >/dev/null && ls /mnt/git-storage/fuse >/dev/null
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - nsenter
+                - --mount=/proc/1/ns/mnt
+                - --
+                - /mnt/git-storage/bins/busybox
+                - sh
+                - -c
+                - findmnt /mnt/git-storage/fuse >/dev/null && ls /mnt/git-storage/fuse >/dev/null && test -f /mnt/git-storage/fuse/CURRENT_SHA
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+      volumes:
+        - name: bins
+          hostPath:
+            path: /mnt/git-storage/bins
+            type: DirectoryOrCreate
+        - name: fuse-device
+          hostPath:
+            path: /dev/fuse
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: git-csi
+  namespace: adr001
+spec:
+  selector:
+    matchLabels:
+      app: git-csi
+  template:
+    metadata:
+      labels:
+        app: git-csi
+        upgrade-domain: csi
+    spec:
+      hostPID: true
+      hostNetwork: true
+      nodeSelector:
+        adr002.io/role: git-worker
+      serviceAccountName: git-csi
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: csi-plugin
+          image: ${FUSE_CSI_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              BINS=/mnt/git-storage/bins
+              mkdir -p "$BINS"
+              cp -f /usr/local/bin/adr001-busybox "$BINS/busybox" || cp -f /bin/busybox "$BINS/busybox"
+              chmod 755 "$BINS/busybox"
+              exec /usr/local/bin/git-csi \
+                -endpoint=unix:///csi/csi.sock \
+                -fuse-export=/mnt/git-storage/fuse \
+                -host-tools=/mnt/git-storage/bins
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: pods-mount
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: bins
+              mountPath: /mnt/git-storage/bins
+
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/git.csi.adr001.local/csi.sock
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/git.csi.adr001.local
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: pods-mount
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: bins
+          hostPath:
+            path: /mnt/git-storage/bins
+            type: DirectoryOrCreate

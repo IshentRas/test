@@ -1,0 +1,90 @@
+# Ephemeral 3-node EKS lab for ADR-001 Git CSI + FUSE validation.
+# Create:  ./scripts/eks-up.sh
+# Destroy: ./scripts/eks-down.sh
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: adr001-git-csi
+  region: us-east-1
+  version: "1.31"
+  tags:
+    project: adr-001
+    purpose: git-csi-quest
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: aws-ebs-csi-driver
+    wellKnownPolicies:
+      ebsCSIController: true
+
+managedNodeGroups:
+  - name: git-workers
+    instanceType: m5.large
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    volumeSize: 40
+    volumeType: gp3
+    amiFamily: AmazonLinux2023
+    privateNetworking: false
+    labels:
+      adr001.io/role: git-worker
+      adr002.io/role: git-worker
+    tags:
+      adr001.io/nodegroup: git-workers
+    iam:
+      withAddonPolicies:
+        ebs: true
+        imageBuilder: true
+    # Extra gp3 dedicated to Git object cache + FUSE export (off root FS).
+    additionalVolumes:
+      - volumeName: /dev/xvdb
+        volumeSize: 40
+        volumeType: gp3
+        volumeEncrypted: true
+    preBootstrapCommands:
+      - |
+        set -eux
+        # AL2023 NVMe: second EBS often appears as nvme1n1 (xvdb mapping).
+        DISK=""
+        for cand in /dev/nvme1n1 /dev/xvdb /dev/sdf; do
+          if [ -b "$cand" ]; then DISK="$cand"; break; fi
+        done
+        if [ -z "$DISK" ]; then
+          # Wait up to ~2m for attach
+          for i in $(seq 1 24); do
+            for cand in /dev/nvme1n1 /dev/xvdb /dev/sdf; do
+              if [ -b "$cand" ]; then DISK="$cand"; break 2; fi
+            done
+            sleep 5
+          done
+        fi
+        if [ -z "$DISK" ]; then
+          echo "ERROR: additional git-storage volume not found" >&2
+          exit 1
+        fi
+        if ! blkid "$DISK" >/dev/null 2>&1; then
+          mkfs.xfs -f "$DISK"
+        fi
+        mkdir -p /mnt/git-storage
+        if ! mountpoint -q /mnt/git-storage; then
+          mount "$DISK" /mnt/git-storage
+        fi
+        UUID="$(blkid -s UUID -o value "$DISK")"
+        grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /mnt/git-storage xfs defaults,nofail 0 2" >> /etc/fstab
+        mkdir -p /mnt/git-storage/backend /mnt/git-storage/fuse /mnt/git-storage/bins
+        chmod 755 /mnt/git-storage /mnt/git-storage/backend /mnt/git-storage/fuse
+        # FUSE userspace helpers required by go-fuse when mounting in host ns
+        # (looks for /bin/fusermount and /usr/bin/fusermount3).
+        dnf install -y fuse fuse-libs fuse3 fuse3-libs || yum install -y fuse fuse-libs fuse3 fuse3-libs || true
+        modprobe fuse || true
+        # Stable paths used by reconciler / FUSE / CSI (same as kind quest).
+        ln -sfn /mnt/git-storage/backend /var/git-backend
+        ln -sfn /mnt/git-storage/fuse /var/git-fuse
+        ln -sfn /mnt/git-storage/bins /var/lib/adr001-bins

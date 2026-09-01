@@ -1,0 +1,80 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: adr001-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fake-git-data
+  namespace: adr001
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: adr001-gp3
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-git
+  namespace: adr001
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fake-git
+  template:
+    metadata:
+      labels:
+        app: fake-git
+    spec:
+      containers:
+        - name: fake-git
+          image: ${FAKE_GIT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /state.json
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /state.json
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /git
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: fake-git-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-git
+  namespace: adr001
+spec:
+  selector:
+    app: fake-git
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

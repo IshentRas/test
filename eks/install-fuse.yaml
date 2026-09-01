@@ -1,0 +1,45 @@
+# Install fuse + fuse3 on AL2023 workers (required for host-ns go-fuse via nsenter).
+# go-fuse looks for /bin/fusermount and/or /usr/bin/fusermount3 in the *host* mount ns.
+# Alpine musl fusermount cannot run on the glibc host — use host dnf.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adr001-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: install-fuse
+  namespace: adr001-system
+spec:
+  selector:
+    matchLabels:
+      app: install-fuse
+  template:
+    metadata:
+      labels:
+        app: install-fuse
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: install
+          # Quest image provides nsenter; host provides dnf + fusermount after install.
+          image: 209561498705.dkr.ecr.us-east-1.amazonaws.com/adr001-fuse-csi:eks
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -eux
+              nsenter --mount=/proc/1/ns/mnt -- /usr/bin/dnf install -y fuse fuse-libs fuse3 fuse3-libs
+              nsenter --mount=/proc/1/ns/mnt -- /usr/sbin/modprobe fuse || true
+              nsenter --mount=/proc/1/ns/mnt -- sh -c '
+                ls -l /bin/fusermount /bin/fusermount3 /usr/bin/fusermount /usr/bin/fusermount3
+                /bin/fusermount -V || true
+                /usr/bin/fusermount3 --version || true
+              '
+              sleep infinity

@@ -1,0 +1,60 @@
+# Platform-managed Deployment: CSI volume at /mnt/git; version via CONFIG_PATH env.
+# 3 replicas with required anti-affinity → one app per worker node for multi-node tests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: adr001
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: adr001-app
+  template:
+    metadata:
+      labels:
+        app: adr001-app
+    spec:
+      serviceAccountName: app
+      nodeSelector:
+        adr002.io/role: git-worker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: adr001-app
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: app
+          image: ${APP_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          env:
+            - name: CONFIG_PATH
+              value: /mnt/git/current
+            - name: GIT_ROOT
+              value: /mnt/git
+            - name: NAMESPACE
+              value: adr001
+            - name: CONFIGMAP
+              value: git-release-state
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: git-ro
+              mountPath: /mnt/git
+              readOnly: true
+      volumes:
+        - name: git-ro
+          csi:
+            driver: git.csi.adr001.local
+            readOnly: true

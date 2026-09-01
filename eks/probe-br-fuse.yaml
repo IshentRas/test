@@ -1,0 +1,85 @@
+# Gate probe: Bottlerocket host-ns FUSE via DirectMountStrict.
+# Only nsenter the static Go git-fuse binary (no host brush, no musl busybox).
+# Prep + verify use Bidirectional /mnt in the container.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: br-fuse-probe
+  namespace: adr001-system
+spec:
+  selector:
+    matchLabels:
+      app: br-fuse-probe
+  template:
+    metadata:
+      labels:
+        app: br-fuse-probe
+    spec:
+      hostPID: true
+      nodeSelector:
+        adr002.io/role: git-worker
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: probe
+          image: 209561498705.dkr.ecr.us-east-1.amazonaws.com/adr001-fuse-csi:eks-br
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fuse-dev
+              mountPath: /dev/fuse
+            - name: bins
+              mountPath: /mnt/git-storage/bins
+            - name: mnt
+              mountPath: /mnt
+              mountPropagation: Bidirectional
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -eux
+              mkdir -p /mnt/git-storage/backend /mnt/git-storage/fuse /mnt/git-storage/bins
+              cp -f /usr/local/bin/git-fuse /mnt/git-storage/bins/git-fuse
+              chmod 755 /mnt/git-storage/bins/git-fuse
+              echo "probe-content" > /mnt/git-storage/backend/CURRENT_SHA
+              # Clear stale export if any (busybox not required — Go binary + umount via container mount view).
+              umount -l /mnt/git-storage/fuse 2>/dev/null || true
+              nsenter --mount=/proc/1/ns/mnt -- /bin/umount -l /mnt/git-storage/fuse 2>/dev/null || true
+              echo "=== start git-fuse in host mount ns (static binary) ==="
+              nsenter --mount=/proc/1/ns/mnt -- /mnt/git-storage/bins/git-fuse \
+                -backend=/mnt/git-storage/backend \
+                -mountpoint=/mnt/git-storage/fuse &
+              FPID=$!
+              OK=0
+              for i in $(seq 1 40); do
+                # Prefer container view of shared /mnt (propagated host FUSE).
+                if cat /mnt/git-storage/fuse/CURRENT_SHA 2>/dev/null | grep -q probe-content; then
+                  OK=1
+                  break
+                fi
+                sleep 1
+              done
+              if [ "$OK" -eq 1 ]; then
+                echo "PROBE_OK: host-ns FUSE readable (DirectMountStrict on Bottlerocket)"
+                findmnt /mnt/git-storage/fuse || true
+              else
+                echo "PROBE_FAIL: could not read FUSE export"
+                ls -la /mnt/git-storage/fuse 2>&1 || true
+                ls -la /dev/fuse 2>&1 || true
+              fi
+              kill "$FPID" 2>/dev/null || true
+              umount -l /mnt/git-storage/fuse 2>/dev/null || true
+              sleep infinity
+      volumes:
+        - name: fuse-dev
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
+        - name: bins
+          hostPath:
+            path: /mnt/git-storage/bins
+            type: DirectoryOrCreate
+        - name: mnt
+          hostPath:
+            path: /mnt
+            type: DirectoryOrCreate

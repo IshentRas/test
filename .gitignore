@@ -1,0 +1,4 @@
+.DS_Store
+eks/rendered/
+eks/karpenter/rendered/
+eks/images.env

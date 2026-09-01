@@ -1,0 +1,44 @@
+# Holds three git-worker nodes for the lab (one pod per node via anti-affinity).
+# Karpenter provisions Bottlerocket nodes when these pods are Pending.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adr001-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-worker-scale
+  namespace: adr001-system
+  labels:
+    app: git-worker-scale
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: git-worker-scale
+  template:
+    metadata:
+      labels:
+        app: git-worker-scale
+    spec:
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+        adr002.io/role: git-worker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: git-worker-scale
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: hold
+          image: registry.access.redhat.com/ubi9/ubi-minimal:9.5
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

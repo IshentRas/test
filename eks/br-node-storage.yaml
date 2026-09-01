@@ -1,0 +1,91 @@
+# Bottlerocket: format + mount second EBS at host /mnt/git-storage.
+# Do NOT nsenter into host shell (Bottlerocket brush blocks cat/bash).
+# Mount under /mnt with Bidirectional so it propagates to the host.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adr001-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: br-node-storage
+  namespace: adr001-system
+spec:
+  selector:
+    matchLabels:
+      app: br-node-storage
+  template:
+    metadata:
+      labels:
+        app: br-node-storage
+    spec:
+      nodeSelector:
+        adr002.io/role: git-worker
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: setup
+          # UBI9 public repos do not ship xfsprogs/e2fsprogs; use AL2023 for disk bootstrap only.
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: mnt
+              mountPath: /mnt
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              set -ux
+              dnf install -y xfsprogs e2fsprogs util-linux >/dev/null
+              DISK=""
+              for cand in /dev/nvme1n1 /dev/xvdb /dev/sdf; do
+                if [ -b "$cand" ]; then DISK="$cand"; break; fi
+              done
+              mkdir -p /mnt/git-storage
+              if mountpoint -q /mnt/git-storage; then
+                echo "/mnt/git-storage already a mountpoint"
+              elif [ -n "$DISK" ]; then
+                SRC="$(findmnt -n -o TARGET -S "$DISK" 2>/dev/null | head -1 || true)"
+                if [ -n "$SRC" ] && [ "$SRC" != "/mnt/git-storage" ]; then
+                  echo "disk $DISK already at $SRC — bind to /mnt/git-storage"
+                  mount --bind "$SRC" /mnt/git-storage
+                elif [ -n "$SRC" ]; then
+                  echo "disk $DISK already mounted at /mnt/git-storage"
+                else
+                  if ! blkid "$DISK" >/dev/null 2>&1; then
+                    mkfs.xfs -f "$DISK" || mkfs.ext4 -F "$DISK"
+                  fi
+                  if ! mount "$DISK" /mnt/git-storage 2>/dev/null; then
+                    SRC="$(findmnt -n -o TARGET -S "$DISK" 2>/dev/null | head -1 || true)"
+                    if [ -n "$SRC" ]; then
+                      echo "mount busy — binding $SRC to /mnt/git-storage"
+                      mount --bind "$SRC" /mnt/git-storage
+                    else
+                      echo "WARN: could not mount $DISK" >&2
+                    fi
+                  else
+                    echo "mounted $DISK on /mnt/git-storage"
+                  fi
+                fi
+              else
+                echo "WARN: no extra disk; using /mnt/git-storage on existing /mnt" >&2
+              fi
+              mkdir -p /mnt/git-storage/backend /mnt/git-storage/fuse /mnt/git-storage/bins
+              chmod 755 /mnt/git-storage /mnt/git-storage/backend /mnt/git-storage/fuse
+              df -h /mnt/git-storage
+              echo "br-node-storage OK disk=${DISK:-none}"
+              sleep infinity
+      volumes:
+        - name: mnt
+          hostPath:
+            path: /mnt
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory

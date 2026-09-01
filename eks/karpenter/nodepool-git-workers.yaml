@@ -1,0 +1,34 @@
+# NodePool for ADR-002 git CSI workers (Bottlerocket + extra EBS via EC2NodeClass).
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: git-workers
+spec:
+  template:
+    metadata:
+      labels:
+        adr002.io/role: git-worker
+        adr002.io/os: bottlerocket
+        adr002.io/provisioner: karpenter
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: git-workers-bottlerocket
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["m5.large"]
+      expireAfter: 720h
+  limits:
+    cpu: "12"
+    memory: 48Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m

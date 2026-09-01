@@ -1,0 +1,58 @@
+# Ephemeral EKS 1.35 + Bottlerocket lab for ADR-002 workplace gate.
+# Create:  ./scripts/eks-br-up.sh
+# Destroy: ./scripts/eks-br-down.sh
+#
+# Critical unknown vs AL2023 lab: host FUSE without dnf-installed fusermount.
+# git-fuse uses go-fuse DirectMountStrict (/dev/fuse only).
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: adr002-git-csi-br
+  region: us-east-1
+  version: "1.35"
+  tags:
+    project: adr-002
+    purpose: bottlerocket-fuse-gate
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: aws-ebs-csi-driver
+    wellKnownPolicies:
+      ebsCSIController: true
+
+managedNodeGroups:
+  - name: br-git-workers
+    instanceType: m5.large
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    # Bottlerocket data volume (containerd/kubelet); keep reasonably sized.
+    volumeSize: 80
+    volumeType: gp3
+    amiFamily: Bottlerocket
+    privateNetworking: false
+    labels:
+      adr002.io/role: git-worker
+      adr002.io/os: bottlerocket
+    tags:
+      adr002.io/nodegroup: br-git-workers
+    iam:
+      withAddonPolicies:
+        ebs: true
+        imageBuilder: true
+    # Extra gp3 for Git cache/FUSE — mounted by eks/br-node-storage.yaml (no dnf/preBootstrap).
+    additionalVolumes:
+      - volumeName: /dev/xvdb
+        volumeSize: 40
+        volumeType: gp3
+        volumeEncrypted: true
+    bottlerocket:
+      enableAdminContainer: true
+      settings:
+        motd: "ADR-002 Bottlerocket Git CSI lab"
