@@ -1,0 +1,18 @@
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.5
+
+RUN microdnf install -y git bash python3 \
+  && ARCH="$(uname -m)" \
+  && case "$ARCH" in \
+       x86_64) KARCH=amd64 ;; \
+       aarch64) KARCH=arm64 ;; \
+       *) echo "unsupported arch $ARCH" >&2; exit 1 ;; \
+     esac \
+  && curl -fsSL -o /usr/local/bin/kubectl \
+    "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${KARCH}/kubectl" \
+  && chmod +x /usr/local/bin/kubectl \
+  && microdnf clean all
+
+COPY reconcile.sh /reconcile.sh
+RUN chmod +x /reconcile.sh
+
+ENTRYPOINT ["/reconcile.sh"]

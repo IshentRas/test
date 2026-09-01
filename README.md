@@ -1,15 +1,15 @@
 # EKS test reference — ADR-001 / ADR-002
 
-Self-contained runbooks, cluster configs, manifests, and quest scripts for validating Git CSI on EKS.
-
-Image builds still use the parent quest repo (`QUEST_ROOT`, default: `..`):
+Self-contained runbooks, cluster configs, manifests, quest scripts, and **image build sources** for validating Git CSI on EKS.
 
 | Build context | Path |
 |---|---|
-| fake-git | `$QUEST_ROOT/fake-git` |
-| reconciler | `$QUEST_ROOT/reconciler` |
-| fuse-csi | `$QUEST_ROOT/fuse-csi` |
-| app | `$QUEST_ROOT/app` |
+| fake-git | `fake-git/` |
+| reconciler | `reconciler/` |
+| fuse-csi | `fuse-csi/` |
+| app | `app/` |
+
+Set `QUEST_ROOT` only if build contexts live elsewhere.
 
 ## Prerequisites
 
@@ -53,6 +53,10 @@ Quest writes findings to `docs/EKS-FINDINGS.md` (overwritten each run).
 
 ```
 test/
+  fuse-csi/         # git-fuse + git-csi + static busybox (Dockerfile)
+  reconciler/       # git-reconciler (Dockerfile / Dockerfile.ubi9)
+  fake-git/         # lab fake git server
+  app/              # lab validation app
   scripts/          # up/down/render/push/probe/quest
   eks/              # eksctl configs, node storage, probes
   k8s/eks/          # workload manifests (rendered with ECR refs)
@@ -63,7 +67,7 @@ test/
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUEST_ROOT` | `..` | Parent repo with Docker build contexts |
+| `QUEST_ROOT` | `.` (this repo) | Override if sources are elsewhere |
 | `CLUSTER` | per script | EKS cluster name |
 | `AWS_REGION` | `us-east-1` | AWS region |
 | `IMAGE_TAG` | `eks` | ECR image tag |
@@ -83,7 +87,7 @@ Those delegate to `test/scripts/`.
 
 ## Build and push images (org registry)
 
-You must build and push images from the parent quest repo. Bottlerocket does **not** ship `git-fuse` / `git-csi` — that logic lives in `fuse-csi/`.
+You must build and push images from this repo. Bottlerocket does **not** ship `git-fuse` / `git-csi` — that logic lives in `fuse-csi/`.
 
 ### All images (recommended)
 
@@ -105,13 +109,12 @@ One image powers **both** `git-fuse` and `git-csi` DaemonSets:
 | `adr001-busybox` | both | static busybox copied to `/mnt/git-storage/bins/busybox` for `nsenter` on host mount ns |
 
 ```bash
-QUEST_ROOT=~/Projects/adr-001-git-csi-kind-quest   # or default `..`
 REGISTRY=<account>.dkr.ecr.<region>.amazonaws.com
 TAG=<your-tag>
 
 docker build --platform linux/amd64 \
   -t "${REGISTRY}/adr001-fuse-csi:${TAG}" \
-  "${QUEST_ROOT}/fuse-csi"
+  fuse-csi/
 docker push "${REGISTRY}/adr001-fuse-csi:${TAG}"
 ```
 
@@ -120,8 +123,7 @@ Also push **`adr001-reconciler`** (materializes git backend). Production uses yo
 ```bash
 docker build --platform linux/amd64 \
   -t "${REGISTRY}/adr001-reconciler:${TAG}" \
-  -f "${QUEST_ROOT}/reconciler/Dockerfile.ubi9" \
-  "${QUEST_ROOT}/reconciler"
+  -f reconciler/Dockerfile.ubi9 reconciler/
 docker push "${REGISTRY}/adr001-reconciler:${TAG}"
 ```
 
