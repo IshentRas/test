@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adr001/replica-lab/internal/auth"
 	"github.com/adr001/replica-lab/internal/gitexec"
 	"github.com/adr001/replica-lab/internal/k8sstate"
 )
@@ -38,8 +39,6 @@ func runServer() error {
 	listen := env("LISTEN", ":8080")
 	dataRoot := env("DATA_ROOT", "/data")
 	repoName := env("REPO_NAME", "repo.git")
-	ns := env("NAMESPACE", "adr001")
-	cmName := env("CONFIGMAP", "git-release-state")
 
 	repoPath := filepath.Join(dataRoot, repoName)
 	if err := os.MkdirAll(dataRoot, 0o755); err != nil {
@@ -71,7 +70,14 @@ func runServer() error {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	// Smart HTTP: GitLab (or lab mirror job) pushes here; reconcilers fetch via upload-pack.
-	mux.Handle("/"+repoName+"/", gitCGI)
+	gitHandler := http.Handler(gitCGI)
+	if creds, ok := auth.LoadPushCredentials(); ok {
+		gitHandler = auth.PushAuthMiddleware(creds, gitHandler)
+		log.Printf("push auth enabled (user=%q); fetch remains open", creds.User)
+	} else {
+		log.Print("push auth disabled — set PUSH_AUTH_USER and PUSH_AUTH_PASSWORD for GitLab mirror")
+	}
+	mux.Handle("/"+repoName+"/", gitHandler)
 
 	log.Printf("git-replica listening on %s repo=%s (empty until first push)", listen, repoPath)
 	srv := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 30 * time.Second}
