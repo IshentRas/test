@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/adr001/replica-lab/internal/k8sstate"
 	"github.com/adr001/replica-lab/internal/layout"
@@ -51,29 +50,9 @@ func main() {
 	}
 	reconcile(active, tags)
 
-	ticker := time.NewTicker(5 * time.Second)
-	go func() {
-		for range ticker.C {
-			a, t, err := k8s.GetRelease(ctx)
-			if err != nil {
-				log.Printf("poll configmap: %v", err)
-				continue
-			}
-			reconcile(a, t)
-		}
-	}()
-
-	go func() {
-		for {
-			err := k8sstate.Watch(ctx, ns, cmName, func(a, t string) {
-				reconcile(a, t)
-			})
-			log.Printf("watch ended: %v; retry in 2s", err)
-			time.Sleep(2 * time.Second)
-		}
-	}()
-
-	select {}
+	if err := k8sstate.WatchLoop(ctx, ns, cmName, reconcile); err != nil {
+		log.Fatalf("watch configmap: %v", err)
+	}
 }
 
 func env(key, def string) string {

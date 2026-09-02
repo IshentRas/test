@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,17 +74,59 @@ func (c *Client) GetRelease(ctx context.Context) (active string, tagsJSON string
 	return cm.Data["ACTIVE_COMMIT"], cm.Data["ACTIVE_TAGS"], nil
 }
 
-func Watch(ctx context.Context, namespace, name string, onChange func(active, tags string)) error {
-	cfg, err := restConfig()
+// WatchLoop subscribes to ConfigMap changes via the API server watch stream.
+// On disconnect it re-reads the ConfigMap (catch-up) and reconnects with
+// exponential backoff.
+func WatchLoop(ctx context.Context, namespace, name string, onChange func(active, tags string)) error {
+	const (
+		minBackoff     = time.Second
+		maxBackoff     = 30 * time.Second
+		stableWatchFor = 30 * time.Second
+	)
+
+	client, err := New(namespace, name)
 	if err != nil {
 		return err
 	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return err
+
+	backoff := minBackoff
+	first := true
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if !first {
+			active, tags, err := client.GetRelease(ctx)
+			if err != nil {
+				if err := sleep(ctx, backoff); err != nil {
+					return err
+				}
+				backoff = nextBackoff(backoff, maxBackoff)
+				continue
+			}
+			onChange(active, tags)
+		}
+		first = false
+
+		started := time.Now()
+		_ = watchOnce(ctx, client, onChange)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Since(started) >= stableWatchFor {
+			backoff = minBackoff
+		}
+		if err := sleep(ctx, backoff); err != nil {
+			return err
+		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
-	w, err := cs.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: "metadata.name=" + name,
+}
+
+func watchOnce(ctx context.Context, client *Client, onChange func(active, tags string)) error {
+	w, err := client.cs.CoreV1().ConfigMaps(client.namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector: "metadata.name=" + client.name,
 	})
 	if err != nil {
 		return err
@@ -103,14 +146,7 @@ func Watch(ctx context.Context, namespace, name string, onChange func(active, ta
 			if !ok {
 				continue
 			}
-			active := ""
-			tags := "{}"
-			if cm.Data != nil {
-				active = cm.Data["ACTIVE_COMMIT"]
-				if cm.Data["ACTIVE_TAGS"] != "" {
-					tags = cm.Data["ACTIVE_TAGS"]
-				}
-			}
+			active, tags := releaseFromCM(cm)
 			if active == lastActive && tags == lastTags {
 				continue
 			}
@@ -118,4 +154,36 @@ func Watch(ctx context.Context, namespace, name string, onChange func(active, ta
 			onChange(active, tags)
 		}
 	}
+}
+
+func releaseFromCM(cm *corev1.ConfigMap) (active, tags string) {
+	active = ""
+	tags = "{}"
+	if cm.Data == nil {
+		return active, tags
+	}
+	active = cm.Data["ACTIVE_COMMIT"]
+	if cm.Data["ACTIVE_TAGS"] != "" {
+		tags = cm.Data["ACTIVE_TAGS"]
+	}
+	return active, tags
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func nextBackoff(cur, max time.Duration) time.Duration {
+	cur *= 2
+	if cur > max {
+		return max
+	}
+	return cur
 }
