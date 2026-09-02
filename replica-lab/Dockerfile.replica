@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+ENV GOTOOLCHAIN=auto
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/git-replica ./cmd/replica
+
+# UBI9-minimal ships git-http-backend (Alpine git does not).
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.5
+RUN microdnf install -y git git-core tar \
+  && microdnf clean all
+COPY --from=build /out/git-replica /usr/local/bin/git-replica
+ENV DATA_ROOT=/data REPO_NAME=repo.git LISTEN=:8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/git-replica"]

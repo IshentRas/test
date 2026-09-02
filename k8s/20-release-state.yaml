@@ -1,0 +1,9 @@
+# Placeholder; run-kind-test.sh replaces ACTIVE_COMMIT/ACTIVE_TAGS from fake-git meta.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-release-state
+  namespace: adr001
+data:
+  ACTIVE_COMMIT: "pending"
+  ACTIVE_TAGS: "{}"

@@ -1,0 +1,12 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: adr001
+nodes:
+  - role: control-plane
+    extraMounts:
+      # Reconciler materialization (FUSE loopback backend).
+      - hostPath: /tmp/adr001-git-backend
+        containerPath: /var/git-backend
+      # FUSE mountpoint shared with CSI bind-mounts into pods.
+      - hostPath: /tmp/adr001-git-fuse
+        containerPath: /var/git-fuse

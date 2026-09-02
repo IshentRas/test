@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: git-replica
+  namespace: adr001
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: git-replica-release-state
+  namespace: adr001
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-state-writer
+subjects:
+  - kind: ServiceAccount
+    name: git-replica
+    namespace: adr001
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: git-replica-data
+  namespace: adr001
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-replica
+  namespace: adr001
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: git-replica
+  template:
+    metadata:
+      labels:
+        app: git-replica
+    spec:
+      serviceAccountName: git-replica
+      containers:
+        - name: replica
+          image: adr001-git-replica:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: UPSTREAM_URL
+              value: http://fake-git.adr001.svc.cluster.local:8080/repo.git
+            - name: NAMESPACE
+              value: adr001
+            - name: CONFIGMAP
+              value: git-release-state
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: git-replica-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-replica
+  namespace: adr001
+spec:
+  selector:
+    app: git-replica
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-reconciler-go
+  namespace: adr001
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: git-reconciler-go
+  template:
+    metadata:
+      labels:
+        app: git-reconciler-go
+    spec:
+      serviceAccountName: reconciler
+      containers:
+        - name: reconciler
+          image: adr001-git-reconciler-go:local
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+          env:
+            - name: EXPORT_ROOT
+              value: /var/git-backend
+            - name: GIT_REMOTE
+              value: http://git-replica.adr001.svc.cluster.local:8080/repo.git
+            - name: NAMESPACE
+              value: adr001
+            - name: CONFIGMAP
+              value: git-release-state
+          volumeMounts:
+            - name: backend
+              mountPath: /var/git-backend
+      volumes:
+        - name: backend
+          hostPath:
+            path: /var/git-backend
+            type: DirectoryOrCreate

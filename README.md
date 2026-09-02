@@ -26,7 +26,18 @@ Set `QUEST_ROOT` only if build contexts live elsewhere.
 
 Runbooks: [`docs/BOTTLEROCKET-LAB.md`](docs/BOTTLEROCKET-LAB.md), [`docs/KARPENTER-LAB.md`](docs/KARPENTER-LAB.md).
 
-## Typical flow
+## Replica lab (kind, no FUSE/CSI)
+
+Validates **upstream → git-replica (Go + Smart HTTP on UBI9) → git-reconciler-go → node backend**:
+
+```bash
+cd test
+./scripts/run-replica-lab.sh
+RECREATE=1 ./scripts/run-replica-lab.sh   # clean cluster
+```
+
+See [`docs/REPLICA-LAB.md`](docs/REPLICA-LAB.md). Code in `replica-lab/`.
+
 
 ```bash
 cd test
@@ -53,6 +64,7 @@ Quest writes findings to `docs/EKS-FINDINGS.md` (overwritten each run).
 
 ```
 test/
+  replica-lab/      # Go git-replica + git-reconciler (UBI9, git-http-backend)
   fuse-csi/         # git-fuse + git-csi + static busybox (Dockerfile)
   reconciler/       # git-reconciler (Dockerfile / Dockerfile.ubi9)
   fake-git/         # lab fake git server
