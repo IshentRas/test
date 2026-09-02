@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: overlay-workspace
+  namespace: adr001
+  labels:
+    app: overlay-workspace
+spec:
+  restartPolicy: Never
+  containers:
+    - name: workspace
+      image: busybox:1.36
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          set -eu
+          mkdir -p /scratch/upper /scratch/work /workspace
+          # Idempotent: remount if already mounted (pod restart on same node).
+          if ! grep -q ' /workspace ' /proc/mounts; then
+            mount -t overlay overlay \
+              -o "lowerdir=/lower,upperdir=/scratch/upper,workdir=/scratch/work" \
+              /workspace
+          fi
+          echo "overlay ready base=$(cat /scratch/.base_commit_sha 2>/dev/null || echo unknown)"
+          exec sleep infinity
+      volumeMounts:
+        # lower must be a real local FS mount (not virtiofs/ro host bind) or OverlayFS
+        # comes up read-only. Kind-on-Mac: paths live on the node disk, seeded by the lab script.
+        - name: lower
+          mountPath: /lower
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: lower
+      hostPath:
+        path: /overlay-lab/lower
+        type: Directory
+    - name: scratch
+      hostPath:
+        path: /overlay-lab/scratch
+        type: DirectoryOrCreate

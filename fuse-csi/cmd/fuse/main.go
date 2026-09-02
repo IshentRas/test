@@ -53,13 +53,16 @@ func main() {
 	// Safe on AL2023/kind when we already run privileged in the host mount ns.
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther:         true,
-			Options:            []string{"ro", "default_permissions"},
-			FsName:             "adr001-git",
-			Name:               "adr001git",
-			DisableXAttrs:      true,
-			DirectMount:        true,
-			DirectMountStrict:  true,
+			AllowOther:        true,
+			Options:           []string{"ro", "default_permissions"},
+			FsName:            "adr001-git",
+			Name:              "adr001git",
+			DisableXAttrs:     true,
+			DirectMount:       true,
+			DirectMountStrict: true,
+			// Advertise FUSE_ALLOW_IDMAP so kubelet can apply MOUNT_ATTR_IDMAP
+			// for pods with hostUsers: false (user namespaces).
+			IDMappedMount: true,
 		},
 	}
 
