@@ -98,6 +98,24 @@ Changing base under an existing upper requires wipe or an explicit rebase of the
 
 PVC is required if scratch must survive reboot / reschedule. `emptyDir` is only for disposable sessions.
 
+### Why not s3fs ([s3fs-fuse](https://github.com/s3fs-fuse/s3fs-fuse)) as the overlay upperdir
+
+Sharing via a shared S3 bucket looks attractive (“one scratch everyone can see”). It is a **poor live upperdir** for OverlayFS / fuse-overlayfs.
+
+| Overlay need | Block PVC (XFS/ext4) | s3fs-fuse |
+|---|---|---|
+| Whiteouts | Character devices (or xattrs) on a real POSIX FS | **S3 cannot store chardev whiteouts**; xattr support is incomplete |
+| Overlay `upperdir` / `workdir` | Supported | Typically **EINVAL / unsupported** (FUSE cannot be a kernel overlay upper; same class of failure as virtiofs in the kind lab) |
+| Atomic rename, `workdir/` internals | Local disk | Eventual consistency, high metadata latency |
+| Multi-writer | One RWO attach (safe) | Concurrent writers on one prefix **corrupt** the overlay |
+| Latency | Sub-ms | Extra FUSE + S3 round trips per syscall |
+
+Kind already showed **virtiofs cannot host a writable overlay upperdir**. s3fs is FUSE + object storage — strictly worse.
+
+**What S3 is good for:** exporting a *translated* delta (files + whiteouts→deletes) as objects, or a side mount at `/share` for large artifacts. Not the live `/workspace` COW layer.
+
+**How we share instead:** publish service walks the **private PVC upperdir** → Git **tag** (`ws/…`) or **MR**. Colleagues consume via existing RO `tags/` + `CONFIG_PATH`. No shared live mount.
+
 ---
 
 ## Publish service (share vs promote)
@@ -195,7 +213,7 @@ publish(mode=promote)
 ## What we are not doing (yet)
 
 - Lazy `git cat-file` FUSE (monorepo read optimization)
-- s3fs (or any FUSE) as overlay upperdir
+- s3fs (or any FUSE) as overlay upperdir — see [Why not s3fs](#why-not-s3fs-s3fs-fuse-as-the-overlay-upperdir)
 - Shared live upperdir across users
 - Direct push to git-replica bypassing GitLab as source of truth for shares
 
