@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kind lab: upstream fake-git → Go git-replica → Go git-reconciler (no FUSE/CSI).
+# Kind lab: fake-git push → Go git-replica → Go git-reconciler (no FUSE/CSI).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,6 +43,15 @@ echo "== wait upstream + replica + reconciler =="
 kubectl -n "$NS" rollout status deployment/fake-git --timeout=180s
 kubectl -n "$NS" rollout status deployment/git-replica --timeout=180s
 kubectl -n "$NS" rollout status deployment/git-reconciler-go --timeout=180s
+
+echo "== simulate GitLab push mirror (fake-git -> replica) =="
+kubectl -n "$NS" delete pod gitlab-mirror-push --ignore-not-found=true --wait=true 2>/dev/null || true
+kubectl -n "$NS" run gitlab-mirror-push --restart=Never --image="$UPSTREAM_IMAGE" --image-pull-policy=IfNotPresent \
+  --command -- bash -ec \
+  "git clone http://fake-git.${NS}.svc.cluster.local:8080/repo.git /tmp/w && cd /tmp/w && git push http://git-replica.${NS}.svc.cluster.local:8080/repo.git main --tags"
+kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/gitlab-mirror-push --timeout=120s
+kubectl -n "$NS" logs pod/gitlab-mirror-push
+kubectl -n "$NS" delete pod gitlab-mirror-push --ignore-not-found=true
 
 echo "== read shas from fake-git =="
 POD="$(kubectl -n "$NS" get pod -l app=fake-git -o jsonpath='{.items[0].metadata.name}')"
@@ -101,6 +110,6 @@ done
 
 echo ""
 echo "REPLICA LAB OK"
-echo "  upstream fake-git  -> git-replica (mirror + CM patch)"
-echo "  git-replica        -> git-reconciler-go (watch + fetch + materialize)"
-echo "  node backend       -> /var/git-backend on kind control-plane"
+echo "  fake-git push  -> git-replica (empty bare + post-receive CM patch)"
+echo "  git-replica    -> git-reconciler-go (watch + fetch + materialize)"
+echo "  node backend   -> /var/git-backend on kind control-plane"

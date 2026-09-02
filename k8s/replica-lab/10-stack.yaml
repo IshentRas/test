@@ -55,8 +55,6 @@ spec:
             - containerPort: 8080
               name: http
           env:
-            - name: UPSTREAM_URL
-              value: http://fake-git.adr001.svc.cluster.local:8080/repo.git
             - name: NAMESPACE
               value: adr001
             - name: CONFIGMAP
