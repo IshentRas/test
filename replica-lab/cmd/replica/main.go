@@ -47,6 +47,9 @@ func runServer() error {
 	if err := ensureBare(repoPath); err != nil {
 		return err
 	}
+	if err := configureHTTPAccess(repoPath); err != nil {
+		return err
+	}
 	if err := installPostReceiveHook(repoPath); err != nil {
 		return err
 	}
@@ -90,6 +93,30 @@ func ensureBare(repoPath string) error {
 	}
 	log.Printf("initializing empty bare repo at %s", repoPath)
 	return gitexec.Run("", "init", "--bare", "-b", "main", repoPath)
+}
+
+// configureHTTPAccess enables Smart HTTP services on the bare repo.
+// git-http-backend disables receive-pack for anonymous clients unless
+// http.receivepack=true. Push auth is enforced separately by auth middleware;
+// reconciler fetch uses upload-pack and stays open.
+func configureHTTPAccess(repoPath string) error {
+	if !receivePackEnabled() {
+		log.Print("GIT_RECEIVE_PACK disabled — pushes rejected by git-http-backend")
+		return nil
+	}
+	if err := gitexec.Run(repoPath, "config", "http.receivepack", "true"); err != nil {
+		return err
+	}
+	return gitexec.Run(repoPath, "config", "http.uploadpack", "true")
+}
+
+func receivePackEnabled() bool {
+	switch strings.ToLower(env("GIT_RECEIVE_PACK", "true")) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func installPostReceiveHook(repoPath string) error {
