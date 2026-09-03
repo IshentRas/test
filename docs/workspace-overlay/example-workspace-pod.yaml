@@ -1,0 +1,118 @@
+# Example: editable /workspace via fuse-overlayfs (sidecar mounts, app stays unprivileged).
+#
+# Prerequisites:
+#   - lowerdir: pinned materialized commit on real disk (hostPath here; prod: backend bind on git-worker)
+#   - scratch PVC: upperdir + workdir + .base_commit_sha
+#   - Org fuse device plugin: expose /dev/fuse to the fuse-overlay sidecar (annotations below are illustrative)
+#
+# fuse-overlayfs must keep running — use a sidecar, not a one-shot init (unlike kernel overlay).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace-scratch
+  namespace: adr001
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quant-workspace
+  namespace: adr001
+  labels:
+    app: quant-workspace
+  annotations:
+    # Illustrative — replace with your org's fuse-device-plugin annotations.
+    # Goal: inject /dev/fuse into the fuse-overlay container only.
+    containers.fuse-device-plugin.io/fuse: "fuse-overlay"
+spec:
+  # Optional hardening once idmap is verified on your kernel + fuse-overlayfs build.
+  hostUsers: false
+
+  initContainers:
+    # Pin base commit on first start (do not retarget under a live upperdir).
+    - name: pin-base
+      image: busybox:1.36
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: BASE_SHA
+          value: "REPLACE_WITH_COMMIT_SHA"
+      command:
+        - /bin/sh
+        - -ec
+        - |
+          mkdir -p /scratch/upper /scratch/work
+          if [ ! -f /scratch/.base_commit_sha ]; then
+            echo "$BASE_SHA" > /scratch/.base_commit_sha
+          fi
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+
+  containers:
+    # Privileged mounter: owns /dev/fuse + mount; quant container does not need caps.
+    - name: fuse-overlay
+      image: ${FUSE_OVERLAYFS_IMAGE:-localhost/fuse-overlayfs:local}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["SYS_ADMIN"]
+      command:
+        - /bin/sh
+        - -ec
+        - |
+          set -eu
+          mkdir -p /scratch/upper /scratch/work /workspace
+          BASE="$(cat /scratch/.base_commit_sha)"
+          echo "mounting fuse-overlayfs base=$BASE"
+          # -f = foreground (sidecar stays alive; FUSE dies if this process exits)
+          exec fuse-overlayfs -f \
+            -o "lowerdir=/lower,upperdir=/scratch/upper,workdir=/scratch/work,allow_other" \
+            /workspace
+      volumeMounts:
+        - name: lower
+          mountPath: /lower
+        - name: scratch
+          mountPath: /scratch
+        - name: workspace
+          mountPath: /workspace
+          mountPropagation: Bidirectional
+      # If your device plugin uses resource limits instead of annotations, use that here.
+
+    # Unprivileged quant / notebook / IDE workload.
+    - name: workspace
+      image: ${WORKSPACE_IMAGE:-jupyter/scipy-notebook:latest}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOME
+          value: /workspace
+      workingDir: /workspace
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+          mountPropagation: HostToContainer
+
+  volumes:
+    # Production: bind /mnt/git-storage/backend/commits/<sha> on a git-worker (not FUSE).
+    - name: lower
+      hostPath:
+        path: /mnt/git-storage/backend/commits/REPLACE_WITH_COMMIT_SHA
+        type: Directory
+    - name: scratch
+      persistentVolumeClaim:
+        claimName: workspace-scratch
+    # Shared mount point; sidecar publishes fuse-overlayfs here, app sees merged tree.
+    - name: workspace
+      emptyDir: {}

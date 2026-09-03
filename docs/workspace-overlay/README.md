@@ -116,11 +116,21 @@ Kind already showed **virtiofs cannot host a writable overlay upperdir**. s3fs i
 
 **How we share instead:** publish service walks the **private PVC upperdir** → Git **tag** (`ws/…`) or **MR**. Colleagues consume via existing RO `tags/` + `CONFIG_PATH`. No shared live mount.
 
+### Privileges: `/dev/fuse` is not enough
+
+The fuse device plugin exposes **`/dev/fuse`**. Creating the mount still needs **`CAP_SYS_ADMIN`** or **privileged** on the **mounter** (or host `fusermount3` — unavailable on Bottlerocket).
+
+Pattern: **privileged fuse-overlay sidecar** mounts `/workspace`; quant container stays unprivileged. FUSE must stay running — use a sidecar, not a one-shot init.
+
+Example manifest: [`example-workspace-pod.yaml`](example-workspace-pod.yaml)
+
 ---
 
 ## Publish service (share vs promote)
 
-One service, two modes. Same delta → commit pipeline; different refs and GitLab actions.
+**Implementation:** Go CLI in the workspace image — [`workspace-publish/`](../../workspace-publish/) (`ws-publish share|promote`). Uses the **real `git` binary** (same as replica/reconciler); go-git optional later.
+
+One CLI, two modes. Same delta → commit pipeline; different refs and GitLab actions.
 
 ```text
 upperdir + .base_commit_sha
@@ -225,7 +235,7 @@ publish(mode=promote)
 |---|---|
 | Overlay COW / whiteout / revert / durable scratch | Kind lab OK — [`OVERLAY-LAB.md`](../OVERLAY-LAB.md) |
 | Wire lower to reconciler `commits/<sha>/` on EKS | Next integration |
-| Publish service (`share` / `promote`) | Designed here — to implement |
+| Publish service (`share` / `promote`) | Skeleton CLI — [`workspace-publish/`](../../workspace-publish/) |
 | Tag retention job | Designed here — to implement |
 
 ---
