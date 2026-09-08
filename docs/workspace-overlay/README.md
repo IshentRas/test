@@ -136,6 +136,9 @@ One CLI, two modes. Same delta → commit pipeline; different refs and GitLab ac
 upperdir + .base_commit_sha
             │
             ▼
+     secret scan (upper only — see Secret scanning)
+            │
+            ▼
      apply delta → git commit (parent = base)
             │
             ├── share   → tag    refs/tags/ws/<user>/<id>
@@ -189,6 +192,60 @@ Promote additionally needs permission to **create MRs** into `main` (merge stays
 
 ---
 
+## Secret scanning (publish gate)
+
+**Status:** designed, not implemented.
+
+### The gap
+
+`promote` opens an MR, so Wiz runs in the pipeline. **`share` never opens an MR** — so today the cheap path, the one we expect people to use most, has *no* secret scanning at all.
+
+A leaked `ws/*` tag is not contained: it flows GitLab → replica → `tags/` and onto every colleague's RO mount. Deleting the tag afterwards does **not** remove the objects.
+
+Quant workspaces are a high-risk population for this. Notebooks are the worst case — `.ipynb` stores cell **outputs**, so a printed env dump or an API response containing a token gets committed as JSON without anyone knowingly writing a secret to a file.
+
+### Two layers, different jobs
+
+| Layer | Mechanism | Job | Bypassable? |
+|---|---|---|---|
+| **Server-side** | GitLab **Secret Push Protection** (Ultimate, pre-receive) | **Enforcement** — blocks the push | Only via documented skip option |
+| **Client-side** | `ws-publish` embedded scan of upperdir | **Fast feedback** — fails in <1s, names file + line | **Yes — trivially** |
+
+Enable the server-side check per project **first**; it costs no code and covers `ws/*` tag pushes over HTTPS.
+
+But it deliberately matches only **high-confidence patterns** to keep the hook fast (GitLab's docs call out that e.g. custom-prefix PATs are missed). Our actual risk is mostly *not* high-confidence: market-data vendor keys, DB connection strings, internal service creds. Necessary, **not sufficient**.
+
+> **The client-side scan is not a security control.** Quants hold their own PAT, so they can always bypass `ws-publish` and `git push` directly. It is a speed bump for **accidents**, which is the real threat model — and it must never become the reason server-side protection stays off.
+
+### Decision: embed the library, do not ship a binary
+
+Import gitleaks' detection engine (`detect` package) rather than shelling out to the CLI. Measured, `linux/amd64`, gitleaks `v8.30.1`:
+
+| Build | Size |
+|---|---|
+| `ws-publish` today (stdlib only) | 2.98 MiB |
+| `ws-publish` + gitleaks `detect`, stripped `-s -w` | **9.16 MiB** |
+| Standalone `gitleaks` CLI (for shell-out) | 23.39 MiB |
+
+Shelling out ships **both** binaries (~26 MiB) — roughly **3× larger** than embedding. Importing `detect` alone skips cobra, the report formatters, the SCM integrations, and all git-history scanning, so **`go-git` is never linked in**. We only pay for the engine we use on the delta.
+
+Module path gotcha: the repo moved to `gitleaks/gitleaks` but `go.mod` still declares the old path. Import **`github.com/zricethezav/gitleaks/v8`** — `go get github.com/gitleaks/gitleaks/v8` fails.
+
+### Where it sits
+
+Scan the **upperdir files, before building the commit** — so a detected secret never enters the temp worktree's object store. `walkUpper` already yields the exact changed-file list; whiteouts are deletions and need no scan. Delta is small, so this stays sub-second.
+
+### Rules and posture
+
+- Load rules from an **external TOML** (`config.ViperConfig` → `Translate()` → `detect.NewDetector`), not only the baked-in default set. Ship it **in the repo** so it arrives via the pinned lowerdir — versioned, reviewed, and updatable without rebuilding `ws-publish`.
+- **Block by default.** Override via `--allow-secret` requiring a reason, recorded as a **commit trailer** so it is auditable rather than silent.
+
+### Open question
+
+Wiz (MR) and gitleaks (local) are **different rule corpora**. "Local says clean, Wiz says leak" is a confusing experience for a non-technical user. Check whether the Wiz CLI has a fast local directory-scan mode before committing to gitleaks — corpus consistency may be worth more than the packaging convenience.
+
+---
+
 ## End-to-end flows
 
 ### Edit locally
@@ -237,6 +294,7 @@ publish(mode=promote)
 | Wire lower to reconciler `commits/<sha>/` on EKS | Next integration |
 | Publish service (`share` / `promote`) | Skeleton CLI — [`workspace-publish/`](../../workspace-publish/) |
 | Tag retention job | Designed here — to implement |
+| Secret scanning gate | Designed here — to implement; enable GitLab Secret Push Protection first |
 
 ---
 
