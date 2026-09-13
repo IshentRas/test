@@ -1,277 +1,385 @@
-# ADR-002: Distributed Read-Only Git Storage via In-Cluster Replica, Decoupled Node FUSE Daemons, and Thin CSI
+# ADR-0001: Agent jobs via middle service + standard Coder workspaces (OSS)
 
-* **Status:** Accepted
-* **Date:** 2026-08-27
-* **Deciders:** Architecture & Platform Engineering Teams
+- **Status:** Proposed (draft)
+- **Date:** 2026-09-13
+- **Scope:** Self-contained design proposal (identity bridge, middle service, Coder APIs, agent-job template, CI/CD)
 
----
+## Context
 
-## Context and Problem Statement
+Our organization runs **Coder open source (Community)**. We need on-demand, sandboxed agent jobs (e.g. Claude SDK inside an isolated environment) that can be started from:
 
-Apps across a multi-node Kubernetes cluster need fast, read-only access to versioned config, schemas, and asset trees from a trunk-based GitLab monorepo.
+1. Our **product UI** — users already authenticated via a **third-party IdP JWT** (not Coder dashboard SSO)
+2. **CI/CD pipelines** — machine identity against the same control plane
 
-When an MR merges to `main`, those updates must show up for workloads **without** each pod cloning Git, rebuilding images, or restarting.
+Coder’s product path for this used to look like **Coder Tasks**. That surface is being **retired** (deprecated in recent releases; removed from mainline around v2.37; continued ESR framed for Premium). **Coder Agents** (the replacement) is not a fit for us (limited interest + commercial gating for serious scale/governance).
 
-### What we must satisfy
+We still want:
 
-* **No pull storms on GitLab.** Hundreds of nodes/pods cloning corporate GitLab at once causes rate limits, WAN cost, and saturation. We want **one** (or few) in-cluster mirror(s); nodes pull from that.
-* **Unprivileged apps.** Application pods stay locked down (`runAsNonRoot`, drop all caps, no `/dev/fuse`, no `hostPath`). Privileged work stays in platform DaemonSets (`git-csi-system`).
-* **Upgradeable platform without breaking reads.** Rolling the CSI driver or sync logic must not cut live file I/O in apps.
-* **Stable views when needed.** Some apps boot-lock to one Git version for their lifetime; others may track live trunk.
-* **Developers pick version in app config.** No annotations / CSI attributes for tag or SHA — apps use `CONFIG_PATH`.
-* **Protect the node OS disk.** Git objects and caches live on **dedicated** node storage so root (`/`) does not fill and trigger `NodeHasDiskPressure`.
+- Ephemeral **sandbox isolation** (one job ≈ one workspace)
+- On-demand start/stop without end users or CI logging into Coder
+- A dedicated, locked-down template (no terminal / VS Code / browser agent apps in v1)
+- Prompt + job context passed into the workspace so an in-workspace agent runner executes the work
+- Easy **CI/CD integration** through one stable API (the middle service), not raw Coder calls from pipelines
 
----
+## Decision
 
-## Plain-language building blocks
+**Replicate the Tasks-shaped workflow using only first-class OSS primitives:**
 
-These terms show up throughout the decision. The substance is technical; the analogies are only for orientation.
-
-| Term | Plain meaning | Analogy |
-| --- | --- | --- |
-| **In-cluster Git replica** | A Git server **inside** the cluster that holds a copy of the monorepo | A **branch library** in the building: everyone borrows from it instead of driving across town to HQ (GitLab) |
-| **FUSE** | A small privileged process that makes a **virtual folder** look like a real filesystem (reads are answered in userspace) | A **librarian at a desk**: when you open a path under `/mnt/git`, the librarian fetches the right page. If the librarian leaves, the desk is still there but reading fails |
-| **CSI** | Kubernetes plug-in that attaches storage into a pod when it starts | The **building keycard system**: it does not own the library; it only unlocks “put this folder at `/mnt/git` inside this apartment (pod)” |
-| **Bind-mount** | “Same folder, second door” — the pod sees the node’s FUSE export at `/mnt/git` | Pointing a second doorway at the same room |
-| **DaemonSet** | One platform pod **per node**, always | A **building engineer on every floor** |
-| **`CONFIG_PATH`** | Env var telling the app *which* path under `/mnt/git` to use (live trunk, tag, or SHA) | Which shelf in the library you agreed to read from |
-| **`nsenter` (host mount namespace)** | Run mount work as if on the **node itself**, not only inside a container’s private view | Operating the real building HVAC, not a mock panel in a closet that the lobby never sees |
-
-**How the pieces fit (one sentence):** the replica feeds each node; **FUSE** publishes a virtual Git tree on that node; **CSI** attaches that tree into each app pod; the app chooses a path via **`CONFIG_PATH`**.
-
----
-
-## Architecture Decision
-
-We adopt a **two-tier** design:
-
-1. **Tier 1 — In-cluster Git replica:** One Git HTTP service in the cluster, on a dedicated block volume (`ReadWriteOnce`, e.g. gp3). Corporate GitLab is only the north–south source (mirror push / webhook on merge).
-2. **Tier 2 — Three node DaemonSets:** On every worker, three separate jobs (sync, FUSE export, CSI attach) so they can fail and upgrade independently. Apps get a normal folder at `/mnt/git` via a CSI ephemeral volume.
-
-```
-[Primary GitLab (Trunk `main`)]
-               │
-               ▼ (North-South: 1 Mirror Push / Webhook on Merge)
-┌─────────────────────────────────────────────────────────────┐
-│ In-Cluster Git Replica Pod (per Cluster)                    │
-│   ├── Dedicated Block PVC (RWO, gp3/NVMe)                   │
-│   ├── Bare Repository (/data/repo.git)                      │
-│   └── post-receive hook -> ConfigMap: `git-release-state`   │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼ (K8s API Watch + Intra-Cluster East-West Pull)
-┌─────────────────────────────────────────────────────────────┐
-│ Worker Node (Host Mount Namespace via `nsenter`)            │
-│ Dedicated Storage: /mnt/git-storage/{backend,fuse}          │
-│                                                             │
-│  ┌───────────────────────┐   ┌───────────────────────────┐  │
-│  │   git-reconciler DS   │   │        git-fuse DS        │  │
-│  │ (Watch + Git CLI Pull)│   │ (Long-lived FUSE Engine)  │  │
-│  └───────────┬───────────┘   └─────────────┬─────────────┘  │
-│              │ Updates                     │ Exports        │
-│              ▼                             ▼                │
-│     /mnt/git-storage/backend     /mnt/git-storage/fuse      │
-│                                            │                │
-│                              ┌─────────────┴─────────────┐  │
-│                              │        git-csi DS         │  │
-│                              │  (Thin Bind-Mount gRPC)   │  │
-│                              └─────────────┬─────────────┘  │
-│                                            │ Bind-mount     │
-│                                            ▼                │
-│                     Kubelet Pod Volume (/mnt/git/)          │
-└────────────────────────────────────────────┬────────────────┘
-                                             ▼
-                        [Application Pod] (100% Unprivileged)
-                        Reads /mnt/git via $CONFIG_PATH
-
-```
-
----
-
-## Proven Implementation vs. Target Production Design
-
-Lab work validated the **shape** of the system (replica → node sync → FUSE → CSI → app). Some internals used simpler stand-ins; production still targets the full design:
-
-| Subsystem | Lab-proven baseline (kind & EKS) | Target production design |
-| --- | --- | --- |
-| **In-cluster Git replica** | Dumb HTTP static server + ConfigMap seeding | Smart HTTP (`git-http-backend` / Nginx) + automated `post-receive` hook |
-| **FUSE engine** | Loopback FUSE over materialized commit directories | `go-fuse` lazy `git cat-file` over the bare object DB (no full tree materialize) |
-| **Garbage collection** | Static retention / manual prune | Automated keep-set (trunk + tags + TTL + FUSE open-inode refs) |
-
----
-
-## Node Subsystem: Three Upgrade Domains
-
-Think of three building staff with different blast radii:
-
-| DaemonSet | Job (plain) | Job (technical) | Privileges | Upgrade |
-| --- | --- | --- | --- | --- |
-| **`git-reconciler`** | Keeps the local Git cache up to date | Watches ConfigMap, `git fetch`, writes `/mnt/git-storage/backend` | Host FS R/W | **Roll freely** — FUSE stays up |
-| **`git-csi`** | Attaches the library door into each apartment | CSI `NodeServer`: host-ns bind-mount into the pod | `hostPID` + mount ns | **Roll freely** — active reads continue |
-| **`git-fuse`** | Runs the librarian (virtual filesystem) | Owns `/dev/fuse`; exports `/mnt/git-storage/fuse` | `privileged`, `hostPID` | **Controlled only** — restart ⇒ local `ENOTCONN` |
-
-**Why three processes, not one:** if FUSE and CSI share a pod, every CSI roll restarts FUSE and disconnects every app on that node. Splitting them is the core upgrade-domain decision.
-
----
-
-## Host Mount Namespace & Node Prerequisites
-
-### 1. Host namespace + ban on CSI-local FUSE binds
-
-Mount work must be visible to **kubelet on the node**, not only inside a container.
-
-* `git-fuse` and `git-csi` use `hostPID: true` and run mounts via:
-
-```bash
-nsenter --mount=/proc/1/ns/mnt -- /usr/local/bin/git-fuse /mnt/git-storage/fuse
-```
-
-* **Do not** bind-mount `/mnt/git-storage/fuse` into the `git-csi` container. After FUSE remounts on the host, that container-local view can stay `ENOTCONN` forever while the host export is healthy. CSI publish and health checks must go through the **host** namespace (`nsenter`).
-
-### 2. Node disk and OS packages (AL2023 / Enterprise Linux)
-
-* **Dedicated volume** per worker (e.g. extra EBS gp3) at `/mnt/git-storage` with `backend/` and `fuse/`.
-* **Native host FUSE packages** (glibc), installed at bootstrap:
-
-```bash
-dnf install -y fuse fuse-libs fuse3 fuse3-libs
-```
-
-Do **not** copy Alpine/musl `fusermount` onto an AL2023 host — the dynamic linker will reject it.
-
----
-
-## Virtual Filesystem Layout & How Apps Consume It
-
-Apps see a normal directory tree at `/mnt/git/` (they do not speak Git or FUSE):
-
-```
-/mnt/git/
-  ├── CURRENT_SHA                   # Active trunk SHA (text file)
-  ├── current ──────────────────────► symlink → commits/<active-sha>/
-  │
-  ├── tags/
-  │     ├── v1.0.0 ─────────────────► ../commits/sha-111111/
-  │     ├── v1.2.0 ─────────────────► ../commits/sha-222222/
-  │     └── stable ─────────────────► ../commits/sha-222222/
-  │
-  └── commits/                      # Immutable trees per SHA
-        ├── sha-111111/
-        ├── sha-222222/
-        └── sha-333333/
-```
-
-### Consumption patterns
-
-1. **Live trunk (default):** read `/mnt/git/current/...` — updates appear when that node flips `current`.
-2. **Boot snapshot (recommended for complex apps):** resolve once at startup and keep that directory for the process life:
-
-```python
-from pathlib import Path
-CONFIG_ROOT = Path("/mnt/git/current").resolve()
-# e.g. permanently /mnt/git/commits/sha-333333/
-```
-
-Later trunk flips do not move this process; a new pod picks up the latest.
-3. **Tag pin:** `CONFIG_PATH=/mnt/git/tags/v1.2.0`
-4. **SHA pin:** `CONFIG_PATH=/mnt/git/commits/sha-111111`
-
-### Atomic `current` flip
-
-```bash
-ln -sfn commits/<new-sha> /mnt/git-storage/fuse/current
-```
-
-Do **not** `mv` onto a directory symlink — it follows into the target and leaves `current` pointing at the old SHA.
-
----
-
-## Consistency Model
-
-* **Model:** per-node **eventual consistency** (each node fetches and flips on its own).
-* **Lab baseline (3× m5.large EKS):** converge in about **2–6 seconds** after ConfigMap update (spread ≈ 3s).
-* **SLO stance:** multi-second mixed-version windows across nodes are **normal**. Sub-second cluster-wide atomic flips are **not** promised. Fleet-scale monorepo latency still needs characterization.
-
----
-
-## Tradeoff & Awareness: When FUSE Dies on One Node
-
-This is an intentional tradeoff of node-local FUSE, not a surprise failure mode.
-
-### What happens
-
-| Scope | Effect |
+| Layer | Choice |
 | --- | --- |
-| **Apps on the bad node** | Reads fail with `ENOTCONN` / “transport endpoint is not connected.” The mount *looks* present (`findmnt` / `mountpoint` can still succeed) but content is dead. |
-| **Apps on other nodes** | **Unaffected** — FUSE is per-node. |
-| **Restarting FUSE alone** | Brings the librarian back for the **node**, but **does not** repair doors already unlocked into running pods. Those pods stay broken until replaced (or remounted) after cleanup. |
+| Isolation | Standard Coder **workspace** from a **dedicated agent-job template** |
+| Agent runtime | In-workspace process (e.g. **Claude SDK**) started by `coder_script` / startup — **not** Coder Tasks or Coder Agents |
+| Control plane | A **middle service** in front of Coder (product UI + CI/CD both call middle only) |
+| Identity | IdP JWT (humans) or CI service credentials → middle validates → maps to Coder user → mints/uses Coder API token **server-side** |
+| UX surface | No Coder login; no IDE/terminal required — **create workspace + pass prompt + observe result** |
 
-### How apps get healthy again
-
-* **Move / reschedule the pod to a healthy node:** yes — that **fixes the app**. CSI publishes a fresh bind to that node’s live FUSE export.
-* **Stay on the same node:** only after FUSE is healthy again **and** stale CSI mounts are purged, then the pod is recreated. Restarting the app without cleanup can leave kubelet stuck on dead mount paths.
-
-### Runbook vs automation
-
-The **sequence** is mandatory (not optional Kubernetes magic):
-
-1. Evict or delete consumer pods on the affected node (or cordon + drain so they move elsewhere).
-2. If remounting on that node: lazy-unmount dead CSI targets under `/var/lib/kubelet/pods/*/volumes/kubernetes.io~csi/*/mount`.
-3. Confirm host export is readable (`/mnt/git-storage/fuse/CURRENT_SHA` — active read, not only `mountpoint`).
-4. Allow pods back (reschedule or recreate).
-
-This can be a **human runbook** or an **automated controller** that performs the same steps. What we do **not** get is silent in-place healing of dead FUSE file handles inside already-running pods.
-
-**Stakeholder takeaway:** CSI and reconciler upgrades are routine; **FUSE upgrades and FUSE crashes are a node maintenance event** (move workloads away, or drain–purge–remount on that node).
+Coder remains the sandbox + lifecycle engine. The middle service owns authn/z, orchestration, the job/run API, and result collection.
 
 ---
 
-## Operational Runbooks & Failure Handling
+## Architecture
 
-### 1. Health probes must read content
+### High-level components
 
-`mountpoint -q` / `findmnt` can succeed on a **dead** FUSE mount. Probes and CSI checks must actively read, e.g.:
-
-```bash
-# From a pod: /mnt/git/CURRENT_SHA
-# From the host / fuse DaemonSet: /mnt/git-storage/fuse/CURRENT_SHA
-head -c 1 /mnt/git-storage/fuse/CURRENT_SHA >/dev/null 2>&1
+```text
+┌─────────────┐     ┌─────────────┐
+│ Product UI  │     │ CI/CD       │
+│ (IdP JWT)   │     │ (CI token)  │
+└──────┬──────┘     └──────┬──────┘
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+       ┌───────────────────┐
+       │  Middle service   │  POST /v1/runs, GET /v1/runs/{id}, …
+       │  - validate auth  │
+       │  - job state      │
+       │  - Owner token    │  (server-side only)
+       │  - per-user Coder │  session tokens (cached)
+       └─────────┬─────────┘
+                 │ Coder REST (Coder-Session-Token)
+                 ▼
+       ┌───────────────────┐
+       │  Coder OSS        │
+       │  - users / tokens │
+       │  - templates      │
+       │  - workspaces     │
+       │  - builds/agents  │
+       └─────────┬─────────┘
+                 ▼
+       ┌───────────────────┐
+       │ Agent-job workspace│
+       │  - coder_agent     │  (lifecycle only)
+       │  - no IDE apps     │
+       │  - prompt / job    │
+       │  - Claude SDK run  │
+       │  - status/artifacts│
+       └───────────────────┘
 ```
 
-### 2. CSI stale-mount recovery
+```mermaid
+flowchart LR
+  subgraph Callers["Callers"]
+    UI["Product UI<br/>IdP JWT"]
+    CI["CI/CD<br/>service auth"]
+  end
 
-In `NodePublishVolume` / `NodeUnpublishVolume`:
+  subgraph Middle["Middle service"]
+    VAL["Validate caller<br/>extract identity"]
+    MINT["Mint / cache<br/>Coder user token"]
+    RUNS["Run / job API"]
+  end
 
-* Detect `ENOTCONN` on the target; `umount -l` before rebinding.
-* `NodeUnpublishVolume` must return OK even if the mount is already dead (otherwise pod deletion deadlocks).
+  subgraph Coder["Coder OSS"]
+    OWNER["Owner token<br/>server-side only"]
+    USERS["Users + tokens"]
+    WS["Workspaces + builds"]
+  end
 
-### 3. FUSE upgrade / same-node recovery procedure
+  subgraph Sandbox["Agent-job workspace"]
+    AGENT["Startup runner<br/>e.g. Claude SDK"]
+  end
 
-1. Drain/evict consumers on the target node.
-2. Lazy-unmount stale CSI mounts under kubelet as above.
-3. Restart `git-fuse`; verify host `CURRENT_SHA` is readable.
-4. Bring consumers back. With required 1-pod-per-node anti-affinity, prefer **Recreate** (or delete+create) over RollingUpdate to avoid scheduling deadlocks.
+  UI --> VAL
+  CI --> VAL
+  VAL --> MINT
+  MINT -->|"Owner"| OWNER
+  OWNER --> USERS
+  USERS -->|"session_token"| MINT
+  VAL --> RUNS
+  RUNS -->|"Coder-Session-Token"| WS
+  WS --> AGENT
+```
+
+### End-to-end job flow
+
+```mermaid
+sequenceDiagram
+  actor Caller as UI or CI
+  participant Mid as Middle service
+  participant Coder as Coder API
+  participant WS as Agent workspace
+
+  Caller->>Mid: POST /v1/runs {prompt, context, …}
+  Mid->>Mid: Authenticate caller → identity
+  Mid->>Coder: Ensure Coder user (Owner token)
+  Mid->>Coder: Mint / reuse user session token (Owner)
+  Mid->>Coder: POST /users/{user}/workspaces<br/>template + rich_parameter_values
+  Coder->>WS: Provision + start
+  WS->>WS: Startup: run agent with prompt
+  loop Until terminal state
+    Mid->>Coder: GET workspace / build / agents
+    Mid-->>Caller: GET /v1/runs/{id} status
+  end
+  Mid->>Coder: Stop and/or delete workspace
+  Mid-->>Caller: result / artifact refs
+```
+
+### Role summary
+
+| Piece | Role |
+| --- | --- |
+| Third-party IdP | Issues the JWT the user already uses for the product |
+| Product UI | Accepts that JWT; never talks to Coder as the user directly |
+| CI/CD | Calls middle with machine credentials; never holds Coder Owner token |
+| Middle service | Validates identity, mints/uses Coder tokens, owns run state machine, drives workspaces |
+| Owner token | Server-side only; find/create users and mint per-user API tokens |
+| Coder `session_token` | Used only between middle ↔ Coder (do **not** return raw Coder tokens to UI/CI) |
+| Agent-job template | Sandbox + runner; no Coder dashboard UX required |
 
 ---
 
-## Node Garbage Collection (Target Design)
+## Middle service: identity bridge
 
-Periodic prune of `/mnt/git-storage/backend`. Keep a SHA if **any** of:
+A thin service sits between callers and Coder. Humans present an **IdP JWT**; CI presents a **service credential**. Middle validates the caller, extracts identity, ensures a Coder user exists, mints a Coder API token on their behalf, then drives workspaces — **without Coder dashboard login**.
 
-1. It is the resolved `/mnt/git/current`.
-2. Any `/mnt/git/tags/*` points at it.
-3. It is within the last N commits on `main` (e.g. 10).
-4. It is inside a TTL window (e.g. 48h).
-5. FUSE still has open file descriptors / inodes for it.
+### Sign-in: third-party JWT → middle → Coder token
 
-Everything else may be unlinked and removed via background `git prune` / `git repack` (not on the hot path of every fetch).
+```mermaid
+sequenceDiagram
+  actor User
+  participant IdP as Third-party IdP
+  participant UI as Product UI
+  participant Mid as Middle service
+  participant Coder as Coder API
+
+  Note over Mid: Holds Owner token + IdP JWKS / shared secret<br/>Never expose Owner token to the browser
+
+  User->>IdP: Authenticate
+  IdP-->>User: JWT (email, sub, …)
+  User->>UI: Connect with JWT
+  UI->>Mid: API call Authorization: Bearer JWT
+  Mid->>Mid: Validate JWT signature / exp / aud
+  Mid->>Mid: Extract user details (e.g. email)
+  Mid->>Coder: GET /users?q=email (Owner token)
+  Coder-->>Mid: Coder user id
+  Mid->>Coder: POST /users/{id}/keys/tokens (Owner token)
+  Coder-->>Mid: Coder session_token
+  Note over Mid: Keep Coder token server-side<br/>bound to middle session or request context
+
+  Note over User,UI: User never visits Coder login / dashboard
+```
+
+### Claim → Coder user mapping
+
+| JWT claim (example) | Middle service use |
+| --- | --- |
+| `email` | Look up Coder user (`GET /users?q=…`) |
+| `sub` / `preferred_username` | Optional stable id / username mapping |
+| `aud` / `iss` / `exp` | Reject if invalid |
+
+If the Coder user does not exist yet, middle can **create** them with the Owner token before minting a token — product policy decision.
+
+### CI / machine identity
+
+| Approach | Notes |
+| --- | --- |
+| CI service token / mTLS / OIDC client credentials | Middle authenticates the pipeline, not a human JWT |
+| Mapped Coder user | Shared automation user **or** per-pipeline bot user (open decision) |
+| Same run API | CI uses `POST /v1/runs` like the UI — no Coder-specific knowledge in pipelines |
+
+### Open decision: JWT on every call vs middle session
+
+How the **product UI** authenticates to middle **after** first contact is not locked yet.
+
+| Approach | Idea | Tradeoffs |
+| --- | --- | --- |
+| **A.** Validate IdP JWT on every call | Browser sends third-party JWT on each middle request | Simple; couples every hop to IdP JWT lifetime / JWKS / refresh |
+| **B.** Exchange once → middle session | Validate IdP JWT at `POST /v1/session`, then issue a middle session (opaque server-side id, or short-lived middle-signed token) bound to user + cached Coder token | Session store/keys + logout/refresh design; clearer TTL and revocation |
+| **C.** Hybrid | Accept IdP JWT *or* middle session during migration | Flexible now; more paths to secure |
+
+**Leading candidate to evaluate:** B (exchange IdP JWT for a middle session; keep Coder tokens server-side). A raw UUID is only acceptable if it is **server-bound** (user, Coder token, expiry) — not “random id in localStorage” as auth by itself.
+
+**Research before locking:**
+
+- How the product UI already handles IdP JWT refresh / logout  
+- Stateless (middle-signed JWT) vs stateful (Redis/DB) middle sessions  
+- Revocation (immediate logout vs wait for `exp`)  
+- Threat model: token theft, XSS, CSRF if cookies are used  
+
+Until that lands, treat “JWT on every call” in diagrams as **illustrative**, not the final session strategy. CI auth is separate (service credentials) and does not depend on this UI decision.
+
+### Middle responsibilities (checklist)
+
+1. Authenticate product callers (IdP JWT) and CI callers (service auth).
+2. Map identity → Coder user (create if policy allows).
+3. Hold Owner API token; mint per-user Coder tokens; keep them server-side.
+4. Expose stable job/run API to UI and CI.
+5. Drive Coder workspace create / watch / stop / delete.
+6. Enforce policy: allowed template(s), max runtime, concurrency, who can start jobs.
+7. Own run state machine and artifact references.
+
+**v1 out of scope for this path:** PTY/terminal proxy, code-server / VS Code embed, interactive Coder dashboard for end users. (Those remain possible later as optional middle proxies; they are not required to replace Tasks.)
 
 ---
 
-## Technical Stack Summary
+## Template contract (agent-job template)
 
-* **Git transport:** Smart HTTP on RWO PVC *(target)*; dumb HTTP proven in lab.
-* **Sync:** real `git` in `git-reconciler` (ConfigMap watch + periodic `git ls-remote`).
-* **Filesystem:** lazy `go-fuse` + `git cat-file` *(target)*; loopback FUSE over materialized trees proven in lab.
-* **CSI:** thin Go `NodeServer`; host-ns bind-mount via `nsenter`.
-* **Packaging:** Helm; system DaemonSets in `git-csi-system`.
+Dedicated template — not a developer desktop template.
+
+| Concern | Proposal |
+| --- | --- |
+| Apps | Omit `coder_app` for terminal, code-server, AgentAPI UI, etc. |
+| Agent | Keep `coder_agent` (required for start/scripts/status) |
+| Input | `coder_parameter` values such as `prompt`, optional `repo_url`, `git_ref`, `job_id` — **and/or** middle delivers a job payload after start (long prompts / secrets) |
+| Runner | `coder_script` on start: run Claude SDK (or equivalent); non-zero exit on failure |
+| Output | Convention TBD: status file, HTTP callback to middle, object-store upload, PR opened by agent |
+| Lifecycle | Short `ttl_ms` / autostop; middle deletes workspace when run completes or times out |
+| Secrets | LLM keys via middle or template env — never from the browser |
+
+---
+
+## Middle ↔ Coder API surface
+
+Auth header for all Coder calls: `Coder-Session-Token: <token>`  
+Base path: `/api/v2`
+
+### A. Identity bridge (Owner token)
+
+| Purpose | Method / path | Notes |
+| --- | --- | --- |
+| Find user by email/username | `GET /users?q=…` | Map IdP `email` / CI bot user |
+| Create user (optional) | `POST /users` | If auto-provision enabled |
+| Mint user API token | `POST /users/{user}/keys/tokens` | For subsequent user-scoped calls |
+| List / revoke tokens (optional) | `GET` / `DELETE` … `/keys/tokens` | Rotation / cleanup |
+
+### B. Template resolution (Owner or user token)
+
+| Purpose | Method / path | Notes |
+| --- | --- | --- |
+| Resolve agent-job template | `GET /templates` or org-scoped template APIs | Prefer pinning id in middle config |
+| Pin version (recommended) | Template + versions APIs | CI reproducibility: use `template_version_id` |
+
+Exact org-scoped routes vary by deployment; production middle should treat **template id** and **template version id** as config.
+
+### C. Job lifecycle = workspace lifecycle (user token)
+
+| Purpose | Method / path | Notes |
+| --- | --- | --- |
+| **Create + start job** | `POST /users/{user}/workspaces` | `name`, `template_id` **or** `template_version_id`, `rich_parameter_values[]`, optional `ttl_ms` |
+| Get workspace | `GET /workspaces/{workspace}` | Map to run status |
+| List workspaces | `GET /workspaces?q=owner:…` | Cleanup / idempotency |
+| Build status | `GET /workspacebuilds/{build}` | Provisioning success/failure |
+| Start / stop | `POST /workspaces/{workspace}/builds` | Transition (start/stop) |
+| Delete workspace | `DELETE /workspaces/{workspace}` | End of run / TTL breach |
+| Agents / readiness | Workspace payload / agent endpoints | Detect agent ready / dead |
+
+**Create body (illustrative):**
+
+```json
+{
+  "name": "job-abc123",
+  "template_version_id": "<pinned-uuid>",
+  "ttl_ms": 3600000,
+  "rich_parameter_values": [
+    { "name": "prompt", "value": "…" },
+    { "name": "job_id", "value": "abc123" }
+  ]
+}
+```
+
+### D. Not required for v1
+
+| Capability | Why deferred |
+| --- | --- |
+| Agent PTY / terminal WebSocket | No interactive terminal |
+| App reverse-proxy / code-server | No IDE embed |
+| Coder Tasks / Chats / Agents APIs | Replaced by workspace + in-workspace runner |
+| Coder OIDC login for end users | Middle + IdP JWT / CI auth instead |
+
+### E. Optional later (result plumbing)
+
+| Purpose | Options |
+| --- | --- |
+| Stream logs | Build/agent log APIs, or agent pushes to middle |
+| Artifacts | Agent uploads to object storage; middle stores URLs on the run |
+| Notify completion | Workspace → middle webhook (good for CI wait) |
+
+Official workspace create docs: https://coder.com/docs/reference/api/workspaces
+
+---
+
+## Middle external API (UI + CI)
+
+Stable contract so CI/CD and the product UI do **not** learn Coder APIs.
+
+| Endpoint (illustrative) | Role |
+| --- | --- |
+| `POST /v1/session` (if approach B) | Exchange IdP JWT → middle session |
+| `POST /v1/runs` | Start job: `{ prompt, context, template?, idempotency_key? }` → `{ run_id }` |
+| `GET /v1/runs/{run_id}` | Status: `queued \| provisioning \| running \| succeeded \| failed \| cancelled` + result refs |
+| `POST /v1/runs/{run_id}/cancel` | Stop/delete underlying workspace |
+| `GET /v1/runs/{run_id}/artifacts` | List outputs |
+
+**CI pattern:** pipeline calls `POST /v1/runs`, polls `GET` until terminal (or waits on webhook), fails the step on `failed`. Use `idempotency_key` so retries do not spawn duplicate workspaces.
+
+---
+
+## Consequences
+
+### Positive
+
+- Stays on **Coder OSS**; no dependency on retiring Tasks or commercial Agents.
+- Same middle path for **UI and CI/CD**.
+- Clear security boundary: sandbox = workspace; Owner and user Coder tokens stay server-side.
+- Template can harden over time (network policy, non-root, no IDE surface).
+
+### Negative / costs
+
+- We own agent orchestration, status model, and result collection.
+- Workspace cold start latency; may need prebuilds/pools later.
+- Must maintain template + runner as Claude SDK / images evolve.
+- Prompt size / secrets via `rich_parameter_values` may be limited — may need post-create payload delivery.
+
+### Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| Parameter length / prompt visibility | Job payload via authenticated pull or middle-delivered secret |
+| Orphan workspaces | TTL + middle sweeper + delete-on-complete |
+| Token sprawl | Short-lived user tokens; revoke; never return Coder tokens to UI/CI |
+| Status ambiguity | Explicit run state machine in middle; don’t expose raw Coder enums to CI |
+
+---
+
+## Open questions
+
+1. **Prompt delivery:** parameter-only vs middle-uploaded job file after agent ready.
+2. **Completion signal:** poll vs webhook from workspace to middle.
+3. **Coder user model:** one shared automation user vs per-human / per-pipeline user.
+4. **Middle session vs IdP JWT every call** (see identity section; leading candidate B).
+5. **Artifact store** and retention policy.
+6. **Idempotency** for CI retries (`idempotency_key` → same run).
+7. Whether a minimal **HTTP status endpoint** inside the workspace is allowed for health (still not IDE/terminal).
+
+---
+
+## Alternatives considered
+
+| Alternative | Why not (for now) |
+| --- | --- |
+| Coder Tasks | Retiring; ESR not a long-term OSS plan |
+| Coder Agents / Chats API | Not desired; commercial limits for serious use |
+| Raw CI runners only (no Coder) | Loses Coder workspace sandbox / template standardization |
+| End users on Coder SSO + dashboard | Conflicts with “no Coder login” and middle-service model |
+
+Background on Tasks deprecation (external): https://coder.com/docs/ai-coder/agents/tasks-to-chats-migration
