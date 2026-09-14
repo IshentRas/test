@@ -1,385 +1,184 @@
-# ADR-0001: Agent jobs via middle service + standard Coder workspaces (OSS)
+# Coder OSS v2.34.5 — idle workspace API capacity (EKS)
 
-- **Status:** Proposed (draft)
-- **Date:** 2026-09-13
-- **Scope:** Self-contained design proposal (identity bridge, middle service, Coder APIs, agent-job template, CI/CD)
+**Date:** 2026-09-14  
+**Region / account:** `us-east-1`  
+**Cluster:** `eks-podman-coder-lab` (destroyed after this run)  
+**Question:** How many *idle, connected* standard workspaces can **one** OSS `coderd` hold before the Coder API exceeds a **300 ms p95** budget?
 
-## Context
+This is a control-plane test (agent ↔ coderd), not nested Podman. It informs ADR-0001 (middle service + standard workspaces): plan concurrent **running** sandboxes, not historical workspace count.
 
-Our organization runs **Coder open source (Community)**. We need on-demand, sandboxed agent jobs (e.g. Claude SDK inside an isolated environment) that can be started from:
+## Verdict
 
-1. Our **product UI** — users already authenticated via a **third-party IdP JWT** (not Coder dashboard SSO)
-2. **CI/CD pipelines** — machine identity against the same control plane
+**What degraded:** one API handler on a single OSS `coderd` — **`GET /api/v2/workspaces`** (list all workspaces + live agent status). At 400 idle agents, **every** list during the 10-minute hold took **100–500 ms** (Prometheus p50 **300 ms**, p95 **480 ms**).
 
-Coder’s product path for this used to look like **Coder Tasks**. That surface is being **retired** (deprecated in recent releases; removed from mainline around v2.37; continued ESR framed for Premium). **Coder Agents** (the replacement) is not a fit for us (limited interest + commercial gating for serious scale/governance).
+**Why that is too much:** the run’s SLO was **p95 ≤ 300 ms**. ~400–480 ms fails that bar. A human opening a dashboard once might still find 400 ms usable, but it is already sluggish — and the **typical** call (p50) is already **at** 300 ms, not only the slow tail. That is with **idle** agents and no real job work. A middle service that polls this list would feel that on every poll. **200** workspaces stayed under budget (p95 **97 ms**). **400** did not.
 
-We still want:
+**What did *not* degrade:** workspace pods stayed Running; all **400 agents stayed connected**; `GET /healthz` stayed ~1 ms; `GET /api/v2/templates` stayed ~24 ms; Terraform/provisionerd was idle; the node groups were not full.
 
-- Ephemeral **sandbox isolation** (one job ≈ one workspace)
-- On-demand start/stop without end users or CI logging into Coder
-- A dedicated, locked-down template (no terminal / VS Code / browser agent apps in v1)
-- Prompt + job context passed into the workspace so an in-workspace agent runner executes the work
-- Easy **CI/CD integration** through one stable API (the middle service), not raw Coder calls from pipelines
+**Cause (from Prometheus, not a guess about CPU):** each idle workspace holds two long-lived connections **on that same coderd process** (agent RPC websocket + embedded DERP). Listing workspaces has to walk that live set. The SQL for the list is still ~11 ms; the extra hundreds of milliseconds are **in coderd after Postgres**. DERP was not moving traffic (0 packets / 0 bytes) — the cost is **connection occupancy**, not relay throughput.
 
-## Decision
+We did **not** take a Go pprof, so we cannot name a mutex or function. We *can* rule out “the box ran out of CPU/RAM” and “Postgres is slow.”
 
-**Replicate the Tasks-shaped workflow using only first-class OSS primitives:**
-
-| Layer | Choice |
+| Finding | Number |
 | --- | --- |
-| Isolation | Standard Coder **workspace** from a **dedicated agent-job template** |
-| Agent runtime | In-workspace process (e.g. **Claude SDK**) started by `coder_script` / startup — **not** Coder Tasks or Coder Agents |
-| Control plane | A **middle service** in front of Coder (product UI + CI/CD both call middle only) |
-| Identity | IdP JWT (humans) or CI service credentials → middle validates → maps to Coder user → mints/uses Coder API token **server-side** |
-| UX surface | No Coder login; no IDE/terminal required — **create workspace + pass prompt + observe result** |
+| Last healthy idle plateau | **~200** connected workspaces |
+| First failed plateau | **400** (`GET /api/v2/workspaces` p95 **480 ms** vs 300 ms) |
+| Exact cliff | **Untested** (between 200 and 400) |
+| Bigger control-plane CPU/RAM | **Would not have changed the 400 result** |
+| More provisionerd (we used 5) | **Would not have changed the 400 result** |
 
-Coder remains the sandbox + lifecycle engine. The middle service owns authn/z, orchestration, the job/run API, and result collection.
+600 and 800 were **not started** (ramp stops on first degraded hold).
 
----
+## Lab topology (what actually ran)
 
-## Architecture
+Account on-demand standard vCPU quota was **64**, so this was not the originally sketched 48xlarge packing layout.
 
-### High-level components
-
-```text
-┌─────────────┐     ┌─────────────┐
-│ Product UI  │     │ CI/CD       │
-│ (IdP JWT)   │     │ (CI token)  │
-└──────┬──────┘     └──────┬──────┘
-       │                   │
-       └─────────┬─────────┘
-                 ▼
-       ┌───────────────────┐
-       │  Middle service   │  POST /v1/runs, GET /v1/runs/{id}, …
-       │  - validate auth  │
-       │  - job state      │
-       │  - Owner token    │  (server-side only)
-       │  - per-user Coder │  session tokens (cached)
-       └─────────┬─────────┘
-                 │ Coder REST (Coder-Session-Token)
-                 ▼
-       ┌───────────────────┐
-       │  Coder OSS        │
-       │  - users / tokens │
-       │  - templates      │
-       │  - workspaces     │
-       │  - builds/agents  │
-       └─────────┬─────────┘
-                 ▼
-       ┌───────────────────┐
-       │ Agent-job workspace│
-       │  - coder_agent     │  (lifecycle only)
-       │  - no IDE apps     │
-       │  - prompt / job    │
-       │  - Claude SDK run  │
-       │  - status/artifacts│
-       └───────────────────┘
-```
-
-```mermaid
-flowchart LR
-  subgraph Callers["Callers"]
-    UI["Product UI<br/>IdP JWT"]
-    CI["CI/CD<br/>service auth"]
-  end
-
-  subgraph Middle["Middle service"]
-    VAL["Validate caller<br/>extract identity"]
-    MINT["Mint / cache<br/>Coder user token"]
-    RUNS["Run / job API"]
-  end
-
-  subgraph Coder["Coder OSS"]
-    OWNER["Owner token<br/>server-side only"]
-    USERS["Users + tokens"]
-    WS["Workspaces + builds"]
-  end
-
-  subgraph Sandbox["Agent-job workspace"]
-    AGENT["Startup runner<br/>e.g. Claude SDK"]
-  end
-
-  UI --> VAL
-  CI --> VAL
-  VAL --> MINT
-  MINT -->|"Owner"| OWNER
-  OWNER --> USERS
-  USERS -->|"session_token"| MINT
-  VAL --> RUNS
-  RUNS -->|"Coder-Session-Token"| WS
-  WS --> AGENT
-```
-
-### End-to-end job flow
-
-```mermaid
-sequenceDiagram
-  actor Caller as UI or CI
-  participant Mid as Middle service
-  participant Coder as Coder API
-  participant WS as Agent workspace
-
-  Caller->>Mid: POST /v1/runs {prompt, context, …}
-  Mid->>Mid: Authenticate caller → identity
-  Mid->>Coder: Ensure Coder user (Owner token)
-  Mid->>Coder: Mint / reuse user session token (Owner)
-  Mid->>Coder: POST /users/{user}/workspaces<br/>template + rich_parameter_values
-  Coder->>WS: Provision + start
-  WS->>WS: Startup: run agent with prompt
-  loop Until terminal state
-    Mid->>Coder: GET workspace / build / agents
-    Mid-->>Caller: GET /v1/runs/{id} status
-  end
-  Mid->>Coder: Stop and/or delete workspace
-  Mid-->>Caller: result / artifact refs
-```
-
-### Role summary
-
-| Piece | Role |
-| --- | --- |
-| Third-party IdP | Issues the JWT the user already uses for the product |
-| Product UI | Accepts that JWT; never talks to Coder as the user directly |
-| CI/CD | Calls middle with machine credentials; never holds Coder Owner token |
-| Middle service | Validates identity, mints/uses Coder tokens, owns run state machine, drives workspaces |
-| Owner token | Server-side only; find/create users and mint per-user API tokens |
-| Coder `session_token` | Used only between middle ↔ Coder (do **not** return raw Coder tokens to UI/CI) |
-| Agent-job template | Sandbox + runner; no Coder dashboard UX required |
-
----
-
-## Middle service: identity bridge
-
-A thin service sits between callers and Coder. Humans present an **IdP JWT**; CI presents a **service credential**. Middle validates the caller, extracts identity, ensures a Coder user exists, mints a Coder API token on their behalf, then drives workspaces — **without Coder dashboard login**.
-
-### Sign-in: third-party JWT → middle → Coder token
-
-```mermaid
-sequenceDiagram
-  actor User
-  participant IdP as Third-party IdP
-  participant UI as Product UI
-  participant Mid as Middle service
-  participant Coder as Coder API
-
-  Note over Mid: Holds Owner token + IdP JWKS / shared secret<br/>Never expose Owner token to the browser
-
-  User->>IdP: Authenticate
-  IdP-->>User: JWT (email, sub, …)
-  User->>UI: Connect with JWT
-  UI->>Mid: API call Authorization: Bearer JWT
-  Mid->>Mid: Validate JWT signature / exp / aud
-  Mid->>Mid: Extract user details (e.g. email)
-  Mid->>Coder: GET /users?q=email (Owner token)
-  Coder-->>Mid: Coder user id
-  Mid->>Coder: POST /users/{id}/keys/tokens (Owner token)
-  Coder-->>Mid: Coder session_token
-  Note over Mid: Keep Coder token server-side<br/>bound to middle session or request context
-
-  Note over User,UI: User never visits Coder login / dashboard
-```
-
-### Claim → Coder user mapping
-
-| JWT claim (example) | Middle service use |
-| --- | --- |
-| `email` | Look up Coder user (`GET /users?q=…`) |
-| `sub` / `preferred_username` | Optional stable id / username mapping |
-| `aud` / `iss` / `exp` | Reject if invalid |
-
-If the Coder user does not exist yet, middle can **create** them with the Owner token before minting a token — product policy decision.
-
-### CI / machine identity
-
-| Approach | Notes |
-| --- | --- |
-| CI service token / mTLS / OIDC client credentials | Middle authenticates the pipeline, not a human JWT |
-| Mapped Coder user | Shared automation user **or** per-pipeline bot user (open decision) |
-| Same run API | CI uses `POST /v1/runs` like the UI — no Coder-specific knowledge in pipelines |
-
-### Open decision: JWT on every call vs middle session
-
-How the **product UI** authenticates to middle **after** first contact is not locked yet.
-
-| Approach | Idea | Tradeoffs |
+| Role | Count × type | Notes |
 | --- | --- | --- |
-| **A.** Validate IdP JWT on every call | Browser sends third-party JWT on each middle request | Simple; couples every hop to IdP JWT lifetime / JWKS / refresh |
-| **B.** Exchange once → middle session | Validate IdP JWT at `POST /v1/session`, then issue a middle session (opaque server-side id, or short-lived middle-signed token) bound to user + cached Coder token | Session store/keys + logout/refresh design; clearer TTL and revocation |
-| **C.** Hybrid | Accept IdP JWT *or* middle session during migration | Flexible now; more paths to secure |
+| Control | 1 × `m7i.2xlarge` (8 vCPU / 32 GiB) | `workload=control`; coderd + Postgres |
+| Workspaces | 3 × `m7i.4xlarge` (16 vCPU / 64 GiB) | taint `workload=coder:NoSchedule`, `maxPods=230` |
+| Workspace fill | 1 × `m7i.2xlarge` | same taint, `maxPods=110` |
+| Nodes | **not scaled with the ramp** | packing vs coderd degradation kept separate |
+| VPC CNI | prefix delegation on | AL2023 (not Bottlerocket) |
+| Karpenter | **not used** | |
 
-**Leading candidate to evaluate:** B (exchange IdP JWT for a middle session; keep Coder tokens server-side). A raw UUID is only acceptable if it is **server-bound** (user, Coder token, expiry) — not “random id in localStorage” as auth by itself.
+**Coder**
 
-**Research before locking:**
+- Chart / app **2.34.5**, `replicaCount: 1`
+- Built-in provisioners: `CODER_PROVISIONER_DAEMONS=5` (external provisioners are Premium)
+- Postgres 16 in-cluster (`emptyDir` on the control node)
+- Prometheus: `CODER_PROMETHEUS_ENABLE=true` (`coder-prom:2112`)
+- coderd requests/limits: **3 CPU / 8 GiB** request, **6 CPU / 16 GiB** limit
+- Postgres requests/limits: **1 CPU / 4 GiB** request, **2 CPU / 8 GiB** limit
+- Workspace pods: requests **50m / 256Mi**, limits **1 CPU / 2 GiB**, **emptyDir** (no PVC)
 
-- How the product UI already handles IdP JWT refresh / logout  
-- Stateless (middle-signed JWT) vs stateful (Redis/DB) middle sessions  
-- Revocation (immediate logout vs wait for `exp`)  
-- Threat model: token theft, XSS, CSRF if cookies are used  
+**Template:** `scale-idle` — Ubuntu 24.04, `coder_agent` only, no IDE apps / Podman / FUSE.
 
-Until that lands, treat “JWT on every call” in diagrams as **illustrative**, not the final session strategy. CI auth is separate (service credentials) and does not depend on this UI decision.
+Creates used admin `coder create` (OSS 2.34.5 rejects `X-Coder-Bypass-Ratelimit` on non-owner scaletest users). Terraform providers were served from a **filesystem mirror** in the coderd pod after GitHub 504s on concurrent `terraform init`.
 
-### Middle responsibilities (checklist)
+## Method
 
-1. Authenticate product callers (IdP JWT) and CI callers (service auth).
-2. Map identity → Coder user (create if policy allows).
-3. Hold Owner API token; mint per-user Coder tokens; keep them server-side.
-4. Expose stable job/run API to UI and CI.
-5. Drive Coder workspace create / watch / stop / delete.
-6. Enforce policy: allowed template(s), max runtime, concurrency, who can start jobs.
-7. Own run state machine and artifact references.
+Waves: **50 → 100 → 200 → 400 → (600) → (800)**.  
+Each wave: fill to N, then **10 minutes idle**. Stop if focus p95 > **0.300 s**.
 
-**v1 out of scope for this path:** PTY/terminal proxy, code-server / VS Code embed, interactive Coder dashboard for end users. (Those remain possible later as optional middle proxies; they are not required to replace Tasks.)
+**Pass/fail metric** is *in-process* coderd latency, not laptop curl:
 
----
+- Histogram: `coderd_api_request_latencies_seconds`
+- Diff start-of-hold vs end-of-hold scrape
+- Focus: **p95 of GET `/api/v2/workspaces`**
+- Budget: **300 ms** (ramp stops if p95 exceeds this)
 
-## Template contract (agent-job template)
+A laptop canary (`GET /users/me`, `/workspaces`, `/templates` every 2 s via port-forward) only **generates** those API samples. Canary RTT includes the port-forward and was **not** the SLO.
 
-Dedicated template — not a developer desktop template.
+### How to read p50 / p95 / p99
 
-| Concern | Proposal |
-| --- | --- |
-| Apps | Omit `coder_app` for terminal, code-server, AgentAPI UI, etc. |
-| Agent | Keep `coder_agent` (required for start/scripts/status) |
-| Input | `coder_parameter` values such as `prompt`, optional `repo_url`, `git_ref`, `job_id` — **and/or** middle delivers a job payload after start (long prompts / secrets) |
-| Runner | `coder_script` on start: run Claude SDK (or equivalent); non-zero exit on failure |
-| Output | Convention TBD: status file, HTTP callback to middle, object-store upload, PR opened by agent |
-| Lifecycle | Short `ttl_ms` / autostop; middle deletes workspace when run completes or times out |
-| Secrets | LLM keys via middle or template env — never from the browser |
+Each idle hold produces ~230–250 timings for the same API call. Sort those durations fastest → slowest:
 
----
-
-## Middle ↔ Coder API surface
-
-Auth header for all Coder calls: `Coder-Session-Token: <token>`  
-Base path: `/api/v2`
-
-### A. Identity bridge (Owner token)
-
-| Purpose | Method / path | Notes |
+| Percentile | Meaning | Why we report it |
 | --- | --- | --- |
-| Find user by email/username | `GET /users?q=…` | Map IdP `email` / CI bot user |
-| Create user (optional) | `POST /users` | If auto-provision enabled |
-| Mint user API token | `POST /users/{user}/keys/tokens` | For subsequent user-scoped calls |
-| List / revoke tokens (optional) | `GET` / `DELETE` … `/keys/tokens` | Rotation / cleanup |
+| **p50** (median) | Half the calls were faster than this, half slower. The **typical** request. | If p50 is already at the budget, slowness is the common case, not a few outliers. |
+| **p95** | 95% of calls were this fast or faster; 5% were slower. | **Pass/fail SLO** for this run (must stay ≤ 300 ms). |
+| **p99** | 99% of calls were this fast or faster; the slowest 1% sit above this. | Shows whether the tail is far from p95 (noisy spikes) or tight (the whole distribution moved). |
 
-### B. Template resolution (Owner or user token)
+Example: at **400** workspaces, workspace-list p50 = 300 ms, p95 = 480 ms, p99 = 496 ms. The typical call is already at budget, and p95/p99 are close together — the endpoint got slow for almost everyone, not just a long tail. At **200**, p50/p95/p99 are 72 / 97 / 99 ms: tight and under budget.
 
-| Purpose | Method / path | Notes |
+Times are coderd’s own histogram (inside the process). They do **not** include laptop or `kubectl port-forward` RTT.
+
+Coder’s histogram buckets jump **100 ms → 500 ms** (no 250/300 ms bucket). p50=300 ms and p95=480 ms are **linear interpolations inside that bucket**. The raw Prom fact is stronger than the interpolated decimals: during the 400 hold, **232 / 232** list samples landed in `le=0.5` and **0** landed in `le=0.1`. So 100% of lists were slower than 100 ms and faster than 500 ms. At 200, almost all lists were still **under 100 ms**.
+
+## API results (idle holds)
+
+Source: `.scale-results/ramp-summary.csv` and `prom-{N}-diff.txt`.
+
+| N (idle agents) | Hold start (UTC) | Workspace list **p50** (typical) | Workspace list **p95** (SLO) | Workspace list **p99** (tail) | Templates p95 | `/healthz` p95 | Verdict |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 50 | 15:20:21 | 38 ms | **49 ms** | 50 ms | 24 ms | 1 ms | ok |
+| 100 | 15:32:02 | 38 ms | **49 ms** | 50 ms | 24 ms | 1 ms | ok |
+| 200 | 15:45:27 | 72 ms | **97 ms** | 99 ms | 24 ms | 1 ms | ok |
+| **400** | 16:02:43 | **300 ms** | **480 ms** | 496 ms | 24 ms | 1 ms | **DEGRADED** (p95 > 300 ms) |
+
+“Workspace list” is `GET /api/v2/workspaces`. **That is the degraded thing.** Templates stayed ~24 ms p95 and healthz ~1 ms at every N, so coderd was not globally wedged — only the handler that walks every workspace/agent got slow.
+
+### What Prometheus showed (cause vs not-cause)
+
+Scrapes of `coder-prom:2112` at the start and end of each idle hold (`prom-{N}-hold-*.prom`). Gauges below are the **end-of-hold** snapshot.
+
+**The load that grew with N** (one of each per idle workspace, all terminated on this coderd — in-cluster ClusterIP, not public Tailscale DERP):
+
+| Prometheus signal | At N=200 | At N=400 | Read as |
+| --- | ---: | ---: | --- |
+| `coderd_agents_up` | 200 | 400 | Agents still healthy; connectivity did not fail |
+| `coderd_api_concurrent_websockets{path="/api/v2/workspaceagents/me/rpc"}` | 200 | 400 | Persistent agent control-plane RPC |
+| `coderd_api_concurrent_requests{path="/derp"}` | 200 | 400 | Persistent HTTP to embedded DERP |
+| `coder_derp_server_connections` / `clients_local` | 201 | 401 | Same DERP sockets counted on the server |
+| `go_goroutines` | ~4.2k | ~8.2k | ~20 goroutines per agent |
+
+**What Prometheus showed was *not* the problem:**
+
+| Prometheus signal | At N=400 | Read as |
 | --- | --- | --- |
-| Resolve agent-job template | `GET /templates` or org-scoped template APIs | Prefer pinning id in middle config |
-| Pin version (recommended) | Template + versions APIs | CI reproducibility: use `template_version_id` |
+| `coderd_api_request_latencies_seconds` for `GET /api/v2/templates` | p95 still **24 ms** | Other REST is fine |
+| same histogram for `GET /healthz` | p95 **1 ms** | Process still serving |
+| `coderd_provisionerd_jobs_current` | **0** | Not stuck in Terraform |
+| `coderd_db_query_latencies_seconds` `GetAuthorizedWorkspaces` | mean **~11 ms** (almost all &lt; 25 ms) | Postgres is not the 480 ms |
+| `coder_derp_server_bytes_*` / `packets_*` | **0** | DERP is idle; no relay throughput |
+| `coder_derp_server_average_queue_duration_ms` | **0** | DERP queue not backed up |
+| `process_cpu_seconds_total` over the 400 hold | ~0.18 cores | Not CPU-bound |
+| `go_memstats_sys_bytes` | ~573 MiB | Not memory-bound |
 
-Exact org-scoped routes vary by deployment; production middle should treat **template id** and **template version id** as config.
+`coderd_api_concurrent_requests` in the old summary scripts is a **sum across paths**. The 400 concurrent HTTP requests are **GET `/derp`**, not 400 overlapping workspace-list calls. The canary only listed workspaces about once every 2 seconds.
 
-### C. Job lifecycle = workspace lifecycle (user token)
+So the cause we can stand on: **one coderd process holding ~400 agent RPC websockets + ~400 idle DERP connections, then executing `GET /api/v2/workspaces` which joins DB rows with that in-memory agent state.** List p95 was flat 50→100 (49 ms), ~2× at 200 (97 ms), ~5× from 200 at 400 (480 ms). We did not profile the handler itself.
 
-| Purpose | Method / path | Notes |
-| --- | --- | --- |
-| **Create + start job** | `POST /users/{user}/workspaces` | `name`, `template_id` **or** `template_version_id`, `rich_parameter_values[]`, optional `ttl_ms` |
-| Get workspace | `GET /workspaces/{workspace}` | Map to run status |
-| List workspaces | `GET /workspaces?q=owner:…` | Cleanup / idempotency |
-| Build status | `GET /workspacebuilds/{build}` | Provisioning success/failure |
-| Start / stop | `POST /workspaces/{workspace}/builds` | Transition (start/stop) |
-| Delete workspace | `DELETE /workspaces/{workspace}` | End of run / TTL breach |
-| Agents / readiness | Workspace payload / agent endpoints | Detect agent ready / dead |
+## Control-plane CPU and memory (not the limiter)
 
-**Create body (illustrative):**
+Live cgroup (still at 400 agents, after the degraded hold):
 
-```json
-{
-  "name": "job-abc123",
-  "template_version_id": "<pinned-uuid>",
-  "ttl_ms": 3600000,
-  "rich_parameter_values": [
-    { "name": "prompt", "value": "…" },
-    { "name": "job_id", "value": "abc123" }
-  ]
-}
-```
+| Pod | CPU throttle | Memory peak | Limit |
+| --- | --- | --- | --- |
+| coderd | **7.4 s** throttled over the whole run (~1.4% of CFS periods) | **1.64 GiB** | 16 GiB |
+| Postgres | **2.0 s** throttled | **~190 MiB** | 8 GiB |
 
-### D. Not required for v1
+coderd `process_cpu_seconds_total` **during the 600 s idle holds** (user+system):
 
-| Capability | Why deferred |
-| --- | --- |
-| Agent PTY / terminal WebSocket | No interactive terminal |
-| App reverse-proxy / code-server | No IDE embed |
-| Coder Tasks / Chats / Agents APIs | Replaced by workspace + in-workspace runner |
-| Coder OIDC login for end users | Middle + IdP JWT / CI auth instead |
+| N | CPU-seconds in hold | Equivalent cores |
+| ---: | ---: | ---: |
+| 50 | 15.6 | ~0.03 |
+| 100 | 23.9 | ~0.04 |
+| 200 | 44.8 | ~0.08 |
+| 400 | 107.4 | ~0.18 |
 
-### E. Optional later (result plumbing)
+Go `sys` bytes at 400 ≈ **573 MiB**. coderd RSS ≈ **640 MiB**. Control node allocatable ~7.9 CPU / 30 GiB; requests were ~54% CPU / 40% memory.
 
-| Purpose | Options |
-| --- | --- |
-| Stream logs | Build/agent log APIs, or agent pushes to middle |
-| Artifacts | Agent uploads to object storage; middle stores URLs on the run |
-| Notify completion | Workspace → middle webhook (good for CI wait) |
+**Postgres is not the 480 ms.** `GetAuthorizedWorkspaces` (the list query) averaged **~11 ms** (2094 samples; almost all &lt; 25 ms). Extra latency is in coderd after the query (assemble 400 workspace+agent records while 400 DERP + 400 RPC connections are live).
 
-Official workspace create docs: https://coder.com/docs/reference/api/workspaces
+## Provisionerd (not the limiter)
 
----
+- 5 built-in daemons; **0 jobs** on every idle hold.
+- Successful template STARTs: **375**, **all &lt; 10 s**, mean **~5.1 s** (`coderd_provisionerd_workspace_build_timings_seconds`).
+- Fill concurrency was 5, matching daemon count, so we did not build a large provisioner queue.
+- Extra in-process daemons would only help **burst-create** start latency. They share the coderd process on OSS; they would not unload idle agent connections.
 
-## Middle external API (UI + CI)
+## What this means for the product
 
-Stable contract so CI/CD and the product UI do **not** learn Coder APIs.
+1. **~400 ms (p95 ~480 ms) on workspace list is too much for this SLO.** We required p95 ≤ **300 ms**. At 400 idle agents the median was already 300 ms, so the common case is at the limit, not just the tail. Treat that plateau as over capacity for a control-plane / middle-service poll path, even if a single UI click would still “work.”
+2. **Plan ~200 concurrent connected workspaces per OSS `coderd` (v2.34.5)** if that 300 ms p95 list SLO (or any handler that walks all live agents) still applies.
+3. Agent jobs should be **ephemeral**: stop/delete when the run finishes so live agent count ≈ jobs in flight, not lifetime creates.
+4. The **middle service should own job lists**. Do not use `GET /api/v2/workspaces` as a hot dashboard path. Talk to Coder by workspace id/name.
+5. **Do not scale this with a larger `m7i` or more provisionerd.** Next capacity lever if you need &gt;200 in flight: **more `coderd` replicas** sharing Postgres (spread DERP + agent RPC), which this lab did **not** measure.
+6. Kubernetes packing was fine: 400 workspace pods stayed Running; the miss is coderd, not the node groups.
 
-| Endpoint (illustrative) | Role |
-| --- | --- |
-| `POST /v1/session` (if approach B) | Exchange IdP JWT → middle session |
-| `POST /v1/runs` | Start job: `{ prompt, context, template?, idempotency_key? }` → `{ run_id }` |
-| `GET /v1/runs/{run_id}` | Status: `queued \| provisioning \| running \| succeeded \| failed \| cancelled` + result refs |
-| `POST /v1/runs/{run_id}/cancel` | Stop/delete underlying workspace |
-| `GET /v1/runs/{run_id}/artifacts` | List outputs |
+## What we did not measure
 
-**CI pattern:** pipeline calls `POST /v1/runs`, polls `GET` until terminal (or waits on webhook), fails the step on `failed`. Use `idempotency_key` so retries do not spawn duplicate workspaces.
+- N = 250, 300, 350 (cliff is only bounded)
+- `coderd` `replicaCount` &gt; 1
+- Premium external provisioners
+- Nested Podman / FUSE / workspace PVCs
+- Active work inside the sandbox (Claude SDK, etc.) — only idle `coder_agent`
+- HA / disk-backed Postgres
+- API paths other than the canary trio (focus = workspace list)
+- Go pprof / mutex profile of the workspace-list handler (Prometheus shows *where* time is not, not the exact function)
 
----
+## Raw dumps (local)
 
-## Consequences
-
-### Positive
-
-- Stays on **Coder OSS**; no dependency on retiring Tasks or commercial Agents.
-- Same middle path for **UI and CI/CD**.
-- Clear security boundary: sandbox = workspace; Owner and user Coder tokens stay server-side.
-- Template can harden over time (network policy, non-root, no IDE surface).
-
-### Negative / costs
-
-- We own agent orchestration, status model, and result collection.
-- Workspace cold start latency; may need prebuilds/pools later.
-- Must maintain template + runner as Claude SDK / images evolve.
-- Prompt size / secrets via `rich_parameter_values` may be limited — may need post-create payload delivery.
-
-### Risks
-
-| Risk | Mitigation |
-| --- | --- |
-| Parameter length / prompt visibility | Job payload via authenticated pull or middle-delivered secret |
-| Orphan workspaces | TTL + middle sweeper + delete-on-complete |
-| Token sprawl | Short-lived user tokens; revoke; never return Coder tokens to UI/CI |
-| Status ambiguity | Explicit run state machine in middle; don’t expose raw Coder enums to CI |
-
----
-
-## Open questions
-
-1. **Prompt delivery:** parameter-only vs middle-uploaded job file after agent ready.
-2. **Completion signal:** poll vs webhook from workspace to middle.
-3. **Coder user model:** one shared automation user vs per-human / per-pipeline user.
-4. **Middle session vs IdP JWT every call** (see identity section; leading candidate B).
-5. **Artifact store** and retention policy.
-6. **Idempotency** for CI retries (`idempotency_key` → same run).
-7. Whether a minimal **HTTP status endpoint** inside the workspace is allowed for health (still not IDE/terminal).
-
----
-
-## Alternatives considered
-
-| Alternative | Why not (for now) |
-| --- | --- |
-| Coder Tasks | Retiring; ESR not a long-term OSS plan |
-| Coder Agents / Chats API | Not desired; commercial limits for serious use |
-| Raw CI runners only (no Coder) | Loses Coder workspace sandbox / template standardization |
-| End users on Coder SSO + dashboard | Conflicts with “no Coder login” and middle-service model |
-
-Background on Tasks deprecation (external): https://coder.com/docs/ai-coder/agents/tasks-to-chats-migration
+`.scale-results/` on the operator laptop: `ramp-summary.csv`, `prom-{50,100,200,400}-diff.txt`, hold start/end Prometheus scrapes, `canary.csv`. Do not commit session tokens from that directory.
