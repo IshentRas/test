@@ -1,184 +1,89 @@
-# Coder OSS v2.34.5 — idle workspace API capacity (EKS)
+# Coder OSS 2.34.5 — agent latency + control-plane exhaustion (EKS)
 
-**Date:** 2026-09-14  
+**Date:** 2026-09-15  
 **Region / account:** `us-east-1`  
 **Cluster:** `eks-podman-coder-lab` (destroyed after this run)  
-**Question:** How many *idle, connected* standard workspaces can **one** OSS `coderd` hold before the Coder API exceeds a **300 ms p95** budget?
+**Question:** On one OSS `coderd`, do **agent connection latencies** (`coderd_agents_connection_latencies_seconds` preferred DERP, plus `coderd_agentstats_connection_median_latency_seconds`) move as idle N goes 50→800 — or is **workspace-list API** still the thing that dies first? Then: patch-all + reconnecting-PTY activity, and whether the **web terminal** still works.
 
-This is a control-plane test (agent ↔ coderd), not nested Podman. It informs ADR-0001 (middle service + standard workspaces): plan concurrent **running** sandboxes, not historical workspace count.
+Companion to [scale-results-2026-09-14.md](scale-results-2026-09-14.md) (idle list SLO only, stopped at 400).
 
 ## Verdict
 
-**What degraded:** one API handler on a single OSS `coderd` — **`GET /api/v2/workspaces`** (list all workspaces + live agent status). At 400 idle agents, **every** list during the 10-minute hold took **100–500 ms** (Prometheus p50 **300 ms**, p95 **480 ms**).
+**Agent DERP stayed ~1–2 ms p95 through 788 idle connected workspaces.** That gauge is **not** the exhaustion signal.
 
-**Why that is too much:** the run’s SLO was **p95 ≤ 300 ms**. ~400–480 ms fails that bar. A human opening a dashboard once might still find 400 ms usable, but it is already sluggish — and the **typical** call (p50) is already **at** 300 ms, not only the slow tail. That is with **idle** agents and no real job work. A middle service that polls this list would feel that on every poll. **200** workspaces stayed under budget (p95 **97 ms**). **400** did not.
+**`GET /api/v2/workspaces` is.** Same as 14 Sep: p95 **49 ms** at 50/100, **98 ms** at 200, **480 ms** at 400 and 600. Packing reached **788** (kubelet `Too many pods`, not 800). List kept getting worse under patch/PTY (p50 **344 ms**, p95 **902 ms** over that scrape window; live canary at ~771 was p50 ~**850 ms**, p95 ~**1.8 s**).
 
-**What did *not* degrade:** workspace pods stayed Running; all **400 agents stayed connected**; `GET /healthz` stayed ~1 ms; `GET /api/v2/templates` stayed ~24 ms; Terraform/provisionerd was idle; the node groups were not full.
+**Web terminal uses a different path than `coder ssh` / VS Code Desktop.** SSH/Desktop make the laptop a tailnet peer of the agent (DERP ~ms, SSH ~1.2 s). The UI terminal is a reconnecting-PTY websocket **through coderd’s servertailnet**. At ~670–771 agents that hop failed (`agent is unreachable`, `you do not share a tunnel`, 0 peers, PTY 101 then no shell). After deleting **150** workspaces, at **620** running the same `ramp-116` PTY returned a prompt in **~100 ms**.
 
-**Cause (from Prometheus, not a guess about CPU):** each idle workspace holds two long-lived connections **on that same coderd process** (agent RPC websocket + embedded DERP). Listing workspaces has to walk that live set. The SQL for the list is still ~11 ms; the extra hundreds of milliseconds are **in coderd after Postgres**. DERP was not moving traffic (0 packets / 0 bytes) — the cost is **connection occupancy**, not relay throughput.
+**Do not add workspace nodes to fix the UI terminal.** Extra nodes only help `Too many pods`. Next lever for >~200 list SLO or >~620 usable PTY: **more `coderd` replicas** splitting agent RPC + embedded DERP.
 
-We did **not** take a Go pprof, so we cannot name a mutex or function. We *can* rule out “the box ran out of CPU/RAM” and “Postgres is slow.”
+## Lab topology
 
-| Finding | Number |
-| --- | --- |
-| Last healthy idle plateau | **~200** connected workspaces |
-| First failed plateau | **400** (`GET /api/v2/workspaces` p95 **480 ms** vs 300 ms) |
-| Exact cliff | **Untested** (between 200 and 400) |
-| Bigger control-plane CPU/RAM | **Would not have changed the 400 result** |
-| More provisionerd (we used 5) | **Would not have changed the 400 result** |
-
-600 and 800 were **not started** (ramp stops on first degraded hold).
-
-## Lab topology (what actually ran)
-
-Account on-demand standard vCPU quota was **64**, so this was not the originally sketched 48xlarge packing layout.
+Unchanged from 14 Sep (on-demand standard vCPU quota **64**):
 
 | Role | Count × type | Notes |
 | --- | --- | --- |
-| Control | 1 × `m7i.2xlarge` (8 vCPU / 32 GiB) | `workload=control`; coderd + Postgres |
-| Workspaces | 3 × `m7i.4xlarge` (16 vCPU / 64 GiB) | taint `workload=coder:NoSchedule`, `maxPods=230` |
-| Workspace fill | 1 × `m7i.2xlarge` | same taint, `maxPods=110` |
-| Nodes | **not scaled with the ramp** | packing vs coderd degradation kept separate |
-| VPC CNI | prefix delegation on | AL2023 (not Bottlerocket) |
-| Karpenter | **not used** | |
+| Control | 1 × `m7i.2xlarge` | `workload=control`; coderd + in-cluster Postgres |
+| Workspaces | 3 × `m7i.4xlarge` | taint `workload=coder:NoSchedule`, `maxPods=230` |
+| Fill | 1 × `m7i.2xlarge` | same taint, `maxPods=110` |
 
-**Coder**
+Coder chart **2.34.5**, `replicaCount: 1`, `CODER_PROVISIONER_DAEMONS=5`, `CODER_PROMETHEUS_COLLECT_AGENT_STATS=true`, `CODER_API_RATE_LIMIT=-1`, `CODER_ACCESS_URL=http://coder.coder.svc.cluster.local`. Template `scale-idle` (Ubuntu, agent only). Quota increase 64→80 for a 4th 4xlarge was **not** granted (`CASE_CLOSED`, quota still 64); we did not add a node.
 
-- Chart / app **2.34.5**, `replicaCount: 1`
-- Built-in provisioners: `CODER_PROVISIONER_DAEMONS=5` (external provisioners are Premium)
-- Postgres 16 in-cluster (`emptyDir` on the control node)
-- Prometheus: `CODER_PROMETHEUS_ENABLE=true` (`coder-prom:2112`)
-- coderd requests/limits: **3 CPU / 8 GiB** request, **6 CPU / 16 GiB** limit
-- Postgres requests/limits: **1 CPU / 4 GiB** request, **2 CPU / 8 GiB** limit
-- Workspace pods: requests **50m / 256Mi**, limits **1 CPU / 2 GiB**, **emptyDir** (no PVC)
+## Idle ramp (did not stop on list p95)
 
-**Template:** `scale-idle` — Ubuntu 24.04, `coder_agent` only, no IDE apps / Podman / FUSE.
+Waves **50 → 100 → 200 → 400 → 600 → 800**, **10 min** idle holds. 800 fill stopped at **788** Running pods (`FailedScheduling` / `Too many pods`; DaemonSets eat slots).
 
-Creates used admin `coder create` (OSS 2.34.5 rejects `X-Coder-Bypass-Ratelimit` on non-owner scaletest users). Terraform providers were served from a **filesystem mirror** in the coderd pod after GitHub 504s on concurrent `terraform init`.
+Preferred DERP (`coderd_agents_connection_latencies_seconds`), end of hold:
 
-## Method
+| N | agents_up | DERP p50 | DERP p95 | List p50 | List p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 50 | 50 | 0.68 ms | **1.2 ms** | 38 ms | **49 ms** |
+| 100 | 100 | 0.68 ms | **1.3 ms** | 38 ms | **49 ms** |
+| 200 | 200 | 0.68 ms | **1.3 ms** | 75 ms | **98 ms** |
+| 400 | 400 | 0.70 ms | **1.3 ms** | 300 ms | **480 ms** |
+| 600 | 600 | 0.71 ms | **1.4 ms** | 300 ms | **480 ms** |
+| 788 | 788 | 0.72 ms | **1.6 ms** | (canary/PF died; list still the slow path) | |
 
-Waves: **50 → 100 → 200 → 400 → (600) → (800)**.  
-Each wave: fill to N, then **10 minutes idle**. Stop if focus p95 > **0.300 s**.
+`coderd_agentstats_connection_median_latency_seconds` is **empty while idle** (needs client sessions / reachable peers). Do not treat a missing median as “agents are fine.”
 
-**Pass/fail metric** is *in-process* coderd latency, not laptop curl:
+## Patch-all + PTY activity
 
-- Histogram: `coderd_api_request_latencies_seconds`
-- Diff start-of-hold vs end-of-hold scrape
-- Focus: **p95 of GET `/api/v2/workspaces`**
-- Budget: **300 ms** (ramp stops if p95 exceeds this)
+- Laptop **788× `coder ssh`** OOMed the operator machine. Do not do that.
+- In-cluster one-process asyncio reconnecting-PTY loadgen on the **control** node (ClusterIP) is the right generator.
+- Org-style patch: enqueue all stop then start into provisionerd (FIFO). Client `xargs -P 5` is not the org queue. Stops ran first, so “nothing running” until the stop drain finished.
+- **771** patched running was the post-patch ceiling. **22** start builds **canceled**, **7 failed** (terraform), after unschedulable starts hung provisioners. UI “22 pending” was those **canceled** jobs; `coderd_provisionerd_jobs_current=0`. **10** k8s pods stayed Pending (`Too many pods`) as orphans.
+- Under PTY: DERP p50 **0.92 ms** / p95 **4.8 ms** (n=655); agentstats median n=689, p50 **0.62 ms** / p95 **1.2 ms**. List over that window p50 **344 ms** / p95 **902 ms**. Loadgen never held 771 PTYs (~100 open, thousands of connect timeouts) and made the UI terminal unusable; Job was deleted.
 
-A laptop canary (`GET /users/me`, `/workspaces`, `/templates` every 2 s via port-forward) only **generates** those API samples. Canary RTT includes the port-forward and was **not** the SLO.
+## Web terminal vs SSH (ramp-116)
 
-### How to read p50 / p95 / p99
-
-Each idle hold produces ~230–250 timings for the same API call. Sort those durations fastest → slowest:
-
-| Percentile | Meaning | Why we report it |
+| Path | ~771 / ~670 | After delete to **620** |
 | --- | --- | --- |
-| **p50** (median) | Half the calls were faster than this, half slower. The **typical** request. | If p50 is already at the budget, slowness is the common case, not a few outliers. |
-| **p95** | 95% of calls were this fast or faster; 5% were slower. | **Pass/fail SLO** for this run (must stay ≤ 300 ms). |
-| **p99** | 99% of calls were this fast or faster; the slowest 1% sit above this. | Shows whether the tail is far from p95 (noisy spikes) or tight (the whole distribution moved). |
+| Preferred DERP in UI | ~1–9 ms | still ~ms |
+| `coder ssh` | **~1.2 s**, works | works |
+| VS Code Desktop | connected | (not retested) |
+| Web `/pty` | 101 then **no shell**; coderd `agent is unreachable` | prompt in **~100 ms** |
+| coderd CPU | ~**2.5–2.7** cores | ~**0.4** core at 620 |
+| Agent RPC + DERP | ~771 + 771 | **620 + 622** |
 
-Example: at **400** workspaces, workspace-list p50 = 300 ms, p95 = 480 ms, p99 = 496 ms. The typical call is already at budget, and p95/p99 are close together — the endpoint got slow for almost everyone, not just a long tail. At **200**, p50/p95/p99 are 72 / 97 / 99 ms: tight and under budget.
+`GET /api/v2/workspaceagents/{id}/listening-ports` timed out (~15–30 s) while SSH worked — same coderd→agent dial as PTY.
 
-Times are coderd’s own histogram (inside the process). They do **not** include laptop or `kubectl port-forward` RTT.
+Deleted **100** then **50** running `ramp-*` (kept `ramp-116`): 100 was not enough (still hung at 670). After 150 gone, UI terminal worked.
 
-Coder’s histogram buckets jump **100 ms → 500 ms** (no 250/300 ms bucket). p50=300 ms and p95=480 ms are **linear interpolations inside that bucket**. The raw Prom fact is stronger than the interpolated decimals: during the 400 hold, **232 / 232** list samples landed in `le=0.5` and **0** landed in `le=0.1`. So 100% of lists were slower than 100 ms and faster than 500 ms. At 200, almost all lists were still **under 100 ms**.
+## Last live snapshot (before destroy)
 
-## API results (idle holds)
+- Workspaces: **650** (`620` running, `22` canceled, `5` failed, a few starting)
+- Agent RPC **620**, DERP **622**, goroutines ~**13.5k**, RSS **~1.11 GiB**
+- `GET /workspaces` ~**0.81 s**
+- DERP n=532 p50 **1.1 ms** p95 **21 ms** (wider tail than idle; still not the UI failure mode)
 
-Source: `.scale-results/ramp-summary.csv` and `prom-{N}-diff.txt`.
+## What this means
 
-| N (idle agents) | Hold start (UTC) | Workspace list **p50** (typical) | Workspace list **p95** (SLO) | Workspace list **p99** (tail) | Templates p95 | `/healthz` p95 | Verdict |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 50 | 15:20:21 | 38 ms | **49 ms** | 50 ms | 24 ms | 1 ms | ok |
-| 100 | 15:32:02 | 38 ms | **49 ms** | 50 ms | 24 ms | 1 ms | ok |
-| 200 | 15:45:27 | 72 ms | **97 ms** | 99 ms | 24 ms | 1 ms | ok |
-| **400** | 16:02:43 | **300 ms** | **480 ms** | 496 ms | 24 ms | 1 ms | **DEGRADED** (p95 > 300 ms) |
-
-“Workspace list” is `GET /api/v2/workspaces`. **That is the degraded thing.** Templates stayed ~24 ms p95 and healthz ~1 ms at every N, so coderd was not globally wedged — only the handler that walks every workspace/agent got slow.
-
-### What Prometheus showed (cause vs not-cause)
-
-Scrapes of `coder-prom:2112` at the start and end of each idle hold (`prom-{N}-hold-*.prom`). Gauges below are the **end-of-hold** snapshot.
-
-**The load that grew with N** (one of each per idle workspace, all terminated on this coderd — in-cluster ClusterIP, not public Tailscale DERP):
-
-| Prometheus signal | At N=200 | At N=400 | Read as |
-| --- | ---: | ---: | --- |
-| `coderd_agents_up` | 200 | 400 | Agents still healthy; connectivity did not fail |
-| `coderd_api_concurrent_websockets{path="/api/v2/workspaceagents/me/rpc"}` | 200 | 400 | Persistent agent control-plane RPC |
-| `coderd_api_concurrent_requests{path="/derp"}` | 200 | 400 | Persistent HTTP to embedded DERP |
-| `coder_derp_server_connections` / `clients_local` | 201 | 401 | Same DERP sockets counted on the server |
-| `go_goroutines` | ~4.2k | ~8.2k | ~20 goroutines per agent |
-
-**What Prometheus showed was *not* the problem:**
-
-| Prometheus signal | At N=400 | Read as |
-| --- | --- | --- |
-| `coderd_api_request_latencies_seconds` for `GET /api/v2/templates` | p95 still **24 ms** | Other REST is fine |
-| same histogram for `GET /healthz` | p95 **1 ms** | Process still serving |
-| `coderd_provisionerd_jobs_current` | **0** | Not stuck in Terraform |
-| `coderd_db_query_latencies_seconds` `GetAuthorizedWorkspaces` | mean **~11 ms** (almost all &lt; 25 ms) | Postgres is not the 480 ms |
-| `coder_derp_server_bytes_*` / `packets_*` | **0** | DERP is idle; no relay throughput |
-| `coder_derp_server_average_queue_duration_ms` | **0** | DERP queue not backed up |
-| `process_cpu_seconds_total` over the 400 hold | ~0.18 cores | Not CPU-bound |
-| `go_memstats_sys_bytes` | ~573 MiB | Not memory-bound |
-
-`coderd_api_concurrent_requests` in the old summary scripts is a **sum across paths**. The 400 concurrent HTTP requests are **GET `/derp`**, not 400 overlapping workspace-list calls. The canary only listed workspaces about once every 2 seconds.
-
-So the cause we can stand on: **one coderd process holding ~400 agent RPC websockets + ~400 idle DERP connections, then executing `GET /api/v2/workspaces` which joins DB rows with that in-memory agent state.** List p95 was flat 50→100 (49 ms), ~2× at 200 (97 ms), ~5× from 200 at 400 (480 ms). We did not profile the handler itself.
-
-## Control-plane CPU and memory (not the limiter)
-
-Live cgroup (still at 400 agents, after the degraded hold):
-
-| Pod | CPU throttle | Memory peak | Limit |
-| --- | --- | --- | --- |
-| coderd | **7.4 s** throttled over the whole run (~1.4% of CFS periods) | **1.64 GiB** | 16 GiB |
-| Postgres | **2.0 s** throttled | **~190 MiB** | 8 GiB |
-
-coderd `process_cpu_seconds_total` **during the 600 s idle holds** (user+system):
-
-| N | CPU-seconds in hold | Equivalent cores |
-| ---: | ---: | ---: |
-| 50 | 15.6 | ~0.03 |
-| 100 | 23.9 | ~0.04 |
-| 200 | 44.8 | ~0.08 |
-| 400 | 107.4 | ~0.18 |
-
-Go `sys` bytes at 400 ≈ **573 MiB**. coderd RSS ≈ **640 MiB**. Control node allocatable ~7.9 CPU / 30 GiB; requests were ~54% CPU / 40% memory.
-
-**Postgres is not the 480 ms.** `GetAuthorizedWorkspaces` (the list query) averaged **~11 ms** (2094 samples; almost all &lt; 25 ms). Extra latency is in coderd after the query (assemble 400 workspace+agent records while 400 DERP + 400 RPC connections are live).
-
-## Provisionerd (not the limiter)
-
-- 5 built-in daemons; **0 jobs** on every idle hold.
-- Successful template STARTs: **375**, **all &lt; 10 s**, mean **~5.1 s** (`coderd_provisionerd_workspace_build_timings_seconds`).
-- Fill concurrency was 5, matching daemon count, so we did not build a large provisioner queue.
-- Extra in-process daemons would only help **burst-create** start latency. They share the coderd process on OSS; they would not unload idle agent connections.
-
-## What this means for the product
-
-1. **~400 ms (p95 ~480 ms) on workspace list is too much for this SLO.** We required p95 ≤ **300 ms**. At 400 idle agents the median was already 300 ms, so the common case is at the limit, not just the tail. Treat that plateau as over capacity for a control-plane / middle-service poll path, even if a single UI click would still “work.”
-2. **Plan ~200 concurrent connected workspaces per OSS `coderd` (v2.34.5)** if that 300 ms p95 list SLO (or any handler that walks all live agents) still applies.
-3. Agent jobs should be **ephemeral**: stop/delete when the run finishes so live agent count ≈ jobs in flight, not lifetime creates.
-4. The **middle service should own job lists**. Do not use `GET /api/v2/workspaces` as a hot dashboard path. Talk to Coder by workspace id/name.
-5. **Do not scale this with a larger `m7i` or more provisionerd.** Next capacity lever if you need &gt;200 in flight: **more `coderd` replicas** sharing Postgres (spread DERP + agent RPC), which this lab did **not** measure.
-6. Kubernetes packing was fine: 400 workspace pods stayed Running; the miss is coderd, not the node groups.
-
-## What we did not measure
-
-- N = 250, 300, 350 (cliff is only bounded)
-- `coderd` `replicaCount` &gt; 1
-- Premium external provisioners
-- Nested Podman / FUSE / workspace PVCs
-- Active work inside the sandbox (Claude SDK, etc.) — only idle `coder_agent`
-- HA / disk-backed Postgres
-- API paths other than the canary trio (focus = workspace list)
-- Go pprof / mutex profile of the workspace-list handler (Prometheus shows *where* time is not, not the exact function)
+1. **Plan ~200 connected workspaces per OSS `coderd`** if `GET /api/v2/workspaces` p95 ≤ 300 ms still matters (unchanged from 14 Sep).
+2. **DERP / agentstats ms ≠ a usable control plane.** List and web PTY die while DERP looks fine.
+3. **Web terminal capacity on one replica was recovered at ~620**, broken at ~670+. Not a tight SLO; do not treat 620 as a product target without a replica>1 retest.
+4. **Kube packing ceiling ~788** on this 64-vCPU layout. More nodes ≠ healthier coderd.
+5. Activity tests: in-cluster PTY loadgen, not 800 laptop SSH.
 
 ## Raw dumps (local)
 
-`.scale-results/` on the operator laptop: `ramp-summary.csv`, `prom-{50,100,200,400}-diff.txt`, hold start/end Prometheus scrapes, `canary.csv`. Do not commit session tokens from that directory.
+`.scale-results-agentconn/`, `.scale-results-patch/`, `.scale-results-loadgen/` — Prom scrapes, CSVs, canary. Do not commit session tokens.
