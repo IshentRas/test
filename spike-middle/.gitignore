@@ -1,0 +1,9 @@
+config.yaml
+config.local.yaml
+portal/node_modules/
+node_modules/
+go-middle/middle
+*.exe
+.DS_Store
+.env
+.env.*

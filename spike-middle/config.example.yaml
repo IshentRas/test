@@ -1,0 +1,28 @@
+# Example middle config. Copy to config.yaml and set secrets via env.
+#
+#   cp config.example.yaml config.yaml
+#   export CODER_OWNER_TOKEN='…'
+#   CONFIG_FILE=./config.yaml ./scripts/run-middle.sh
+#
+# Env overrides (win over file): CODER_URL, CODER_OWNER_TOKEN, LISTEN,
+# MIDDLE_PUBLIC_URL, DEFAULT_TEMPLATE, OIDC_ISSUER_URL, CONFIG_FILE
+
+listen: "127.0.0.1:8081"
+public_url: "http://localhost:8081"
+
+coder:
+  url: "http://localhost:3000"
+  # Prefer env CODER_OWNER_TOKEN — leave empty here
+  owner_token: ""
+  default_template: "spike-docker"
+
+idp:
+  issuer: "http://localhost:8080/realms/coder-lab"
+  # Leave empty: Keycloak access tokens often use aud "account"
+  audience: ""
+  jwks_url: ""
+  email_claim: "email"
+
+portal_origins:
+  - "http://localhost:5173"
+  - "http://127.0.0.1:5173"
