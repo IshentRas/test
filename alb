@@ -87,3 +87,127 @@ Deleted **100** then **50** running `ramp-*` (kept `ramp-116`): 100 was not enou
 ## Raw dumps (local)
 
 `.scale-results-agentconn/`, `.scale-results-patch/`, `.scale-results-loadgen/` — Prom scrapes, CSVs, canary. Do not commit session tokens.
+
+
+# CLI illusion: `coder ssh` URLs and DERP rewrite
+
+Lab defaults used below:
+
+| Role | URL |
+| --- | --- |
+| Coder (real control plane) | `http://localhost:3000` |
+| Middle | `http://localhost:8081` |
+| CLI | `CODER_URL=http://localhost:8081` (or `coder login http://localhost:8081`) |
+
+After login, the CLI holds an opaque middle token (`mt_…`), **not** a real Coder session token and **not** the Owner token.
+
+## Why rewrite is needed
+
+`coder ssh` asks the API how to reach the workspace agent. Coder’s answer includes a **DERP** relay (Tailscale-style tunnel endpoint). By default that points at Coder itself (`:3000`).
+
+If the CLI dialed that, SSH would bypass middle and talk to Coder directly — breaking the “everything goes through middle” illusion (and `mt_…` auth).
+
+Middle therefore:
+
+1. Proxies `GET /api/v2/workspaceagents/{id}/connection`
+2. Rewrites embedded DERP `HostName` / `DERPPort` to middle’s `public_url`
+3. Proxies tunnel traffic on `/derp` to upstream Coder
+
+## Step-by-step with ports
+
+### 1. CLI asks middle for connection info
+
+```http
+GET http://localhost:8081/api/v2/workspaceagents/AGENT_ID/connection
+Coder-Session-Token: mt_abc123…
+```
+
+Middle resolves `mt_…` → real Coder user token and forwards:
+
+```http
+GET http://localhost:3000/api/v2/workspaceagents/AGENT_ID/connection
+Coder-Session-Token: <real-coder-user-token>
+```
+
+### 2. What Coder returns (points at itself)
+
+Simplified:
+
+```json
+{
+  "derp_map": {
+    "Regions": {
+      "999": {
+        "EmbeddedRelay": true,
+        "Nodes": [
+          {
+            "Name": "1b",
+            "HostName": "localhost",
+            "DERPPort": 3000,
+            "ForceHTTP": true
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Without a rewrite, the CLI would open DERP at **`http://localhost:3000/derp`**.
+
+### 3. What middle returns to the CLI (rewritten)
+
+With `public_url: http://localhost:8081`:
+
+```json
+{
+  "derp_map": {
+    "Regions": {
+      "999": {
+        "EmbeddedRelay": true,
+        "Nodes": [
+          {
+            "Name": "1b",
+            "HostName": "localhost",
+            "DERPPort": 8081,
+            "ForceHTTP": true
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+The CLI opens DERP at **`http://localhost:8081/derp`**.
+
+Implementation: `rewriteConnectionInfoDERP` in [`go-middle/proxy.go`](go-middle/proxy.go) (sets `HostName`, `DERPPort`, `ForceHTTP` from `Config.PublicURL`).
+
+### 4. End-to-end path
+
+```text
+coder ssh my-workspace
+   │
+   │  API  GET http://localhost:8081/api/v2/.../connection
+   │       (Coder-Session-Token: mt_…)
+   ▼
+middle :8081
+   │  proxy + rewrite DERP → HostName=localhost, DERPPort=8081
+   │  upstream: http://localhost:3000/api/v2/.../connection
+   ▼
+   │  DERP http://localhost:8081/derp
+   ▼
+middle /derp  ──proxy──►  http://localhost:3000/derp  ──► workspace agent
+```
+
+## Rule of thumb
+
+Every URL the CLI **learns** must stay on **`:8081`**. Middle secretly talks to **`:3000`**.
+
+| Traffic | Client URL | Upstream |
+| --- | --- | --- |
+| Login / whoami / ls / connection info | `http://localhost:8081/api/v2/…` | `http://localhost:3000/api/v2/…` |
+| SSH tunnel (DERP) | `http://localhost:8081/derp` | `http://localhost:3000/derp` |
+
+Related login endpoints are documented in [`README.md`](README.md) (`/cli-auth*`, anonymous probes, `/api/v2/buildinfo` dashboard rewrite).
+
