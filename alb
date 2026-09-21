@@ -1,178 +1,157 @@
-# Opening Coder apps: path vs `subdomain = true`
+# Middle scale-down: thin control plane (no Coder reverse-proxy)
 
-**Status:** path apps work via middle 302 + host-only cookie (multi-plane lab). Subdomain apps were **proven** with `?coder_session_token=` (local-subdomain lab) but are **not yet wired** into middle’s open endpoint.
-
-**Code today:** [`../go-middle/planes.go`](../go-middle/planes.go) — `handleOpenCoderApp`  
-**Related labs:** [`../multi-plane-lab/README.md`](../multi-plane-lab/README.md), [`../local-subdomain-lab/README.md`](../local-subdomain-lab/README.md)
-
----
-
-## 1. Goal
-
-Portal / Backstage → middle → **302 to the real Coder app URL** (no middle proxy of the app body), authenticated as the user, for both:
-
-| Mode | Terraform | Example URL |
-| --- | --- | --- |
-| Path | `subdomain = false` | `https://coder-a.example.com/@alice/ws/apps/ttyd/` |
-| Subdomain | `subdomain = true` | `https://ttyd--ws--alice.coder-a.example.com/` |
+**Date:** 2026-09-21  
+**Status:** Decision after lab validation  
+**Related:** [SPIKE-RESULTS.md](../agent-task-lab/SPIKE-RESULTS.md), [open-coder-apps-path-vs-subdomain.md](./open-coder-apps-path-vs-subdomain.md), [multi-plane-lab README](../multi-plane-lab/README.md)
 
 ---
 
-## 2. What works today
+## 1. Decision
 
-### Path (`subdomain = false`) — implemented
+Middle does **not** need to pretend to be Coder (no reverse-proxy of the Coder API, apps, or DERP).
 
-`GET /v1/workspaces/{id}/coder-app/{slug}?plane=`
+Browsers and the Coder CLI talk to the **real control plane URL**. Middle stays a **thin orchestration + auth + credential** service.
 
-1. Mint plane user token (`middle-{plane}` reserved key).
-2. If middle hostname == plane hostname (lab: both `127.0.0.1`):
-   - `Set-Cookie: coder_session_token=…` **host-only** (no `Domain=`)
-   - `302` → `{plane}/@{user}/{ws}/apps/{slug}/` (**clean URL**, no token in query)
-3. Else (different hostnames):
-   - `302` → same path URL with `?coder_session_token=`
+```text
+Before (facade):
+  Portal / CLI ──► Middle (/api/v2 proxy, /proxy apps, /derp) ──► Coder
 
-Browsers ignore **port** for cookies, so lab middle `:8081` and Coder `:3000` on `127.0.0.1` share the cookie. Production should use **one hostname per plane** and set the cookie for that host (or use the query fallback).
+After (thin):
+  Portal ──► Middle (auth, mint, create/stop/tasks, 302 open, CLI exports)
+                │
+                └── server-side Coder API client ──► Coder planes
 
-### Subdomain (`subdomain = true`) — verified, not wired
-
-Local subdomain lab showed:
-
-- `?coder_session_token=` on the **subdomain** URL → **200**
-- Without token → Coder `303` auth-redirect
-- Cookie set only on `127.0.0.1` is **not** sent to `*.sslip.io` / `*.coder.example.com`
-
-So auth works; middle simply never builds or redirects to the subdomain URL.
+  Browser apps ──► real Coder URL (cookie or ?coder_session_token=)
+  CLI           ──► CODER_URL=<plane> + CODER_SESSION_TOKEN=<minted>
+```
 
 ---
 
-## 3. What we are missing
+## 2. What we validated
 
-| Gap | Why it matters |
+| Claim | Result |
 | --- | --- |
-| **1. Detect app sharing mode** | Workspace JSON / apps list must tell middle whether `slug` is subdomain or path (don’t hardcode path URLs). |
-| **2. Build subdomain URL** | Pattern is `{slug}--{workspace}--{username}.{wildcard-suffix}` (Coder’s app hostname scheme), not `/@user/ws/apps/slug/`. |
-| **3. Know wildcard base per plane** | Needs `CODER_WILDCARD_ACCESS_URL` (or equivalent) in middle config, e.g. `*.coder-a.example.com`, plus scheme/port. |
-| **4. Cookie scope for subdomain** | Host-only cookie on `coder-a.example.com` is **not** sent to `ttyd--ws--alice.coder-a.example.com`. Options below. |
-| **5. Plane config / ACCESS_URL** | Each plane must run with wildcard enabled and a stable access + wildcard URL (sslip in lab; real DNS in prod). |
-| **6. Portal / Backstage** | Open button must call middle; middle returns Location for the correct URL shape. |
-
-Nothing fundamental is “impossible” — it’s URL construction + cookie strategy + config.
+| Open path apps via middle **302** + host-only cookie / query token on **real** Coder URL | Works (multi-plane lab) |
+| Subdomain apps accept `?coder_session_token=` on real wildcard host | Works (subdomain lab); middle open wiring still TBD — see sibling doc |
+| CLI works with **only** `CODER_URL` + `CODER_SESSION_TOKEN` (no `coder login`, no paste) | Works — empty HOME, plane URL + user/session token → `coder whoami` / `list` as alice/owner |
+| `coder login` paste + 302 cannot replace credential issuance | Confirmed — login waits for paste; portal export is the better UX |
 
 ---
 
-## 4. Target logic (what to implement)
+## 3. Keep in middle
 
-```text
-open(workspace_id, slug, plane):
-  tok = mint(plane, user)
-  app = lookupApp(workspace, slug)   # from Coder API / agent apps
+| Responsibility | Why |
+| --- | --- |
+| Validate IdP JWT / GitLab JWKS | Product + CI identity |
+| Map identity → Coder user; mint/ensure per-plane tokens | Users never use Coder login UI |
+| `POST/GET/DELETE` workspaces, tasks, archive | Orchestration API for portal / Backstage / CI |
+| Open app: mint + **302** to real Coder app URL | Clean browser entry; no app proxy |
+| CLI credentials: return plane `CODER_URL` + token for copy (bash / PowerShell / cmd) | Skip interactive `coder login` — **new `GET /v1/cli-credentials`** (§5) |
+| JWT mint JSON (e.g. `POST /cli-auth/mint`) | Keep for token-from-JWT; **drop HTML** `/cli-auth` page |
+| Task event bus (ingest + WS to portal) | Agent stream without terminal |
+| Policy / plane routing | Multi-plane branching |
 
-  if app.subdomain:
-    host = f"{slug}--{workspaceName}--{username}.{wildcardBase(plane)}"
-    // e.g. ttyd--alice-a--alice.coder-a.example.com
-    target = url(scheme, host, port, path="/", query=…)
-  else:
-    target = f"{planeURL}/@{username}/{workspaceName}/apps/{slug}/"
+Middle still calls Coder’s REST API **as a client** (owner token + user tokens). That is not a reverse-proxy.
 
-  authStrategy(target, tok):
-    // see §5
-  302 → target
+---
+
+## 4. Drop / stop investing in
+
+| Piece (spike today) | Reason |
+| --- | --- |
+| `GET/… /api/v2/` reverse-proxy (`handleAPIV2Proxy`) | CLI/portal use real `CODER_URL` |
+| DERP map rewrite so CLI dials middle | Not needed if CLI targets the plane |
+| `/proxy/{user}/{ws}/apps/...` app reverse-proxy | Browser opens real Coder app URL |
+| **`GET /cli-auth` HTML page** (paste UI) | Portal/Backstage owns copy-export UX |
+| Framing middle as `CODER_URL` for humans | Default = real plane URL |
+
+**Keep the JWT mint path** (e.g. today’s `POST /cli-auth/mint` with IdP access token) as a JSON API if useful for labs or non-portal clients — **without** serving HTML. Product path for humans is the new credentials endpoint below + portal UI.
+
+---
+
+## 5. New endpoint: control plane URL + token (required)
+
+Spike does **not** yet expose a first-class “give me CLI exports” API. Portal today would have to cobble plane URL from `/v1/planes` and a token from open-app/session side effects. **Add an explicit endpoint.**
+
+### Sketch
+
+```http
+GET /v1/cli-credentials?plane=a
+Authorization: Bearer <IdP JWT>
 ```
 
-### Subdomain hostname format
+**Response:**
 
-Coder’s convention (as used in the subdomain lab):
-
-```text
-{app_slug}--{workspace_name}--{username}.{wildcard_without_star}
-```
-
-Example:
-
-- Wildcard: `*.coder.127.0.0.1.sslip.io`
-- App: `jupyter`, workspace `subdomlab`, user `alice`
-- Host: `jupyter--subdomlab--alice.coder.127.0.0.1.sslip.io`
-
-Confirm against your Coder version if names contain chars that get normalized.
-
-### Looking up `subdomain`
-
-Prefer reading from workspace/agent apps in the API response (each `coder_app` has sharing / subdomain metadata) rather than a static slug map. Fallback: config table `slug → mode` per template if API shape is awkward.
-
----
-
-## 5. Auth strategies for subdomain (choose one)
-
-| Strategy | How | Pros | Cons |
-| --- | --- | --- | --- |
-| **A. Query token (simplest)** | `302` → `https://{subhost}/?coder_session_token=…` | Already verified; no cookie on wildcard | Token briefly in URL / Referer; use short-lived session keys |
-| **B. Bootstrap on app host** | Tiny middle (or edge) endpoint on `*.coder-a…` sets host cookie then redirects clean | Clean URL like path flow | Needs wildcard TLS + something listening on app hosts (or Coder itself accepting Set-Cookie from a bounce) |
-| **C. Parent Domain cookie** | `Set-Cookie; Domain=.coder-a.example.com` | Cookie shared by dashboard + `*.` apps | Broader blast radius; avoid on shared parent like `.example.com`; **do not** use one Domain across planes |
-| **D. Middle app proxy** | Keep traffic on middle `/proxy/...` | One origin | Not “open real Coder URL”; extra hop (we already have path proxy for some cases) |
-
-**Recommendation for first production cut:** **A** (query token 302 to subdomain URL), same as today’s cross-host path fallback. Add **B** or carefully scoped **C** later if product forbids tokens in the address bar.
-
-Path apps can keep today’s host-only cookie 302 when middle and plane share a cookie host.
-
----
-
-## 6. Config to add (per plane)
-
-```yaml
-planes:
-  - id: a
-    url: "https://coder-a.example.com"              # ACCESS_URL / dashboard
-    wildcard_url: "https://*.coder-a.example.com"   # WILDCARD_ACCESS_URL
-    owner_token: "…"
-```
-
-Coder server must be started with matching:
-
-- `CODER_ACCESS_URL=https://coder-a.example.com`
-- `CODER_WILDCARD_ACCESS_URL=*.coder-a.example.com`
-
-Lab already does this via sslip in [`../local-subdomain-lab/start-coder.sh`](../local-subdomain-lab/start-coder.sh).
-
----
-
-## 7. Code to change (sketches — not applied yet)
-
-Files: [`../go-middle/config.go`](../go-middle/config.go), [`../go-middle/planes.go`](../go-middle/planes.go), optionally [`../go-middle/access.go`](../go-middle/access.go).
-
-### 7.1 Config — add `wildcard_url` per plane
-
-**Today** (`config.go`):
-
-```go
-type PlaneConfig struct {
-	ID              string `yaml:"id"`
-	URL             string `yaml:"url"`
-	OwnerToken      string `yaml:"owner_token"`
-	DefaultTemplate string `yaml:"default_template"`
+```json
+{
+  "plane_id": "a",
+  "coder_url": "https://coder-a.example.com",
+  "session_token": "<coder user API/session token>",
+  "expires_at": "2026-09-22T00:00:00Z",
+  "username": "alice"
 }
 ```
 
-**Change to:**
+| Field | Meaning |
+| --- | --- |
+| `coder_url` | Real control plane / ACCESS_URL for that plane (what user sets as `CODER_URL`) |
+| `session_token` | Minted/ensured **Coder** user token for that plane (what user sets as `CODER_SESSION_TOKEN`) |
 
-```go
-type PlaneConfig struct {
-	ID              string `yaml:"id"`
-	URL             string `yaml:"url"`
-	WildcardURL     string `yaml:"wildcard_url"` // e.g. "https://*.coder-a.example.com"
-	OwnerToken      string `yaml:"owner_token"`
-	DefaultTemplate string `yaml:"default_template"`
-}
+Middle: validate caller → ensure user on plane → mint/refresh reserved token → return JSON.  
+Portal: format bash / PowerShell / cmd snippets and **copy to clipboard**.
+
+Optional: `POST /v1/cli-credentials` with `{ "plane_id": "a" }` if you prefer non-GET for token issuance.
+
+### Auth note
+
+- Humans: IdP JWT (same as other `/v1/*` routes) — **not** the HTML `/cli-auth` page.
+- JWT-only mint (`POST /cli-auth/mint`) can remain for scripts that already have a Keycloak token and only need a middle/Coder token; it should return JSON only. Prefer migrating callers to `/v1/cli-credentials` so `coder_url` is always included.
+
+---
+
+## 6. Portal / Backstage UX (CLI)
+
+Authenticated user → **`GET /v1/cli-credentials?plane=…`** → UI shows copy buttons:
+
+**bash / zsh**
+```bash
+export CODER_URL='https://coder-a.example.com'
+export CODER_SESSION_TOKEN='…'
 ```
 
-Mirror on runtime `Plane` in `planes.go` when planes are loaded from config (same field).
-
-**YAML:**
-
-```yaml
-planes:
-  - id: a
-    url: "https://coder-a.example.com"
-    wildcard_url: "https://*.coder-a.example.com"
-    owner_token: "…"
-    default_template: "multiplane-apps"
+**PowerShell**
+```powershell
+$env:CODER_URL = 'https://coder-a.example.com'
+$env:CODER_SESSION_TOKEN = '…'
 ```
+
+**cmd**
+```bat
+set CODER_URL=https://coder-a.example.com
+set CODER_SESSION_TOKEN=…
+```
+
+Then: `coder whoami`, `coder list`, `coder ssh …` — no paste into `coder login`.
+
+Prefer **plane URL + real Coder user token** (validated). Do **not** return `CODER_URL=middle` or `mt_…` for this product path.
+
+---
+
+## 7. Implications for code / docs
+
+Spike `go-middle` still contains proxy/DERP paths and the `/cli-auth` HTML handler for the earlier illusion. Treat them as **legacy lab surface**, not the target architecture.
+
+When implementing production middle (or pruning the spike):
+
+1. Do not port `/api/v2` proxy, app proxy, or DERP rewrite.
+2. Drop or gut **`GET /cli-auth` HTML**; keep JWT→token JSON mint if needed.
+3. **Add `GET /v1/cli-credentials`** (plane URL + Coder token) — see §5.
+4. Do port: auth, token mint, workspace/task APIs, open-app 302.
+5. Update ADRs / SPIKE-RESULTS “CLI illusion” language to match this scale-down.
+6. Subdomain open still needs wildcard URL construction (sibling doc) — still **302 to Coder**, not proxy.
+
+---
+
+## 8. One-line summary
+
+**Middle authorizes and orchestrates; Coder serves. Portal copies plane URL + token. No reverse-proxy and no middle HTML login page.**
