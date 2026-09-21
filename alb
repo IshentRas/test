@@ -1,298 +1,178 @@
-# Multi-plane spike: 2 Coders + middle + portal + Keycloak
+# Opening Coder apps: path vs `subdomain = true`
 
-Validates **plane branching**: mint and open apps on the correct control plane.
-Alice has workspaces on **A and B**; Bob only on **B**.
+**Status:** path apps work via middle 302 + host-only cookie (multi-plane lab). Subdomain apps were **proven** with `?coder_session_token=` (local-subdomain lab) but are **not yet wired** into middle’s open endpoint.
 
-## Architecture
+**Code today:** [`../go-middle/planes.go`](../go-middle/planes.go) — `handleOpenCoderApp`  
+**Related labs:** [`../multi-plane-lab/README.md`](../multi-plane-lab/README.md), [`../local-subdomain-lab/README.md`](../local-subdomain-lab/README.md)
+
+---
+
+## 1. Goal
+
+Portal / Backstage → middle → **302 to the real Coder app URL** (no middle proxy of the app body), authenticated as the user, for both:
+
+| Mode | Terraform | Example URL |
+| --- | --- | --- |
+| Path | `subdomain = false` | `https://coder-a.example.com/@alice/ws/apps/ttyd/` |
+| Subdomain | `subdomain = true` | `https://ttyd--ws--alice.coder-a.example.com/` |
+
+---
+
+## 2. What works today
+
+### Path (`subdomain = false`) — implemented
+
+`GET /v1/workspaces/{id}/coder-app/{slug}?plane=`
+
+1. Mint plane user token (`middle-{plane}` reserved key).
+2. If middle hostname == plane hostname (lab: both `127.0.0.1`):
+   - `Set-Cookie: coder_session_token=…` **host-only** (no `Domain=`)
+   - `302` → `{plane}/@{user}/{ws}/apps/{slug}/` (**clean URL**, no token in query)
+3. Else (different hostnames):
+   - `302` → same path URL with `?coder_session_token=`
+
+Browsers ignore **port** for cookies, so lab middle `:8081` and Coder `:3000` on `127.0.0.1` share the cookie. Production should use **one hostname per plane** and set the cookie for that host (or use the query fallback).
+
+### Subdomain (`subdomain = true`) — verified, not wired
+
+Local subdomain lab showed:
+
+- `?coder_session_token=` on the **subdomain** URL → **200**
+- Without token → Coder `303` auth-redirect
+- Cookie set only on `127.0.0.1` is **not** sent to `*.sslip.io` / `*.coder.example.com`
+
+So auth works; middle simply never builds or redirects to the subdomain URL.
+
+---
+
+## 3. What we are missing
+
+| Gap | Why it matters |
+| --- | --- |
+| **1. Detect app sharing mode** | Workspace JSON / apps list must tell middle whether `slug` is subdomain or path (don’t hardcode path URLs). |
+| **2. Build subdomain URL** | Pattern is `{slug}--{workspace}--{username}.{wildcard-suffix}` (Coder’s app hostname scheme), not `/@user/ws/apps/slug/`. |
+| **3. Know wildcard base per plane** | Needs `CODER_WILDCARD_ACCESS_URL` (or equivalent) in middle config, e.g. `*.coder-a.example.com`, plus scheme/port. |
+| **4. Cookie scope for subdomain** | Host-only cookie on `coder-a.example.com` is **not** sent to `ttyd--ws--alice.coder-a.example.com`. Options below. |
+| **5. Plane config / ACCESS_URL** | Each plane must run with wildcard enabled and a stable access + wildcard URL (sslip in lab; real DNS in prod). |
+| **6. Portal / Backstage** | Open button must call middle; middle returns Location for the correct URL shape. |
+
+Nothing fundamental is “impossible” — it’s URL construction + cookie strategy + config.
+
+---
+
+## 4. Target logic (what to implement)
 
 ```text
-Keycloak (:8080)
-    │  IdP JWT
-Portal (:5173) ──► Middle (:8081) ──► Coder A (:3000)   alice-a
-                      │            └► Coder B (:3001)   alice-b, bob-b
-                      │
-                      └─ GET /v1/workspaces/{id}/coder-app/{slug}?plane=a|b
-                           → Set-Cookie coder_session_token (host-only) + 302 to
-                             http://127.0.0.1:PORT/@user/ws/apps/slug/  (no token in URL)
+open(workspace_id, slug, plane):
+  tok = mint(plane, user)
+  app = lookupApp(workspace, slug)   # from Coder API / agent apps
+
+  if app.subdomain:
+    host = f"{slug}--{workspaceName}--{username}.{wildcardBase(plane)}"
+    // e.g. ttyd--alice-a--alice.coder-a.example.com
+    target = url(scheme, host, port, path="/", query=…)
+  else:
+    target = f"{planeURL}/@{username}/{workspaceName}/apps/{slug}/"
+
+  authStrategy(target, tok):
+    // see §5
+  302 → target
 ```
 
-Apps are **path-based** (`subdomain = false`): **ttyd** (terminal) + **code-server**.
-Built-in Coder web terminal is disabled (`display_apps.web_terminal = false`).
+### Subdomain hostname format
 
-## Quick start
+Coder’s convention (as used in the subdomain lab):
 
-```bash
-# 1. Keycloak
-docker compose -f local-sso/docker-compose.yml up -d
-
-# 2. Two Coder planes (separate terminals)
-PLANE_ID=a PORT=3000 ./spike-middle/multi-plane-lab/start-plane.sh
-PLANE_ID=b PORT=3001 ./spike-middle/multi-plane-lab/start-plane.sh
-
-# 3. Seed users + template + workspaces
-chmod +x spike-middle/multi-plane-lab/*.sh
-./spike-middle/multi-plane-lab/seed-planes.sh
-
-# 4. Fill owner tokens into config
-cp spike-middle/multi-plane-lab/config.multiplane.yaml /tmp/mp-config.yaml
-# paste tokens from /tmp/multiplane-lab/owner-a.token and owner-b.token into planes.*.owner_token
-
-# 5. Middle
-cd spike-middle/go-middle
-CONFIG_FILE=/tmp/multiplane-lab/config.yaml go run .
-# or: go build -o /tmp/multiplane-middle . && CONFIG_FILE=… /tmp/multiplane-middle
-
-# 6. Portal
-cd spike-middle/portal && MIDDLE_URL=http://127.0.0.1:8081 npm start
+```text
+{app_slug}--{workspace_name}--{username}.{wildcard_without_star}
 ```
 
-Open http://127.0.0.1:5173 → Keycloak as **alice** / **alice** or **bob** / **bob**.
+Example:
 
-| User | Expected workspaces |
-| --- | --- |
-| alice | `alice-a` (plane **a**), `alice-b` (plane **b**) |
-| bob | `bob-b` (plane **b**) only |
+- Wildcard: `*.coder.127.0.0.1.sslip.io`
+- App: `jupyter`, workspace `subdomlab`, user `alice`
+- Host: `jupyter--subdomlab--alice.coder.127.0.0.1.sslip.io`
 
-Coder UI (optional): email `alice@example.com` / `bob@example.com`, password `TestUser1!`.
+Confirm against your Coder version if names contain chars that get normalized.
 
-## Host-only cookie (no token in the URL)
+### Looking up `subdomain`
 
-### Goal
+Prefer reading from workspace/agent apps in the API response (each `coder_app` has sharing / subdomain metadata) rather than a static slug map. Fallback: config table `slug → mode` per template if API shape is awkward.
 
-Open the **real** Coder app URL without putting `?coder_session_token=` in the address bar
-(history / Referer / logs).
+---
 
-### How it works (local lab)
+## 5. Auth strategies for subdomain (choose one)
 
-1. Portal calls `POST /v1/app-session` (sets `middle_session`), then navigates to  
-   `GET /v1/workspaces/{id}/coder-app/{slug}?plane=…`.
-2. Middle mints/reuses the user’s Coder API token for that plane.
-3. Middle responds with:
-   - `Set-Cookie: coder_session_token=…; Path=/; HttpOnly; SameSite=Lax`  
-     (**no `Domain=` attribute** → **host-only**)
-   - `302` → `http://127.0.0.1:PORT/@user/ws/apps/slug/` (clean URL; code-server may keep `?folder=`)
-4. Browser sends that cookie to Coder on the same hostname. Coder accepts  
-   `Cookie: coder_session_token=…` for path apps (same as query param).
+| Strategy | How | Pros | Cons |
+| --- | --- | --- | --- |
+| **A. Query token (simplest)** | `302` → `https://{subhost}/?coder_session_token=…` | Already verified; no cookie on wildcard | Token briefly in URL / Referer; use short-lived session keys |
+| **B. Bootstrap on app host** | Tiny middle (or edge) endpoint on `*.coder-a…` sets host cookie then redirects clean | Clean URL like path flow | Needs wildcard TLS + something listening on app hosts (or Coder itself accepting Set-Cookie from a bounce) |
+| **C. Parent Domain cookie** | `Set-Cookie; Domain=.coder-a.example.com` | Cookie shared by dashboard + `*.` apps | Broader blast radius; avoid on shared parent like `.example.com`; **do not** use one Domain across planes |
+| **D. Middle app proxy** | Keep traffic on middle `/proxy/...` | One origin | Not “open real Coder URL”; extra hop (we already have path proxy for some cases) |
 
-### Why localhost works
+**Recommendation for first production cut:** **A** (query token 302 to subdomain URL), same as today’s cross-host path fallback. Add **B** or carefully scoped **C** later if product forbids tokens in the address bar.
 
-Browsers treat cookies as **host-only and ignore port**. Middle (`127.0.0.1:8081`) and
-planes (`127.0.0.1:3000` / `:3001`) share hostname `127.0.0.1`, so a cookie set by middle
-is sent to both planes.
+Path apps can keep today’s host-only cookie 302 when middle and plane share a cookie host.
 
-That is convenient for the lab and awkward for multi-plane: opening plane B **overwrites**
-the shared `coder_session_token` for the host. Production should use **distinct hostnames**
-per plane (`coder-a.example.com`, `coder-b.example.com`) and set the host-only cookie from
-**that plane’s edge** (or a bootstrap path on that host)—not `Domain=.example.com`
-(which would leak one session to every subdomain).
+---
 
-### TTLs / logout
+## 6. Config to add (per plane)
 
-| Cookie | Max-Age | Cleared by |
+```yaml
+planes:
+  - id: a
+    url: "https://coder-a.example.com"              # ACCESS_URL / dashboard
+    wildcard_url: "https://*.coder-a.example.com"   # WILDCARD_ACCESS_URL
+    owner_token: "…"
+```
+
+Coder server must be started with matching:
+
+- `CODER_ACCESS_URL=https://coder-a.example.com`
+- `CODER_WILDCARD_ACCESS_URL=*.coder-a.example.com`
+
+Lab already does this via sslip in [`../local-subdomain-lab/start-coder.sh`](../local-subdomain-lab/start-coder.sh).
+
+---
+
+## 7. Code changes (checklist)
+
+1. **Config:** `wildcard_url` (or derive host suffix) on each plane.
+2. **`handleOpenCoderApp`:**
+   - Resolve whether `slug` is subdomain.
+   - If subdomain → build subdomain `target`; else keep path `target`.
+   - Auth: subdomain → query token (or chosen strategy); path → cookie when same host else query.
+3. **Tests / probes:** extend subdomain lab script — call middle open endpoint, assert `Location` host matches `slug--ws--user.…` and `curl -L` with cookie/query returns 200.
+4. **Docs:** portal/Backstage “Open” uses middle only (never hand-build URLs).
+5. **Optional:** strip query token after Coder sets `coder_signed_app_token` (Coder often does this client-side).
+
+---
+
+## 8. Security / multi-plane notes
+
+- **One wildcard (and cookie Domain) per plane** — never `Domain=.example.com` shared by plane A and B.
+- Prefer **distinct plane hostnames** (`coder-a…`, `coder-b…`) so sessions don’t collide (localhost port-sharing was a lab accident).
+- Query tokens should be the **short-lived user session** middle already mints, not owner tokens.
+- Subdomain isolation is why Coder recommends `subdomain = true` (app origin ≠ API/dashboard origin); path + host-only cookie is fine for labs and some internal apps.
+
+---
+
+## 9. Minimal acceptance test
+
+1. Plane with wildcard + template apps: one path, one subdomain.
+2. `GET /v1/workspaces/{id}/coder-app/gotty?plane=a` → `Location` path URL; opens with cookie or query.
+3. `GET /v1/workspaces/{id}/coder-app/ttyd?plane=a` → `Location` **subdomain** host; `curl`/`browser` with token → 200.
+4. No token → Coder auth redirect (expected).
+5. Plane B wildcard must not accept plane A’s cookie Domain.
+
+---
+
+## 10. Summary
+
+| | Path | Subdomain |
 | --- | --- | --- |
-| `coder_session_token` | **2 hours** | `POST /v1/logout` |
-| `middle_session` | **12 hours** | `POST /v1/logout` |
+| Lab proof | Cookie 302 | Query token on subdomain URL |
+| Middle open | **Done** | **Missing:** detect mode, build host, wildcard config, auth strategy |
+| First impl | Keep as-is | Query-token 302 to `{slug}--{ws}--{user}.{wildcard}` |
 
-Portal Logout → `POST` middle `/v1/logout` (clears both) → Keycloak logout.  
-Already-open app tabs may keep working until refresh; a new open after logout should fail auth.
-
-### Auth priority (bob must not see alice)
-
-Portal sends `credentials: "include"` **and** `Authorization: Bearer <IdP JWT>`.  
-Middle prefers **Bearer over `middle_session`**, so switching Keycloak users is not stuck
-on a stale cookie.
-
-### Code map (cookie)
-
-| Piece | File |
-| --- | --- |
-| Open app: set host-only cookie + clean 302 | [`../go-middle/planes.go`](../go-middle/planes.go) — `handleOpenCoderApp` |
-| Prefer Bearer over cookie | [`../go-middle/auth.go`](../go-middle/auth.go) — `resolveAppAuth` |
-| Clear cookies on logout | [`../go-middle/auth.go`](../go-middle/auth.go) — `handleLogout`, `clearCoderSessionCookie` |
-| Route `POST /v1/logout` | [`../go-middle/main.go`](../go-middle/main.go) |
-| Portal logout calls middle | [`../portal/public/app.js`](../portal/public/app.js) — `#logout` handler |
-
-### How the cookie is set (Go)
-
-From [`../go-middle/planes.go`](../go-middle/planes.go) `handleOpenCoderApp` — after minting `tok`
-for the plane user:
-
-```go
-// Compare hostnames only (ports are ignored by the browser for cookies).
-planeHost := cookieHostForURL(p.URL)                 // e.g. "127.0.0.1" from plane URL
-middleHost := cookieHostForURL(s.Config.PublicURL)   // e.g. "127.0.0.1"
-if r.Host != "" {
-    middleHost = strings.Split(r.Host, ":")[0]       // Host header from the browser
-}
-
-target := fmt.Sprintf("%s/@%s/%s/apps/%s/", p.URL, me.Username, name, slug)
-if slug == "code-server" {
-    target += "?folder=/home/coder" // non-secret query only
-}
-
-if planeHost != "" && planeHost == middleHost {
-    // Same host as middle → Set-Cookie is visible to Coder on :3000/:3001.
-    // Omit Domain so the cookie is host-only (not Domain=.example.com).
-    http.SetCookie(w, &http.Cookie{
-        Name:     "coder_session_token",
-        Value:    tok, // minted Coder API key for this user/plane
-        Path:     "/",
-        HttpOnly: true,
-        SameSite: http.SameSiteLaxMode,
-        MaxAge:   int((2 * time.Hour).Seconds()),
-        // Domain: unset on purpose
-    })
-    // Clean app URL — token is in the cookie, not the Location query.
-    http.Redirect(w, r, target, http.StatusFound)
-    return
-}
-
-// Different hostnames: middle cannot set a cookie for the plane host.
-// Fall back to ?coder_session_token= until a bootstrap runs on that host.
-q := url.Values{"coder_session_token": {tok}}
-http.Redirect(w, r, fmt.Sprintf("%s/@%s/%s/apps/%s/?%s",
-    p.URL, me.Username, name, slug, q.Encode()), http.StatusFound)
-```
-
-HTTP response the browser sees on the happy path:
-
-```http
-HTTP/1.1 302 Found
-Set-Cookie: coder_session_token=<tok>; Path=/; Max-Age=7200; HttpOnly; SameSite=Lax
-Location: http://127.0.0.1:3000/@alice/alice-a/apps/ttyd/
-```
-
-Clearing on logout ([`../go-middle/auth.go`](../go-middle/auth.go)):
-
-```go
-http.SetCookie(w, &http.Cookie{
-    Name:     "coder_session_token",
-    Value:    "",
-    Path:     "/",
-    HttpOnly: true,
-    SameSite: http.SameSiteLaxMode,
-    MaxAge:   -1, // delete
-})
-```
-
-## Minted Coder API tokens (1 day, reserved name)
-
-### Goal
-
-- One stable API key per user **per plane** (not a new key on every request).
-- **1-day** lifetime.
-- On middle **restart** / cache miss: **delete** the reserved key and **recreate** it
-  (no pile-up of `middle-a-<hex>` tokens).
-
-### How it works
-
-1. In-memory cache key: `planeID|email` (e.g. `a|alice@example.com`).
-2. Cache hit + `PingToken` OK → reuse the secret string; **no** Coder API create.
-3. Cache miss (fresh middle process, expired/revoked key) →  
-   `EnsureReservedUserToken(userID, "middle-"+planeID)`:
-   - list user’s API keys
-   - delete any named exactly `middle-a` / `middle-b` (and legacy `middle-a-*`)
-   - create new key with that **exact** name and `lifetime = 24h` (nanoseconds in JSON)
-
-Reserved names: **`middle-a`**, **`middle-b`** (single-plane legacy: `middle`).
-
-Lab seed may also create a one-off **`seed` / `seed2`** token while creating workspaces as
-the user; that is unrelated to middle and can be deleted in the Coder UI.
-
-### Code map (mint)
-
-| Piece | File |
-| --- | --- |
-| Cache + call ensure on miss | [`../go-middle/planes.go`](../go-middle/planes.go) — `ensureCoderTokenOnPlane` |
-| Delete-by-name + create 1-day key | [`../go-middle/coder.go`](../go-middle/coder.go) — `EnsureReservedUserToken`, `ListUserAPIKeys`, `DeleteUserAPIKey` |
-| Single-plane path | [`../go-middle/auth.go`](../go-middle/auth.go) — `ensureCoderToken` → `EnsureReservedUserToken(..., "middle")` |
-
-### How the reserved token is minted (Go)
-
-Cache + replace on miss — [`../go-middle/planes.go`](../go-middle/planes.go) `ensureCoderTokenOnPlane`:
-
-```go
-func (s *Service) ensureCoderTokenOnPlane(ctx context.Context, email, planeID string) (string, error) {
-    p, err := s.plane(planeID)
-    // ...
-    key := p.ID + "|" + email // e.g. "a|alice@example.com"
-    if t, ok := s.Store.GetCoderTokenByEmail(key); ok {
-        if err := p.Client.PingToken(ctx, t); err == nil {
-            return t, nil // cache hit — do not create another Coder API key
-        }
-    }
-    user, err := p.Client.FindOrCreateUser(ctx, email)
-    // ...
-    // Stable name per plane; replace on cache miss so keys don't accumulate.
-    token, err := p.Client.EnsureReservedUserToken(ctx, user.ID, "middle-"+p.ID) // "middle-a"
-    // ...
-    s.Store.SetCoderTokenByEmail(key, token)
-    return token, nil
-}
-```
-
-Delete matching keys, then create a 1-day key — [`../go-middle/coder.go`](../go-middle/coder.go)
-`EnsureReservedUserToken`:
-
-```go
-func (c *CoderClient) EnsureReservedUserToken(ctx context.Context, userID, reservedName string) (string, error) {
-    keys, err := c.ListUserAPIKeys(ctx, userID) // GET /api/v2/users/{id}/keys/tokens
-    // ...
-    for _, k := range keys {
-        // exact "middle-a" or legacy "middle-a-<hex>"
-        if !tokenNameMatchesReserved(k.TokenName, reservedName) {
-            continue
-        }
-        // DELETE /api/v2/users/{id}/keys/{keyID}
-        if err := c.DeleteUserAPIKey(ctx, userID, k.ID); err != nil {
-            return "", fmt.Errorf("delete api key %s (%s): %w", k.ID, k.TokenName, err)
-        }
-    }
-    // Coder expects lifetime as time.Duration nanoseconds in JSON.
-    body := map[string]any{
-        "token_name": reservedName,            // e.g. "middle-a" (exact, no random suffix)
-        "lifetime":   int64(24 * time.Hour),   // 1 day
-    }
-    var resp coderTokenResp
-    // POST /api/v2/users/{id}/keys/tokens  (as owner)
-    if err := c.do(ctx, http.MethodPost, "/api/v2/users/"+userID+"/keys/tokens",
-        c.OwnerToken, body, &resp); err != nil {
-        return "", err
-    }
-    return resp.Key, nil // secret string; only returned once at create time
-}
-
-func tokenNameMatchesReserved(name, reserved string) bool {
-    if name == reserved {
-        return true
-    }
-    return strings.HasPrefix(name, reserved+"-") // legacy middle-a-<hex>
-}
-```
-
-After a middle restart + alice list/open, Coder should show **one** key named `middle-a`
-with `lifetime_seconds: 86400`; the key **id** changes on each remint.
-
-### Sanity check after restart
-
-```bash
-# list alice keys on plane A (owner token from seed)
-curl -sS -H "Coder-Session-Token: $(cat /tmp/multiplane-lab/owner-a.token)" \
-  "http://127.0.0.1:3000/api/v2/users/<alice-uuid>/keys/tokens"
-# expect a single middle-a with lifetime_seconds=86400; id changes after remint
-```
-
-## Middle API (multi-plane)
-
-| Endpoint | Notes |
-| --- | --- |
-| `GET /v1/planes` | Configured plane ids + URLs |
-| `GET /v1/workspaces` | Fan-out; each item has `plane_id`, `plane_url` |
-| `POST /v1/workspaces` | Body may include `plane_id` |
-| `GET /v1/workspaces/{id}/access?plane=` | Access choices for that plane |
-| `GET /v1/workspaces/{id}/coder-app/{slug}?plane=` | Host-only cookie + 302 to clean app URL |
-| `POST /v1/logout` | Clears `middle_session` + `coder_session_token` |
-
-## Template
-
-[`../templates/multiplane-apps/`](../templates/multiplane-apps/)
+Once those pieces land, portal/Backstage can open either app type the same way: one middle URL, correct `Location`.
