@@ -135,44 +135,44 @@ Lab already does this via sslip in [`../local-subdomain-lab/start-coder.sh`](../
 
 ---
 
-## 7. Code changes (checklist)
+## 7. Code to change (sketches — not applied yet)
 
-1. **Config:** `wildcard_url` (or derive host suffix) on each plane.
-2. **`handleOpenCoderApp`:**
-   - Resolve whether `slug` is subdomain.
-   - If subdomain → build subdomain `target`; else keep path `target`.
-   - Auth: subdomain → query token (or chosen strategy); path → cookie when same host else query.
-3. **Tests / probes:** extend subdomain lab script — call middle open endpoint, assert `Location` host matches `slug--ws--user.…` and `curl -L` with cookie/query returns 200.
-4. **Docs:** portal/Backstage “Open” uses middle only (never hand-build URLs).
-5. **Optional:** strip query token after Coder sets `coder_signed_app_token` (Coder often does this client-side).
+Files: [`../go-middle/config.go`](../go-middle/config.go), [`../go-middle/planes.go`](../go-middle/planes.go), optionally [`../go-middle/access.go`](../go-middle/access.go).
 
----
+### 7.1 Config — add `wildcard_url` per plane
 
-## 8. Security / multi-plane notes
+**Today** (`config.go`):
 
-- **One wildcard (and cookie Domain) per plane** — never `Domain=.example.com` shared by plane A and B.
-- Prefer **distinct plane hostnames** (`coder-a…`, `coder-b…`) so sessions don’t collide (localhost port-sharing was a lab accident).
-- Query tokens should be the **short-lived user session** middle already mints, not owner tokens.
-- Subdomain isolation is why Coder recommends `subdomain = true` (app origin ≠ API/dashboard origin); path + host-only cookie is fine for labs and some internal apps.
+```go
+type PlaneConfig struct {
+	ID              string `yaml:"id"`
+	URL             string `yaml:"url"`
+	OwnerToken      string `yaml:"owner_token"`
+	DefaultTemplate string `yaml:"default_template"`
+}
+```
 
----
+**Change to:**
 
-## 9. Minimal acceptance test
+```go
+type PlaneConfig struct {
+	ID              string `yaml:"id"`
+	URL             string `yaml:"url"`
+	WildcardURL     string `yaml:"wildcard_url"` // e.g. "https://*.coder-a.example.com"
+	OwnerToken      string `yaml:"owner_token"`
+	DefaultTemplate string `yaml:"default_template"`
+}
+```
 
-1. Plane with wildcard + template apps: one path, one subdomain.
-2. `GET /v1/workspaces/{id}/coder-app/gotty?plane=a` → `Location` path URL; opens with cookie or query.
-3. `GET /v1/workspaces/{id}/coder-app/ttyd?plane=a` → `Location` **subdomain** host; `curl`/`browser` with token → 200.
-4. No token → Coder auth redirect (expected).
-5. Plane B wildcard must not accept plane A’s cookie Domain.
+Mirror on runtime `Plane` in `planes.go` when planes are loaded from config (same field).
 
----
+**YAML:**
 
-## 10. Summary
-
-| | Path | Subdomain |
-| --- | --- | --- |
-| Lab proof | Cookie 302 | Query token on subdomain URL |
-| Middle open | **Done** | **Missing:** detect mode, build host, wildcard config, auth strategy |
-| First impl | Keep as-is | Query-token 302 to `{slug}--{ws}--{user}.{wildcard}` |
-
-Once those pieces land, portal/Backstage can open either app type the same way: one middle URL, correct `Location`.
+```yaml
+planes:
+  - id: a
+    url: "https://coder-a.example.com"
+    wildcard_url: "https://*.coder-a.example.com"
+    owner_token: "…"
+    default_template: "multiplane-apps"
+```
