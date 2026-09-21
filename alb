@@ -1,157 +1,150 @@
-# Middle scale-down: thin control plane (no Coder reverse-proxy)
+# Opening Coder apps: portal JSON + token strip
 
-**Date:** 2026-09-21  
-**Status:** Decision after lab validation  
-**Related:** [SPIKE-RESULTS.md](../agent-task-lab/SPIKE-RESULTS.md), [open-coder-apps-path-vs-subdomain.md](./open-coder-apps-path-vs-subdomain.md), [multi-plane-lab README](../multi-plane-lab/README.md)
+**Status:** portal path used in the lab.  
+**Code:** [`../go-middle/planes.go`](../go-middle/planes.go) (`handleOpenCoderApp`), [`../portal/public/app.js`](../portal/public/app.js) (`openCoderApp` / `openCoderURLMaybeStripToken`).  
+**Related:** [open-coder-apps-path-vs-subdomain.md](./open-coder-apps-path-vs-subdomain.md) (path vs subdomain, cookie vs query token).
 
 ---
 
-## 1. Decision
+## 1. What the portal does (preferred)
 
-Middle does **not** need to pretend to be Coder (no reverse-proxy of the Coder API, apps, or DERP).
-
-Browsers and the Coder CLI talk to the **real control plane URL**. Middle stays a **thin orchestration + auth + credential** service.
+Middle does **not** 302 the portal. The portal asks for JSON, opens the real Coder URL itself, then strips `coder_session_token` from the address bar once Coder has set its own cookie.
 
 ```text
-Before (facade):
-  Portal / CLI ──► Middle (/api/v2 proxy, /proxy apps, /derp) ──► Coder
+Portal (Bearer JWT)
+  → GET /v1/workspaces/{id}/coder-app/{slug}?plane=a&format=json
+  ← 200 { "url": "https://…/apps/ttyd/?coder_session_token=…" }
 
-After (thin):
-  Portal ──► Middle (auth, mint, create/stop/tasks, 302 open, CLI exports)
-                │
-                └── server-side Coder API client ──► Coder planes
-
-  Browser apps ──► real Coder URL (cookie or ?coder_session_token=)
-  CLI           ──► CODER_URL=<plane> + CODER_SESSION_TOKEN=<minted>
+Portal
+  → window.open(url)                         // first hit: auth via query token
+  → ~900ms later: w.location.replace(clean) // drop ?coder_session_token= from bar/history
 ```
 
----
-
-## 2. What we validated
-
-| Claim | Result |
-| --- | --- |
-| Open path apps via middle **302** + host-only cookie / query token on **real** Coder URL | Works (multi-plane lab) |
-| Subdomain apps accept `?coder_session_token=` on real wildcard host | Works (subdomain lab); middle open wiring still TBD — see sibling doc |
-| CLI works with **only** `CODER_URL` + `CODER_SESSION_TOKEN` (no `coder login`, no paste) | Works — empty HOME, plane URL + user/session token → `coder whoami` / `list` as alice/owner |
-| `coder login` paste + 302 cannot replace credential issuance | Confirmed — login waits for paste; portal export is the better UX |
+Why strip works: after the first request, Coder has already set an HttpOnly app/session cookie for that app host. The same URL without the query param keeps working; `location.replace` avoids leaving the token in history.
 
 ---
 
-## 3. Keep in middle
+## 2. Middle: JSON vs 302
 
-| Responsibility | Why |
-| --- | --- |
-| Validate IdP JWT / GitLab JWKS | Product + CI identity |
-| Map identity → Coder user; mint/ensure per-plane tokens | Users never use Coder login UI |
-| `POST/GET/DELETE` workspaces, tasks, archive | Orchestration API for portal / Backstage / CI |
-| Open app: mint + **302** to real Coder app URL | Clean browser entry; no app proxy |
-| CLI credentials: return plane `CODER_URL` + token for copy (bash / PowerShell / cmd) | Skip interactive `coder login` — **new `GET /v1/cli-credentials`** (§5) |
-| JWT mint JSON (e.g. `POST /cli-auth/mint`) | Keep for token-from-JWT; **drop HTML** `/cli-auth` page |
-| Task event bus (ingest + WS to portal) | Agent stream without terminal |
-| Policy / plane routing | Multi-plane branching |
+Same handler, two response modes:
 
-Middle still calls Coder’s REST API **as a client** (owner token + user tokens). That is not a reverse-proxy.
+| Client | How | Response |
+| --- | --- | --- |
+| **Portal** | `?format=json` or `Accept: application/json` | **`200`** JSON `{ url, subdomain, slug, plane_id }` |
+| **Direct / legacy** | top-level navigation, no JSON | **`302`** `Location: <same url>` |
 
----
+URL shape:
 
-## 4. Drop / stop investing in
-
-| Piece (spike today) | Reason |
-| --- | --- |
-| `GET/… /api/v2/` reverse-proxy (`handleAPIV2Proxy`) | CLI/portal use real `CODER_URL` |
-| DERP map rewrite so CLI dials middle | Not needed if CLI targets the plane |
-| `/proxy/{user}/{ws}/apps/...` app reverse-proxy | Browser opens real Coder app URL |
-| **`GET /cli-auth` HTML page** (paste UI) | Portal/Backstage owns copy-export UX |
-| Framing middle as `CODER_URL` for humans | Default = real plane URL |
-
-**Keep the JWT mint path** (e.g. today’s `POST /cli-auth/mint` with IdP access token) as a JSON API if useful for labs or non-portal clients — **without** serving HTML. Product path for humans is the new credentials endpoint below + portal UI.
+- **Subdomain apps** (e.g. Jupyter, Airflow): always include `?coder_session_token=` (host-only cookie on the access URL is not sent to `app--ws--user.…`).
+- **Path apps** (e.g. ttyd): host-only `Set-Cookie` + clean URL **only if** middle’s request `Host` equals the plane hostname (e.g. both `127.0.0.1`). Cross-host lab (`127.0.0.1` middle vs `coder.…sslip.io` plane) → query token, same as subdomain.
 
 ---
 
-## 5. New endpoint: control plane URL + token (required)
+## 3. UI snippet (portal)
 
-Spike does **not** yet expose a first-class “give me CLI exports” API. Portal today would have to cobble plane URL from `/v1/planes` and a token from open-app/session side effects. **Add an explicit endpoint.**
+```javascript
+async function openCoderApp(wsId, name, slug, planeId) {
+  const q = new URLSearchParams({ format: "json" });
+  if (planeId) q.set("plane", planeId);
+  const data = await api(
+    `/v1/workspaces/${wsId}/coder-app/${encodeURIComponent(slug || "code-server")}?${q}`
+  );
+  if (!data?.url) throw new Error("no coder app url from middle");
+  openCoderURLMaybeStripToken(data.url);
+}
 
-### Sketch
-
-```http
-GET /v1/cli-credentials?plane=a
-Authorization: Bearer <IdP JWT>
-```
-
-**Response:**
-
-```json
-{
-  "plane_id": "a",
-  "coder_url": "https://coder-a.example.com",
-  "session_token": "<coder user API/session token>",
-  "expires_at": "2026-09-22T00:00:00Z",
-  "username": "alice"
+/** First navigation with token so Coder can set its app cookie; then replace to a clean URL. */
+function openCoderURLMaybeStripToken(withTok) {
+  let clean = withTok;
+  try {
+    const u = new URL(withTok);
+    u.searchParams.delete("coder_session_token");
+    clean = u.toString();
+  } catch {
+    /* keep withTok */
+  }
+  if (!String(withTok).includes("coder_session_token=")) {
+    window.open(withTok, "_blank", "noopener,noreferrer");
+    return;
+  }
+  // No noopener — we must call location.replace on the opened window.
+  const w = window.open(withTok, "_blank");
+  if (!w) throw new Error("popup blocked — allow popups to open workspace apps");
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    if (w.closed) {
+      clearInterval(iv);
+      return;
+    }
+    if (Date.now() - t0 < 900) return; // let Set-Cookie land
+    try {
+      w.location.replace(clean);
+      clearInterval(iv);
+    } catch {
+      /* retry until timeout */
+    }
+    if (Date.now() - t0 > 12000) clearInterval(iv);
+  }, 200);
 }
 ```
 
-| Field | Meaning |
+**Frontend checklist**
+
+- Call middle with the user’s IdP **Bearer** token (`format=json`).
+- If `url` has no `coder_session_token` → normal `window.open` (`noopener` OK).
+- If it does → open **without** `noopener`, then `location.replace` to the stripped URL.
+- Allow popups; handle blockers.
+- Stripping is **portal-only**; middle does not return a separate `url_clean`.
+
+---
+
+## 4. Middle snippet
+
+```go
+// GET /v1/workspaces/{id}/coder-app/{slug}?plane=a[&format=json]
+// Mints a plane user token and builds the real Coder app URL (path or subdomain).
+// No middle app proxy.
+
+// … mint tok, load workspace, build `target` (may set ?coder_session_token=) …
+
+if wantsJSON(r) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"url":       target,
+		"subdomain": subdomain,
+		"slug":      slug,
+		"plane_id":  p.ID,
+	})
+	return
+}
+http.Redirect(w, r, target, http.StatusFound)
+
+func wantsJSON(r *http.Request) bool {
+	if r.URL.Query().Get("format") == "json" {
+		return true
+	}
+	return strings.Contains(r.Header.Get("Accept"), "application/json")
+}
+```
+
+Example JSON body:
+
+```json
+{
+  "url": "http://airflow--lime-dolphin-21--alice.coder.127.0.0.1.sslip.io:3000/?coder_session_token=…",
+  "subdomain": true,
+  "slug": "airflow",
+  "plane_id": "a"
+}
+```
+
+---
+
+## 5. Hand-off summary for FE
+
+| Do | Don’t |
 | --- | --- |
-| `coder_url` | Real control plane / ACCESS_URL for that plane (what user sets as `CODER_URL`) |
-| `session_token` | Minted/ensured **Coder** user token for that plane (what user sets as `CODER_SESSION_TOKEN`) |
+| `GET …/coder-app/{slug}?format=json` with Bearer | Navigate the browser to middle and expect the portal strip trick after a 302 |
+| Open Coder’s `url`, then strip `coder_session_token` yourself | Leave the token in the address bar |
+| Skip strip when the param is absent | Use `noopener` on the token open (you lose the window handle) |
 
-Middle: validate caller → ensure user on plane → mint/refresh reserved token → return JSON.  
-Portal: format bash / PowerShell / cmd snippets and **copy to clipboard**.
-
-Optional: `POST /v1/cli-credentials` with `{ "plane_id": "a" }` if you prefer non-GET for token issuance.
-
-### Auth note
-
-- Humans: IdP JWT (same as other `/v1/*` routes) — **not** the HTML `/cli-auth` page.
-- JWT-only mint (`POST /cli-auth/mint`) can remain for scripts that already have a Keycloak token and only need a middle/Coder token; it should return JSON only. Prefer migrating callers to `/v1/cli-credentials` so `coder_url` is always included.
-
----
-
-## 6. Portal / Backstage UX (CLI)
-
-Authenticated user → **`GET /v1/cli-credentials?plane=…`** → UI shows copy buttons:
-
-**bash / zsh**
-```bash
-export CODER_URL='https://coder-a.example.com'
-export CODER_SESSION_TOKEN='…'
-```
-
-**PowerShell**
-```powershell
-$env:CODER_URL = 'https://coder-a.example.com'
-$env:CODER_SESSION_TOKEN = '…'
-```
-
-**cmd**
-```bat
-set CODER_URL=https://coder-a.example.com
-set CODER_SESSION_TOKEN=…
-```
-
-Then: `coder whoami`, `coder list`, `coder ssh …` — no paste into `coder login`.
-
-Prefer **plane URL + real Coder user token** (validated). Do **not** return `CODER_URL=middle` or `mt_…` for this product path.
-
----
-
-## 7. Implications for code / docs
-
-Spike `go-middle` still contains proxy/DERP paths and the `/cli-auth` HTML handler for the earlier illusion. Treat them as **legacy lab surface**, not the target architecture.
-
-When implementing production middle (or pruning the spike):
-
-1. Do not port `/api/v2` proxy, app proxy, or DERP rewrite.
-2. Drop or gut **`GET /cli-auth` HTML**; keep JWT→token JSON mint if needed.
-3. **Add `GET /v1/cli-credentials`** (plane URL + Coder token) — see §5.
-4. Do port: auth, token mint, workspace/task APIs, open-app 302.
-5. Update ADRs / SPIKE-RESULTS “CLI illusion” language to match this scale-down.
-6. Subdomain open still needs wildcard URL construction (sibling doc) — still **302 to Coder**, not proxy.
-
----
-
-## 8. One-line summary
-
-**Middle authorizes and orchestrates; Coder serves. Portal copies plane URL + token. No reverse-proxy and no middle HTML login page.**
+Longer-term (optional): serve middle on the plane hostname and set an HttpOnly cookie (`Domain=` for subdomain apps, host-only for path apps) so `url` can be clean without a query token. Until then, JSON + open + strip is the lab/production-friendly approach for the portal.
