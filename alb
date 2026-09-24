@@ -1,150 +1,494 @@
-# Opening Coder apps: portal JSON + token strip
+# Multi-plane spike: 2 Coders + middle + portal + Keycloak
 
-**Status:** portal path used in the lab.  
-**Code:** [`../go-middle/planes.go`](../go-middle/planes.go) (`handleOpenCoderApp`), [`../portal/public/app.js`](../portal/public/app.js) (`openCoderApp` / `openCoderURLMaybeStripToken`).  
-**Related:** [open-coder-apps-path-vs-subdomain.md](./open-coder-apps-path-vs-subdomain.md) (path vs subdomain, cookie vs query token).
+Validates **plane branching**: mint and open apps on the correct control plane.
+Alice has workspaces on **A and B**; Bob only on **B**.
 
----
-
-## 1. What the portal does (preferred)
-
-Middle does **not** 302 the portal. The portal asks for JSON, opens the real Coder URL itself, then strips `coder_session_token` from the address bar once Coder has set its own cookie.
+## Architecture
 
 ```text
-Portal (Bearer JWT)
-  → GET /v1/workspaces/{id}/coder-app/{slug}?plane=a&format=json
-  ← 200 { "url": "https://…/apps/ttyd/?coder_session_token=…" }
-
-Portal
-  → window.open(url)                         // first hit: auth via query token
-  → ~900ms later: w.location.replace(clean) // drop ?coder_session_token= from bar/history
+Keycloak (:8080)
+    │  IdP JWT
+Portal (:5173) ──► Middle (:8081) ──► Coder A (:3000)   alice-a
+                      │            └► Coder B (:3001)   alice-b, bob-b
+                      │
+                      └─ GET /v1/workspaces/{id}/coder-app/{slug}?plane=a|b
+                           → Set-Cookie coder_session_token (host-only) + 302 to
+                             http://127.0.0.1:PORT/@user/ws/apps/slug/  (no token in URL)
 ```
 
-Why strip works: after the first request, Coder has already set an HttpOnly app/session cookie for that app host. The same URL without the query param keeps working; `location.replace` avoids leaving the token in history.
+Apps are **path-based** (`subdomain = false`): **ttyd** (terminal) + **code-server**.
 
----
+For what it takes to open **`subdomain = true`** apps the same way (wildcard URL, cookie vs query token), see [`../docs/open-coder-apps-path-vs-subdomain.md`](../docs/open-coder-apps-path-vs-subdomain.md).
+Built-in Coder web terminal is disabled (`display_apps.web_terminal = false`).
 
-## 2. Middle: JSON vs 302
+## Quick start
 
-Same handler, two response modes:
+```bash
+# 1. Keycloak
+docker compose -f local-sso/docker-compose.yml up -d
 
-| Client | How | Response |
+# 2. Two Coder planes (separate terminals)
+PLANE_ID=a PORT=3000 ./spike-middle/multi-plane-lab/start-plane.sh
+PLANE_ID=b PORT=3001 ./spike-middle/multi-plane-lab/start-plane.sh
+
+# 3. Seed users + template + workspaces
+chmod +x spike-middle/multi-plane-lab/*.sh
+./spike-middle/multi-plane-lab/seed-planes.sh
+
+# 4. Fill owner tokens into config
+cp spike-middle/multi-plane-lab/config.multiplane.yaml /tmp/mp-config.yaml
+# paste tokens from /tmp/multiplane-lab/owner-a.token and owner-b.token into planes.*.owner_token
+
+# 5. Middle
+cd spike-middle/go-middle
+CONFIG_FILE=/tmp/multiplane-lab/config.yaml go run .
+# or: go build -o /tmp/multiplane-middle . && CONFIG_FILE=… /tmp/multiplane-middle
+
+# 6. Portal
+cd spike-middle/portal && MIDDLE_URL=http://127.0.0.1:8081 npm start
+```
+
+Open http://127.0.0.1:5173 → Keycloak as **alice** / **alice** or **bob** / **bob**.
+
+| User | Expected workspaces |
+| --- | --- |
+| alice | `alice-a` (plane **a**), `alice-b` (plane **b**) |
+| bob | `bob-b` (plane **b**) only |
+
+Coder UI (optional): email `alice@example.com` / `bob@example.com`, password `TestUser1!`.
+
+## Host-only cookie (no token in the URL)
+
+### Goal
+
+Open the **real** Coder app URL without putting `?coder_session_token=` in the address bar
+(history / Referer / logs).
+
+### How it works (local lab)
+
+1. Portal calls `POST /v1/app-session` (sets `middle_session`), then navigates to  
+   `GET /v1/workspaces/{id}/coder-app/{slug}?plane=…`.
+2. Middle mints/reuses the user’s Coder API token for that plane.
+3. Middle responds with:
+   - `Set-Cookie: coder_session_token=…; Path=/; HttpOnly; SameSite=Lax`  
+     (**no `Domain=` attribute** → **host-only**)
+   - `302` → `http://127.0.0.1:PORT/@user/ws/apps/slug/` (clean URL; code-server may keep `?folder=`)
+4. Browser sends that cookie to Coder on the same hostname. Coder accepts  
+   `Cookie: coder_session_token=…` for path apps (same as query param).
+
+### Why localhost works
+
+Browsers treat cookies as **host-only and ignore port**. Middle (`127.0.0.1:8081`) and
+planes (`127.0.0.1:3000` / `:3001`) share hostname `127.0.0.1`, so a cookie set by middle
+is sent to both planes.
+
+That is convenient for the lab and awkward for multi-plane: opening plane B **overwrites**
+the shared `coder_session_token` for the host. Production should use **distinct hostnames**
+per plane (`coder-a.example.com`, `coder-b.example.com`) and set the host-only cookie from
+**that plane’s edge** (or a bootstrap path on that host)—not `Domain=.example.com`
+(which would leak one session to every subdomain).
+
+### TTLs / logout
+
+| Cookie | Max-Age | Cleared by |
 | --- | --- | --- |
-| **Portal** | `?format=json` or `Accept: application/json` | **`200`** JSON `{ url, subdomain, slug, plane_id }` |
-| **Direct / legacy** | top-level navigation, no JSON | **`302`** `Location: <same url>` |
+| `coder_session_token` | **2 hours** | `POST /v1/logout` |
+| `middle_session` | **12 hours** | `POST /v1/logout` |
 
-URL shape:
+Portal Logout → `POST` middle `/v1/logout` (clears both) → Keycloak logout.  
+Already-open app tabs may keep working until refresh; a new open after logout should fail auth.
 
-- **Subdomain apps** (e.g. Jupyter, Airflow): always include `?coder_session_token=` (host-only cookie on the access URL is not sent to `app--ws--user.…`).
-- **Path apps** (e.g. ttyd): host-only `Set-Cookie` + clean URL **only if** middle’s request `Host` equals the plane hostname (e.g. both `127.0.0.1`). Cross-host lab (`127.0.0.1` middle vs `coder.…sslip.io` plane) → query token, same as subdomain.
+### Auth priority (bob must not see alice)
 
----
+Portal sends `credentials: "include"` **and** `Authorization: Bearer <IdP JWT>`.  
+Middle prefers **Bearer over `middle_session`**, so switching Keycloak users is not stuck
+on a stale cookie.
 
-## 3. UI snippet (portal)
+### Code map (cookie)
 
-```javascript
-async function openCoderApp(wsId, name, slug, planeId) {
-  const q = new URLSearchParams({ format: "json" });
-  if (planeId) q.set("plane", planeId);
-  const data = await api(
-    `/v1/workspaces/${wsId}/coder-app/${encodeURIComponent(slug || "code-server")}?${q}`
-  );
-  if (!data?.url) throw new Error("no coder app url from middle");
-  openCoderURLMaybeStripToken(data.url);
-}
+| Piece | File |
+| --- | --- |
+| Open app: set host-only cookie + clean 302 | [`../go-middle/planes.go`](../go-middle/planes.go) — `handleOpenCoderApp` |
+| Prefer Bearer over cookie | [`../go-middle/auth.go`](../go-middle/auth.go) — `resolveAppAuth` |
+| Clear cookies on logout | [`../go-middle/auth.go`](../go-middle/auth.go) — `handleLogout`, `clearCoderSessionCookie` |
+| Route `POST /v1/logout` | [`../go-middle/main.go`](../go-middle/main.go) |
+| Portal logout calls middle | [`../portal/public/app.js`](../portal/public/app.js) — `#logout` handler |
 
-/** First navigation with token so Coder can set its app cookie; then replace to a clean URL. */
-function openCoderURLMaybeStripToken(withTok) {
-  let clean = withTok;
-  try {
-    const u = new URL(withTok);
-    u.searchParams.delete("coder_session_token");
-    clean = u.toString();
-  } catch {
-    /* keep withTok */
-  }
-  if (!String(withTok).includes("coder_session_token=")) {
-    window.open(withTok, "_blank", "noopener,noreferrer");
-    return;
-  }
-  // No noopener — we must call location.replace on the opened window.
-  const w = window.open(withTok, "_blank");
-  if (!w) throw new Error("popup blocked — allow popups to open workspace apps");
-  const t0 = Date.now();
-  const iv = setInterval(() => {
-    if (w.closed) {
-      clearInterval(iv);
-      return;
-    }
-    if (Date.now() - t0 < 900) return; // let Set-Cookie land
-    try {
-      w.location.replace(clean);
-      clearInterval(iv);
-    } catch {
-      /* retry until timeout */
-    }
-    if (Date.now() - t0 > 12000) clearInterval(iv);
-  }, 200);
-}
-```
+### How the cookie is set (Go)
 
-**Frontend checklist**
-
-- Call middle with the user’s IdP **Bearer** token (`format=json`).
-- If `url` has no `coder_session_token` → normal `window.open` (`noopener` OK).
-- If it does → open **without** `noopener`, then `location.replace` to the stripped URL.
-- Allow popups; handle blockers.
-- Stripping is **portal-only**; middle does not return a separate `url_clean`.
-
----
-
-## 4. Middle snippet
+From [`../go-middle/planes.go`](../go-middle/planes.go) `handleOpenCoderApp` — after minting `tok`
+for the plane user:
 
 ```go
-// GET /v1/workspaces/{id}/coder-app/{slug}?plane=a[&format=json]
-// Mints a plane user token and builds the real Coder app URL (path or subdomain).
-// No middle app proxy.
-
-// … mint tok, load workspace, build `target` (may set ?coder_session_token=) …
-
-if wantsJSON(r) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"url":       target,
-		"subdomain": subdomain,
-		"slug":      slug,
-		"plane_id":  p.ID,
-	})
-	return
+// Compare hostnames only (ports are ignored by the browser for cookies).
+planeHost := cookieHostForURL(p.URL)                 // e.g. "127.0.0.1" from plane URL
+middleHost := cookieHostForURL(s.Config.PublicURL)   // e.g. "127.0.0.1"
+if r.Host != "" {
+    middleHost = strings.Split(r.Host, ":")[0]       // Host header from the browser
 }
-http.Redirect(w, r, target, http.StatusFound)
 
-func wantsJSON(r *http.Request) bool {
-	if r.URL.Query().Get("format") == "json" {
-		return true
-	}
-	return strings.Contains(r.Header.Get("Accept"), "application/json")
+target := fmt.Sprintf("%s/@%s/%s/apps/%s/", p.URL, me.Username, name, slug)
+if slug == "code-server" {
+    target += "?folder=/home/coder" // non-secret query only
 }
+
+if planeHost != "" && planeHost == middleHost {
+    // Same host as middle → Set-Cookie is visible to Coder on :3000/:3001.
+    // Omit Domain so the cookie is host-only (not Domain=.example.com).
+    http.SetCookie(w, &http.Cookie{
+        Name:     "coder_session_token",
+        Value:    tok, // minted Coder API key for this user/plane
+        Path:     "/",
+        HttpOnly: true,
+        SameSite: http.SameSiteLaxMode,
+        MaxAge:   int((2 * time.Hour).Seconds()),
+        // Domain: unset on purpose
+    })
+    // Clean app URL — token is in the cookie, not the Location query.
+    http.Redirect(w, r, target, http.StatusFound)
+    return
+}
+
+// Different hostnames: middle cannot set a cookie for the plane host.
+// Fall back to ?coder_session_token= until a bootstrap runs on that host.
+q := url.Values{"coder_session_token": {tok}}
+http.Redirect(w, r, fmt.Sprintf("%s/@%s/%s/apps/%s/?%s",
+    p.URL, me.Username, name, slug, q.Encode()), http.StatusFound)
 ```
 
-Example JSON body:
+HTTP response the browser sees on the happy path:
 
-```json
-{
-  "url": "http://airflow--lime-dolphin-21--alice.coder.127.0.0.1.sslip.io:3000/?coder_session_token=…",
-  "subdomain": true,
-  "slug": "airflow",
-  "plane_id": "a"
-}
+```http
+HTTP/1.1 302 Found
+Set-Cookie: coder_session_token=<tok>; Path=/; Max-Age=7200; HttpOnly; SameSite=Lax
+Location: http://127.0.0.1:3000/@alice/alice-a/apps/ttyd/
 ```
 
----
+Clearing on logout ([`../go-middle/auth.go`](../go-middle/auth.go)):
 
-## 5. Hand-off summary for FE
+```go
+http.SetCookie(w, &http.Cookie{
+    Name:     "coder_session_token",
+    Value:    "",
+    Path:     "/",
+    HttpOnly: true,
+    SameSite: http.SameSiteLaxMode,
+    MaxAge:   -1, // delete
+})
+```
 
-| Do | Don’t |
+## Minted Coder API tokens (1 day, reserved name)
+
+### Goal
+
+- One stable API key per user **per plane** (not a new key on every request).
+- **1-day** lifetime.
+- On middle **restart** / cache miss: **delete** the reserved key and **recreate** it
+  (no pile-up of `middle-a-<hex>` tokens).
+
+### How it works
+
+1. In-memory cache key: `planeID|email` (e.g. `a|alice@example.com`).
+2. Cache hit + `PingToken` OK → reuse the secret string; **no** Coder API create.
+3. Cache miss (fresh middle process, expired/revoked key) →  
+   `EnsureReservedUserToken(userID, "middle-"+planeID)`:
+   - list user’s API keys
+   - delete any named exactly `middle-a` / `middle-b` (and legacy `middle-a-*`)
+   - create new key with that **exact** name and `lifetime = 24h` (nanoseconds in JSON)
+
+Reserved names: **`middle-a`**, **`middle-b`** (single-plane legacy: `middle`).
+
+Lab seed may also create a one-off **`seed` / `seed2`** token while creating workspaces as
+the user; that is unrelated to middle and can be deleted in the Coder UI.
+
+### Code map (mint)
+
+| Piece | File |
 | --- | --- |
-| `GET …/coder-app/{slug}?format=json` with Bearer | Navigate the browser to middle and expect the portal strip trick after a 302 |
-| Open Coder’s `url`, then strip `coder_session_token` yourself | Leave the token in the address bar |
-| Skip strip when the param is absent | Use `noopener` on the token open (you lose the window handle) |
+| Cache + call ensure on miss | [`../go-middle/planes.go`](../go-middle/planes.go) — `ensureCoderTokenOnPlane` |
+| Delete-by-name + create 1-day key | [`../go-middle/coder.go`](../go-middle/coder.go) — `EnsureReservedUserToken`, `ListUserAPIKeys`, `DeleteUserAPIKey` |
+| Single-plane path | [`../go-middle/auth.go`](../go-middle/auth.go) — `ensureCoderToken` → `EnsureReservedUserToken(..., "middle")` |
 
-Longer-term (optional): serve middle on the plane hostname and set an HttpOnly cookie (`Domain=` for subdomain apps, host-only for path apps) so `url` can be clean without a query token. Until then, JSON + open + strip is the lab/production-friendly approach for the portal.
+### How the reserved token is minted (Go)
+
+Cache + replace on miss — [`../go-middle/planes.go`](../go-middle/planes.go) `ensureCoderTokenOnPlane`:
+
+```go
+func (s *Service) ensureCoderTokenOnPlane(ctx context.Context, email, planeID string) (string, error) {
+    p, err := s.plane(planeID)
+    // ...
+    key := p.ID + "|" + email // e.g. "a|alice@example.com"
+    if t, ok := s.Store.GetCoderTokenByEmail(key); ok {
+        if err := p.Client.PingToken(ctx, t); err == nil {
+            return t, nil // cache hit — do not create another Coder API key
+        }
+    }
+    user, err := p.Client.FindOrCreateUser(ctx, email)
+    // ...
+    // Stable name per plane; replace on cache miss so keys don't accumulate.
+    token, err := p.Client.EnsureReservedUserToken(ctx, user.ID, "middle-"+p.ID) // "middle-a"
+    // ...
+    s.Store.SetCoderTokenByEmail(key, token)
+    return token, nil
+}
+```
+
+Delete matching keys, then create a 1-day key — [`../go-middle/coder.go`](../go-middle/coder.go)
+`EnsureReservedUserToken`:
+
+```go
+func (c *CoderClient) EnsureReservedUserToken(ctx context.Context, userID, reservedName string) (string, error) {
+    keys, err := c.ListUserAPIKeys(ctx, userID) // GET /api/v2/users/{id}/keys/tokens
+    // ...
+    for _, k := range keys {
+        // exact "middle-a" or legacy "middle-a-<hex>"
+        if !tokenNameMatchesReserved(k.TokenName, reservedName) {
+            continue
+        }
+        // DELETE /api/v2/users/{id}/keys/{keyID}
+        if err := c.DeleteUserAPIKey(ctx, userID, k.ID); err != nil {
+            return "", fmt.Errorf("delete api key %s (%s): %w", k.ID, k.TokenName, err)
+        }
+    }
+    // Coder expects lifetime as time.Duration nanoseconds in JSON.
+    body := map[string]any{
+        "token_name": reservedName,            // e.g. "middle-a" (exact, no random suffix)
+        "lifetime":   int64(24 * time.Hour),   // 1 day
+    }
+    var resp coderTokenResp
+    // POST /api/v2/users/{id}/keys/tokens  (as owner)
+    if err := c.do(ctx, http.MethodPost, "/api/v2/users/"+userID+"/keys/tokens",
+        c.OwnerToken, body, &resp); err != nil {
+        return "", err
+    }
+    return resp.Key, nil // secret string; only returned once at create time
+}
+
+func tokenNameMatchesReserved(name, reserved string) bool {
+    if name == reserved {
+        return true
+    }
+    return strings.HasPrefix(name, reserved+"-") // legacy middle-a-<hex>
+}
+```
+
+After a middle restart + alice list/open, Coder should show **one** key named `middle-a`
+with `lifetime_seconds: 86400`; the key **id** changes on each remint.
+
+### Sanity check after restart
+
+```bash
+# list alice keys on plane A (owner token from seed)
+curl -sS -H "Coder-Session-Token: $(cat /tmp/multiplane-lab/owner-a.token)" \
+  "http://127.0.0.1:3000/api/v2/users/<alice-uuid>/keys/tokens"
+# expect a single middle-a with lifetime_seconds=86400; id changes after remint
+```
+
+## GitLab OAuth / External Auth (without Coder dashboard)
+
+Users never use the Coder portal login UI. **Identity for middle** stays on the product
+portal (Keycloak / GitLab OIDC) → mint Coder API tokens as today.
+
+For **GitLab inside the workspace** (clone/push as the user), prefer Coder **External Auth**
+driven from the portal after the host-only cookie is set — not a click inside Coder’s UI.
+
+### Recommended flow (option A)
+
+1. Portal/middle mints (or reuses) the user’s plane token and sets `coder_session_token`
+   (same as opening ttyd/code-server).
+2. **Check** whether GitLab consent is already done (API below).
+3. If not linked → open the plane’s external-auth URL in a browser tab (cookie already on
+   the host) so the user completes GitLab OAuth once.
+4. Template uses `data.coder_external_auth` / `coder external-auth access-token` as usual.
+
+Portal does **not** rewrite URLs for consent; it only decides whether to navigate to
+Coder’s external-auth page. Middle already owns cookie + mint.
+
+### Check if the user still needs consent
+
+Call **as the user** (minted `middle-a` / `middle-b` token), not as owner.
+Provider id is whatever you configured (e.g. `CODER_EXTERNAL_AUTH_0_ID=primary-gitlab`).
+
+```bash
+# Single provider
+curl -sS -H "Coder-Session-Token: $USER_TOKEN" \
+  "http://127.0.0.1:3000/api/v2/external-auth/primary-gitlab"
+
+# All links for this user
+curl -sS -H "Coder-Session-Token: $USER_TOKEN" \
+  "http://127.0.0.1:3000/api/v2/external-auth"
+```
+
+Useful fields on the response:
+
+| Field | Meaning |
+| --- | --- |
+| `authenticated` | `true` → linked / consent done; skip redirect |
+| `validate_error` | Token present but invalid / needs re-auth |
+| `expires` / `has_refresh_token` | Lifetime / refresh capability |
+
+Portal/middle logic:
+
+```text
+GET /api/v2/external-auth/{id}  (user token)
+  authenticated == true  → continue (create workspace / open apps)
+  authenticated == false → window.open("http://<plane>/external-auth/{id}")
+                           then re-check after return
+```
+
+Consent URL (browser, with host-only `coder_session_token` already set):
+
+```text
+http://127.0.0.1:3000/external-auth/primary-gitlab
+```
+
+(Use the real plane host/port; path is `/external-auth/<CODER_EXTERNAL_AUTH_*_ID>`.)
+
+### Where to put the code (sketch — not wired in this lab yet)
+
+| Layer | File | Responsibility |
+| --- | --- | --- |
+| Middle client | [`../go-middle/coder.go`](../go-middle/coder.go) | `GET /api/v2/external-auth/{id}` as user |
+| Middle handler | [`../go-middle/planes.go`](../go-middle/planes.go) (or new `external_auth.go`) | Mint + check + return JSON |
+| Middle route | [`../go-middle/main.go`](../go-middle/main.go) | `GET /v1/external-auth/{id}` |
+| Portal | [`../portal/public/app.js`](../portal/public/app.js) | Call middle; open `auth_url` if needed |
+
+**1. Coder client** (`coder.go`):
+
+```go
+type externalAuthStatus struct {
+    Authenticated bool   `json:"authenticated"`
+    ProviderID    string `json:"provider_id"`
+    ValidateError string `json:"validate_error,omitempty"`
+}
+
+func (c *CoderClient) ExternalAuth(ctx context.Context, userToken, providerID string) (*externalAuthStatus, error) {
+    var out externalAuthStatus
+    path := "/api/v2/external-auth/" + url.PathEscape(providerID)
+    if err := c.do(ctx, http.MethodGet, path, userToken, nil, &out); err != nil {
+        return nil, err
+    }
+    return &out, nil
+}
+```
+
+**2. Middle handler** (`planes.go` / `external_auth.go`) — check happens **here**:
+
+```go
+// GET /v1/external-auth/{id}?plane=a
+func (s *Service) handleExternalAuthStatus(w http.ResponseWriter, r *http.Request) {
+    email, err := s.emailFromRequest(r)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusUnauthorized)
+        return
+    }
+    providerID := r.PathValue("id") // e.g. "primary-gitlab"
+    p, err := s.plane(r.URL.Query().Get("plane"))
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadGateway)
+        return
+    }
+    st, err := p.Client.ExternalAuth(r.Context(), tok, providerID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadGateway)
+        return
+    }
+    // Ensure cookie so a follow-up window.open(auth_url) is already authenticated.
+    http.SetCookie(w, &http.Cookie{
+        Name:     "coder_session_token",
+        Value:    tok,
+        Path:     "/",
+        HttpOnly: true,
+        SameSite: http.SameSiteLaxMode,
+        MaxAge:   int((2 * time.Hour).Seconds()),
+    })
+    writeJSON(w, http.StatusOK, map[string]any{
+        "provider_id":   providerID,
+        "authenticated": st.Authenticated,
+        "plane_id":      p.ID,
+        // Portal opens this only when authenticated == false
+        "auth_url": p.URL + "/external-auth/" + url.PathEscape(providerID),
+    })
+}
+```
+
+**3. Register route** (`main.go`):
+
+```go
+mux.Handle("GET /v1/external-auth/{id}",
+    svc.requireAuth(http.HandlerFunc(svc.handleExternalAuthStatus)))
+```
+
+**4. Portal** (`app.js`) — only consumes middle JSON:
+
+```js
+async function ensureGitLabLinked(planeId, providerId = "primary-gitlab") {
+  await ensureAppSession(); // middle_session for top-level nav if needed
+  const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
+  const st = await api(`/v1/external-auth/${encodeURIComponent(providerId)}${q}`);
+  if (st.authenticated) return true;
+  // Middle already set coder_session_token on this host; open Coder consent page.
+  window.open(st.auth_url, "_blank", "noopener,noreferrer");
+  return false; // caller may poll / show "Connect GitLab then Refresh"
+}
+
+// Example: before create, or a "Connect GitLab" button
+// if (!(await ensureGitLabLinked(ws.plane_id))) { alert("Complete GitLab login, then retry"); }
+```
+
+Optional poll after the popup:
+
+```js
+async function waitUntilGitLabLinked(planeId, providerId = "primary-gitlab", attempts = 30) {
+  for (let i = 0; i < attempts; i++) {
+    const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
+    const st = await api(`/v1/external-auth/${encodeURIComponent(providerId)}${q}`);
+    if (st.authenticated) return true;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
+}
+```
+
+### Inside the workspace
+
+```bash
+coder external-auth access-token primary-gitlab
+# exit 0 → token on stdout (OK)
+# exit 1 → not linked; stdout is the auth URL to open
+```
+
+### Alternatives (not implemented in this lab)
+
+| Approach | When |
+| --- | --- |
+| **B. Portal owns GitLab OAuth** | Portal runs auth-code flow and injects the token into the workspace (env/secret). No Coder External Auth UI at all. |
+| **C. Non-user tokens** | Deploy / project / group tokens — no interactive consent. |
+
+There is no way to finish OAuth **from Terraform alone** with no browser hop; the consent
+step needs a user agent. The hop should be **portal → Coder external-auth URL** (after
+cookie), not “click Login with GitLab on the Coder dashboard.”
+
+## Middle API (multi-plane)
+
+| Endpoint | Notes |
+| --- | --- |
+| `GET /v1/planes` | Configured plane ids + URLs |
+| `GET /v1/workspaces` | Fan-out; each item has `plane_id`, `plane_url` |
+| `POST /v1/workspaces` | Body may include `plane_id` |
+| `GET /v1/workspaces/{id}/access?plane=` | Access choices for that plane |
+| `GET /v1/workspaces/{id}/coder-app/{slug}?plane=` | Host-only cookie + 302 to clean app URL |
+| `POST /v1/logout` | Clears `middle_session` + `coder_session_token` |
+
+## Template
+
+[`../templates/multiplane-apps/`](../templates/multiplane-apps/)
+
+## Related: agent tasks in the portal
+
+Mock agent activity stream (no terminal) → Cursor SDK swap: [`../agent-task-lab/README.md`](../agent-task-lab/README.md).
