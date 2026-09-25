@@ -1,494 +1,373 @@
-# Multi-plane spike: 2 Coders + middle + portal + Keycloak
+# Plane-host cookie bounce (ALB → Lambda → middle) — validated design & way forward
 
-Validates **plane branching**: mint and open apps on the correct control plane.
-Alice has workspaces on **A and B**; Bob only on **B**.
+**Status:** validated end to end.
 
-## Architecture
+- Bounce mechanics on real AWS (ALB + Lambda + IAM/STS on `ishentras.click`) and locally (ALB emulator).
+- **GitLab OAuth consent (Coder external auth) with a real gitlab.com OAuth app**, locally: portal →
+  plane host → GitLab → Coder → back to the portal, with the consent session **revoked and the cookie
+  cleared** at the end (the user can't reuse it to browse the Coder dashboard).
 
-```text
-Keycloak (:8080)
-    │  IdP JWT
-Portal (:5173) ──► Middle (:8081) ──► Coder A (:3000)   alice-a
-                      │            └► Coder B (:3001)   alice-b, bob-b
-                      │
-                      └─ GET /v1/workspaces/{id}/coder-app/{slug}?plane=a|b
-                           → Set-Cookie coder_session_token (host-only) + 302 to
-                             http://127.0.0.1:PORT/@user/ws/apps/slug/  (no token in URL)
-```
+Labs torn down; code lives in this repo.
 
-Apps are **path-based** (`subdomain = false`): **ttyd** (terminal) + **code-server**.
+## 1. Problem
 
-For what it takes to open **`subdomain = true`** apps the same way (wildcard URL, cookie vs query token), see [`../docs/open-coder-apps-path-vs-subdomain.md`](../docs/open-coder-apps-path-vs-subdomain.md).
-Built-in Coder web terminal is disabled (`display_apps.web_terminal = false`).
+Some Coder pages authenticate **only with the `coder_session_token` cookie on the plane host**:
 
-## Quick start
-
-```bash
-# 1. Keycloak
-docker compose -f local-sso/docker-compose.yml up -d
-
-# 2. Two Coder planes (separate terminals)
-PLANE_ID=a PORT=3000 ./spike-middle/multi-plane-lab/start-plane.sh
-PLANE_ID=b PORT=3001 ./spike-middle/multi-plane-lab/start-plane.sh
-
-# 3. Seed users + template + workspaces
-chmod +x spike-middle/multi-plane-lab/*.sh
-./spike-middle/multi-plane-lab/seed-planes.sh
-
-# 4. Fill owner tokens into config
-cp spike-middle/multi-plane-lab/config.multiplane.yaml /tmp/mp-config.yaml
-# paste tokens from /tmp/multiplane-lab/owner-a.token and owner-b.token into planes.*.owner_token
-
-# 5. Middle
-cd spike-middle/go-middle
-CONFIG_FILE=/tmp/multiplane-lab/config.yaml go run .
-# or: go build -o /tmp/multiplane-middle . && CONFIG_FILE=… /tmp/multiplane-middle
-
-# 6. Portal
-cd spike-middle/portal && MIDDLE_URL=http://127.0.0.1:8081 npm start
-```
-
-Open http://127.0.0.1:5173 → Keycloak as **alice** / **alice** or **bob** / **bob**.
-
-| User | Expected workspaces |
+| Page | Why a query token doesn't work |
 | --- | --- |
-| alice | `alice-a` (plane **a**), `alice-b` (plane **b**) |
-| bob | `bob-b` (plane **b**) only |
+| External-auth consent `/external-auth/{id}` and its callback `/external-auth/{id}/callback` (GitLab OAuth) | The callback is where GitLab redirects the browser back; only cookies can travel on that redirect. Without the cookie Coder answers `303 /login`. |
+| Built-in web terminal `/@user/ws.agent/terminal` | Dashboard SPA; its fetch/WebSocket calls use the cookie only (not needed if you use ttyd as an app) |
 
-Coder UI (optional): email `alice@example.com` / `bob@example.com`, password `TestUser1!`.
+A browser only accepts a host-only cookie from a response **served by that host**. Middle lives on
+another host (`middle.example.com`), so it can't set it, and `Domain=` cookies are ruled out (they
+would leak the user's Coder token to every workspace app subdomain).
 
-## Host-only cookie (no token in the URL)
+## 2. Solution in one picture
 
-### Goal
+Put a tiny, stateless **bounce** on the plane host via one ALB rule. Middle stays where it is and
+keeps all logic.
 
-Open the **real** Coder app URL without putting `?coder_session_token=` in the address bar
-(history / Referer / logs).
+```mermaid
+sequenceDiagram
+  participant P as Portal (browser)
+  participant M as Middle
+  participant A as ALB coder-a.example.com
+  participant L as Bounce Lambda (role per plane)
+  participant S as AWS STS
+  participant C as Coder plane A
+  participant G as GitLab
+  P->>M: POST /v1/bounce/start {plane, purpose: external-auth, provider} (user JWT)
+  M-->>P: {bounce_url, code} — one-time, 60s, bound to user+plane+redirect
+  P->>A: form POST code → https://coder-a.example.com/_portal/bounce (same tab)
+  A->>L: rule host=coder-a + path=/_portal/* (priority before Coder)
+  L->>M: POST /internal/bounce/redeem {code, host, iam: signed GetCallerIdentity}
+  M->>S: replay signed request (fixed endpoint)
+  S-->>M: arn …:assumed-role/coder-bounce-plane-a/…
+  M->>M: role→plane allowlist, consume code, check host, mint 5-min "bounce-a" token
+  M-->>L: {session_token, redirect_path, max_age: 300}
+  L-->>P: 302 /external-auth/primary-gitlab/callback?redirect=/_portal/done + Set-Cookie (host-only)
+  P->>C: callback (cookie) → Coder stores oauth_redirect=/_portal/done
+  C-->>P: 307 gitlab.com/oauth/authorize (PKCE + state)
+  P->>G: consent
+  G-->>P: 302 back to Coder callback ?code=…
+  P->>C: callback (cookie) → Coder exchanges code, stores the user's GitLab link
+  C-->>P: 307 /_portal/done
+  P->>A: GET /_portal/done (cookie)
+  A->>L: same rule
+  L->>M: POST /internal/bounce/done {host, session_token, iam}
+  M->>C: delete that API key (only if it is the "bounce-a" key)
+  M-->>L: {redirect_url: portal}
+  L-->>P: 302 portal/?linked=1 + Set-Cookie coder_session_token=; Max-Age=0
+  P->>M: GET /v1/external-auth/primary-gitlab → authenticated: true
+```
 
-### How it works (local lab)
+## 3. What was proven
 
-1. Portal calls `POST /v1/app-session` (sets `middle_session`), then navigates to  
-   `GET /v1/workspaces/{id}/coder-app/{slug}?plane=…`.
-2. Middle mints/reuses the user’s Coder API token for that plane.
-3. Middle responds with:
-   - `Set-Cookie: coder_session_token=…; Path=/; HttpOnly; SameSite=Lax`  
-     (**no `Domain=` attribute** → **host-only**)
-   - `302` → `http://127.0.0.1:PORT/@user/ws/apps/slug/` (clean URL; code-server may keep `?folder=`)
-4. Browser sends that cookie to Coder on the same hostname. Coder accepts  
-   `Cookie: coder_session_token=…` for path apps (same as query param).
+### 3.1 Bounce mechanics
 
-### Why localhost works
-
-Browsers treat cookies as **host-only and ignore port**. Middle (`127.0.0.1:8081`) and
-planes (`127.0.0.1:3000` / `:3001`) share hostname `127.0.0.1`, so a cookie set by middle
-is sent to both planes.
-
-That is convenient for the lab and awkward for multi-plane: opening plane B **overwrites**
-the shared `coder_session_token` for the host. Production should use **distinct hostnames**
-per plane (`coder-a.example.com`, `coder-b.example.com`) and set the host-only cookie from
-**that plane’s edge** (or a bootstrap path on that host)—not `Domain=.example.com`
-(which would leak one session to every subdomain).
-
-### TTLs / logout
-
-| Cookie | Max-Age | Cleared by |
+| Check | Local lab | AWS lab |
 | --- | --- | --- |
-| `coder_session_token` | **2 hours** | `POST /v1/logout` |
-| `middle_session` | **12 hours** | `POST /v1/logout` |
+| `/_portal/*` on plane host → bounce, everything else → Coder | ALB emulator | Real ALB listener rule (priority 10) → Lambda target group |
+| Lambda identity proven to middle | Assumed role via lab IAM user | **Real Lambda execution role** (`assumed-role/coder-bounce-plane-a/coder-bounce-plane-a`) verified with STS |
+| 302 + host-only cookie, no `Domain=` | `HttpOnly; SameSite=Lax` (http) | `HttpOnly; Secure; SameSite=Lax` |
+| Cookie alone authenticates on the plane host | 200, `/users/me` = alice (401 without cookie) | same |
+| No token/code in URLs | form POST; clean address bar | same |
+| Replay same code | 403 | 403 |
+| Wrong audience (server id) | 403 `audience mismatch` | 403 |
+| Caller not the trusted role (plain IAM user) | 403 `caller is not an assumed role` | — |
+| Direct call to middle redeem without Lambda | — | 403 |
 
-Portal Logout → `POST` middle `/v1/logout` (clears both) → Keycloak logout.  
-Already-open app tabs may keep working until refresh; a new open after logout should fail auth.
+Observed on AWS: the ALB turns the Lambda's relative `Location` into an absolute URL on the same
+host (harmless).
 
-### Auth priority (bob must not see alice)
+### 3.2 GitLab external auth (real gitlab.com OAuth app, local lab)
 
-Portal sends `credentials: "include"` **and** `Authorization: Bearer <IdP JWT>`.  
-Middle prefers **Bearer over `middle_session`**, so switching Keycloak users is not stuck
-on a stale cookie.
-
-### Code map (cookie)
-
-| Piece | File |
+| Check | Result |
 | --- | --- |
-| Open app: set host-only cookie + clean 302 | [`../go-middle/planes.go`](../go-middle/planes.go) — `handleOpenCoderApp` |
-| Prefer Bearer over cookie | [`../go-middle/auth.go`](../go-middle/auth.go) — `resolveAppAuth` |
-| Clear cookies on logout | [`../go-middle/auth.go`](../go-middle/auth.go) — `handleLogout`, `clearCoderSessionCookie` |
-| Route `POST /v1/logout` | [`../go-middle/main.go`](../go-middle/main.go) |
-| Portal logout calls middle | [`../portal/public/app.js`](../portal/public/app.js) — `#logout` handler |
+| Portal shows link status from `GET /v1/external-auth/primary-gitlab` | `authenticated: false` → "Connect GitLab"; `true` → "GitLab: linked" |
+| Bounce → `/external-auth/primary-gitlab/callback?redirect=%2F_portal%2Fdone` | Coder sets `oauth_redirect=/_portal/done` and 307s to `gitlab.com/oauth/authorize` (PKCE, `scope=write_repository read_api`) |
+| GitLab consent → Coder callback with the bounced cookie | Link stored ("You've authenticated with GitLab!" before the `/done` step existed) |
+| Coder → `/_portal/done` → portal | Browser lands on the portal, button shows "GitLab: linked" |
+| Consent session after `/done` | Bounce key revoked (`revoked=true` in middle log, old token → 401), cookie cleared; `http://coder…/` shows Coder's login, **not the dashboard** |
+| Git inside the workspace | `git clone` / push over HTTPS via Coder's GitLab credentials works |
+| Unlink (`DELETE /v1/external-auth/primary-gitlab`) and re-link | Works; GitLab auto-approves an app the user already authorized (revoke it in GitLab → Applications to see the consent screen again) |
 
-### How the cookie is set (Go)
+## 4. Trust model
 
-From [`../go-middle/planes.go`](../go-middle/planes.go) `handleOpenCoderApp` — after minting `tok`
-for the plane user:
-
-```go
-// Compare hostnames only (ports are ignored by the browser for cookies).
-planeHost := cookieHostForURL(p.URL)                 // e.g. "127.0.0.1" from plane URL
-middleHost := cookieHostForURL(s.Config.PublicURL)   // e.g. "127.0.0.1"
-if r.Host != "" {
-    middleHost = strings.Split(r.Host, ":")[0]       // Host header from the browser
-}
-
-target := fmt.Sprintf("%s/@%s/%s/apps/%s/", p.URL, me.Username, name, slug)
-if slug == "code-server" {
-    target += "?folder=/home/coder" // non-secret query only
-}
-
-if planeHost != "" && planeHost == middleHost {
-    // Same host as middle → Set-Cookie is visible to Coder on :3000/:3001.
-    // Omit Domain so the cookie is host-only (not Domain=.example.com).
-    http.SetCookie(w, &http.Cookie{
-        Name:     "coder_session_token",
-        Value:    tok, // minted Coder API key for this user/plane
-        Path:     "/",
-        HttpOnly: true,
-        SameSite: http.SameSiteLaxMode,
-        MaxAge:   int((2 * time.Hour).Seconds()),
-        // Domain: unset on purpose
-    })
-    // Clean app URL — token is in the cookie, not the Location query.
-    http.Redirect(w, r, target, http.StatusFound)
-    return
-}
-
-// Different hostnames: middle cannot set a cookie for the plane host.
-// Fall back to ?coder_session_token= until a bootstrap runs on that host.
-q := url.Values{"coder_session_token": {tok}}
-http.Redirect(w, r, fmt.Sprintf("%s/@%s/%s/apps/%s/?%s",
-    p.URL, me.Username, name, slug, q.Encode()), http.StatusFound)
-```
-
-HTTP response the browser sees on the happy path:
-
-```http
-HTTP/1.1 302 Found
-Set-Cookie: coder_session_token=<tok>; Path=/; Max-Age=7200; HttpOnly; SameSite=Lax
-Location: http://127.0.0.1:3000/@alice/alice-a/apps/ttyd/
-```
-
-Clearing on logout ([`../go-middle/auth.go`](../go-middle/auth.go)):
-
-```go
-http.SetCookie(w, &http.Cookie{
-    Name:     "coder_session_token",
-    Value:    "",
-    Path:     "/",
-    HttpOnly: true,
-    SameSite: http.SameSiteLaxMode,
-    MaxAge:   -1, // delete
-})
-```
-
-## Minted Coder API tokens (1 day, reserved name)
-
-### Goal
-
-- One stable API key per user **per plane** (not a new key on every request).
-- **1-day** lifetime.
-- On middle **restart** / cache miss: **delete** the reserved key and **recreate** it
-  (no pile-up of `middle-a-<hex>` tokens).
-
-### How it works
-
-1. In-memory cache key: `planeID|email` (e.g. `a|alice@example.com`).
-2. Cache hit + `PingToken` OK → reuse the secret string; **no** Coder API create.
-3. Cache miss (fresh middle process, expired/revoked key) →  
-   `EnsureReservedUserToken(userID, "middle-"+planeID)`:
-   - list user’s API keys
-   - delete any named exactly `middle-a` / `middle-b` (and legacy `middle-a-*`)
-   - create new key with that **exact** name and `lifetime = 24h` (nanoseconds in JSON)
-
-Reserved names: **`middle-a`**, **`middle-b`** (single-plane legacy: `middle`).
-
-Lab seed may also create a one-off **`seed` / `seed2`** token while creating workspaces as
-the user; that is unrelated to middle and can be deleted in the Coder UI.
-
-### Code map (mint)
-
-| Piece | File |
+| Question | Answer |
 | --- | --- |
-| Cache + call ensure on miss | [`../go-middle/planes.go`](../go-middle/planes.go) — `ensureCoderTokenOnPlane` |
-| Delete-by-name + create 1-day key | [`../go-middle/coder.go`](../go-middle/coder.go) — `EnsureReservedUserToken`, `ListUserAPIKeys`, `DeleteUserAPIKey` |
-| Single-plane path | [`../go-middle/auth.go`](../go-middle/auth.go) — `ensureCoderToken` → `EnsureReservedUserToken(..., "middle")` |
+| How does middle know **which user**? | From the **code**, minted while the user was authenticated to middle (IdP JWT). The Lambda never asserts identity. |
+| How does middle know the caller is **the bounce Lambda**? | IAM: the Lambda sends a **pre-signed `sts:GetCallerIdentity`**; middle replays it to a **fixed** STS endpoint and gets the role ARN. No shared secret; middle needs no AWS credentials. |
+| Why can't plane A's Lambda redeem plane B's codes? | Allowlist maps **role → plane**; code's plane must equal caller's plane and the request host must equal that plane's host. |
+| Why can't a captured signature be reused? | Signed headers `X-Middle-Server-Id` (audience) and `X-Middle-Code-Sha256` = sha256(`action` + `\n` + value) — `redeem` + code, or `done` + session token — so a proof is valid for one middle, one action, one value. STS signatures expire (~15 min); codes are single-use, 60 s. |
+| What if the code leaks? | It contains no token, is single-use/short-lived, bound to one plane host, and only the trusted Lambda can redeem it. Sent via form POST so it stays out of history and ALB access logs. |
+| Open redirect? | Redirect paths are computed by middle (`external-auth` / `terminal` purposes); the Lambda only accepts a same-origin path on redeem, and on `/done` only an http(s) URL returned by middle (`bounce.done_redirect`). |
+| Can the consent cookie be used to browse the Coder dashboard? | Only during the consent round trip. It carries a **dedicated 5-minute key (`bounce-<plane>`)**, which `/done` revokes; the cookie itself is cleared. `/internal/bounce/done` only ever deletes keys named `bounce-<plane>`, never the user's main `middle-<plane>` key. |
+| What if the user abandons consent mid-way? | The bounce key expires on its own after 5 minutes (cookie `Max-Age` = 300). |
 
-### How the reserved token is minted (Go)
+Allowlist matching notes: STS returns `arn:aws:sts::<acct>:assumed-role/<role-name>/<session>` —
+match **account + role name** (role path is dropped); optionally pin the role unique id
+(`AROA…`, the `UserId` prefix) so a deleted/recreated role isn't trusted automatically.
 
-Cache + replace on miss — [`../go-middle/planes.go`](../go-middle/planes.go) `ensureCoderTokenOnPlane`:
+### 4.1 Tokens and timers (GitLab consent)
 
-```go
-func (s *Service) ensureCoderTokenOnPlane(ctx context.Context, email, planeID string) (string, error) {
-    p, err := s.plane(planeID)
-    // ...
-    key := p.ID + "|" + email // e.g. "a|alice@example.com"
-    if t, ok := s.Store.GetCoderTokenByEmail(key); ok {
-        if err := p.Client.PingToken(ctx, t); err == nil {
-            return t, nil // cache hit — do not create another Coder API key
-        }
-    }
-    user, err := p.Client.FindOrCreateUser(ctx, email)
-    // ...
-    // Stable name per plane; replace on cache miss so keys don't accumulate.
-    token, err := p.Client.EnsureReservedUserToken(ctx, user.ID, "middle-"+p.ID) // "middle-a"
-    // ...
-    s.Store.SetCoderTokenByEmail(key, token)
-    return token, nil
-}
-```
+| Token | Where it lives | Lifetime | Used for |
+| --- | --- | --- | --- |
+| Main `middle-<plane>` key | **Middle only**, never sent to the browser for consent | 24 h, re-minted | Link status (`GET /v1/external-auth/{id}`), unlink, workspaces… — server-side |
+| Dedicated `bounce-<plane>` key | The consent cookie on the plane host | 5 min, **revoked at `/_portal/done`** | GitLab consent round trip only |
 
-Delete matching keys, then create a 1-day key — [`../go-middle/coder.go`](../go-middle/coder.go)
-`EnsureReservedUserToken`:
+- The bounce key is minted **at redeem** (when the Lambda redeems the code), not when the user
+  clicks; minting deletes any previous `bounce-<plane>` key, so there is at most one per user.
+- Two independent timers:
 
-```go
-func (c *CoderClient) EnsureReservedUserToken(ctx context.Context, userID, reservedName string) (string, error) {
-    keys, err := c.ListUserAPIKeys(ctx, userID) // GET /api/v2/users/{id}/keys/tokens
-    // ...
-    for _, k := range keys {
-        // exact "middle-a" or legacy "middle-a-<hex>"
-        if !tokenNameMatchesReserved(k.TokenName, reservedName) {
-            continue
-        }
-        // DELETE /api/v2/users/{id}/keys/{keyID}
-        if err := c.DeleteUserAPIKey(ctx, userID, k.ID); err != nil {
-            return "", fmt.Errorf("delete api key %s (%s): %w", k.ID, k.TokenName, err)
-        }
-    }
-    // Coder expects lifetime as time.Duration nanoseconds in JSON.
-    body := map[string]any{
-        "token_name": reservedName,            // e.g. "middle-a" (exact, no random suffix)
-        "lifetime":   int64(24 * time.Hour),   // 1 day
-    }
-    var resp coderTokenResp
-    // POST /api/v2/users/{id}/keys/tokens  (as owner)
-    if err := c.do(ctx, http.MethodPost, "/api/v2/users/"+userID+"/keys/tokens",
-        c.OwnerToken, body, &resp); err != nil {
-        return "", err
-    }
-    return resp.Key, nil // secret string; only returned once at create time
-}
+| Timer | Covers | Recommended | Notes |
+| --- | --- | --- | --- |
+| One-time code (`code_ttl_seconds`) | Click → form POST to `/_portal/bounce` (sub-second) | 30–60 s | Minted on click ("Connect GitLab"), single use, consumed **before** the GitLab page |
+| Consent key + cookie (`bounceConsentTTLSeconds`, 300 s today) | Bounce → GitLab (login, 2FA/SSO, consent) → `/_portal/done` | 5–10 min | Too short and GitLab's redirect back finds no valid cookie → Coder login page, user restarts from the portal. Longer is low-risk: revoked at `/done`, expires if abandoned |
 
-func tokenNameMatchesReserved(name, reserved string) bool {
-    if name == reserved {
-        return true
-    }
-    return strings.HasPrefix(name, reserved+"-") // legacy middle-a-<hex>
-}
-```
+Naming note: the bounce key is `bounce-a`, not `middle-a-bounce` — middle treats `middle-a-*` as
+legacy variants of its main key and would delete it when re-minting.
 
-After a middle restart + alice list/open, Coder should show **one** key named `middle-a`
-with `lifetime_seconds: 86400`; the key **id** changes on each remint.
+## 5. Components & code
 
-### Sanity check after restart
-
-```bash
-# list alice keys on plane A (owner token from seed)
-curl -sS -H "Coder-Session-Token: $(cat /tmp/multiplane-lab/owner-a.token)" \
-  "http://127.0.0.1:3000/api/v2/users/<alice-uuid>/keys/tokens"
-# expect a single middle-a with lifetime_seconds=86400; id changes after remint
-```
-
-## GitLab OAuth / External Auth (without Coder dashboard)
-
-Users never use the Coder portal login UI. **Identity for middle** stays on the product
-portal (Keycloak / GitLab OIDC) → mint Coder API tokens as today.
-
-For **GitLab inside the workspace** (clone/push as the user), prefer Coder **External Auth**
-driven from the portal after the host-only cookie is set — not a click inside Coder’s UI.
-
-### Recommended flow (option A)
-
-1. Portal/middle mints (or reuses) the user’s plane token and sets `coder_session_token`
-   (same as opening ttyd/code-server).
-2. **Check** whether GitLab consent is already done (API below).
-3. If not linked → open the plane’s external-auth URL in a browser tab (cookie already on
-   the host) so the user completes GitLab OAuth once.
-4. Template uses `data.coder_external_auth` / `coder external-auth access-token` as usual.
-
-Portal does **not** rewrite URLs for consent; it only decides whether to navigate to
-Coder’s external-auth page. Middle already owns cookie + mint.
-
-### Check if the user still needs consent
-
-Call **as the user** (minted `middle-a` / `middle-b` token), not as owner.
-Provider id is whatever you configured (e.g. `CODER_EXTERNAL_AUTH_0_ID=primary-gitlab`).
-
-```bash
-# Single provider
-curl -sS -H "Coder-Session-Token: $USER_TOKEN" \
-  "http://127.0.0.1:3000/api/v2/external-auth/primary-gitlab"
-
-# All links for this user
-curl -sS -H "Coder-Session-Token: $USER_TOKEN" \
-  "http://127.0.0.1:3000/api/v2/external-auth"
-```
-
-Useful fields on the response:
-
-| Field | Meaning |
-| --- | --- |
-| `authenticated` | `true` → linked / consent done; skip redirect |
-| `validate_error` | Token present but invalid / needs re-auth |
-| `expires` / `has_refresh_token` | Lifetime / refresh capability |
-
-Portal/middle logic:
-
-```text
-GET /api/v2/external-auth/{id}  (user token)
-  authenticated == true  → continue (create workspace / open apps)
-  authenticated == false → window.open("http://<plane>/external-auth/{id}")
-                           then re-check after return
-```
-
-Consent URL (browser, with host-only `coder_session_token` already set):
-
-```text
-http://127.0.0.1:3000/external-auth/primary-gitlab
-```
-
-(Use the real plane host/port; path is `/external-auth/<CODER_EXTERNAL_AUTH_*_ID>`.)
-
-### Where to put the code (sketch — not wired in this lab yet)
-
-| Layer | File | Responsibility |
+| Piece | Where | Notes |
 | --- | --- | --- |
-| Middle client | [`../go-middle/coder.go`](../go-middle/coder.go) | `GET /api/v2/external-auth/{id}` as user |
-| Middle handler | [`../go-middle/planes.go`](../go-middle/planes.go) (or new `external_auth.go`) | Mint + check + return JSON |
-| Middle route | [`../go-middle/main.go`](../go-middle/main.go) | `GET /v1/external-auth/{id}` |
-| Portal | [`../portal/public/app.js`](../portal/public/app.js) | Call middle; open `auth_url` if needed |
+| Middle endpoints | [`../go-middle/bounce.go`](../go-middle/bounce.go) | `POST /v1/bounce/start` (user), `POST /internal/bounce/redeem` + `POST /internal/bounce/done` (IAM proof), `GET`/`DELETE /v1/external-auth/{id}` (user) |
+| Middle config | [`../go-middle/config.go`](../go-middle/config.go) | `bounce:` block + optional per-plane `api_url` |
+| Coder client | [`../go-middle/coder.go`](../go-middle/coder.go) | `EnsureReservedUserTokenLifetime`, `ExternalAuth`, `DeleteExternalAuth` |
+| Bounce handler | [`../bounce-lambda/bounce/handler.go`](../bounce-lambda/bounce/handler.go) | ALB event in; `/_portal/done` → revoke + clear cookie + portal; anything else → redeem + cookie |
+| Lambda entrypoint | [`../bounce-lambda/cmd/lambda`](../bounce-lambda/cmd/lambda) | `provided.al2023`, arm64 |
+| Local ALB emulator | [`../bounce-lambda/cmd/alb-emulator`](../bounce-lambda/cmd/alb-emulator) | Same handler in-process; reverse-proxies the rest to Coder |
+| Portal | [`../portal/public/app.js`](../portal/public/app.js) | `openViaBounce()`, `connectGitLab()` / `disconnectGitLab()` / `refreshGitLabStatus()`, `openWebTerminal()` |
+| Access choice | [`../go-middle/access.go`](../go-middle/access.go) | `web_terminal` choice when the agent's `display_apps` enables it |
+| Templates | [`../templates/terminal-bounce`](../templates/terminal-bounce) (with `coder_external_auth` GitLab, optional), [`../templates/terminal-bounce-aws`](../templates/terminal-bounce-aws) | |
+| Local lab | [`../local-subdomain-lab/bring-up-bounce-lab.sh`](../local-subdomain-lab/bring-up-bounce-lab.sh), [`test-bounce.sh`](../local-subdomain-lab/test-bounce.sh) | Bring-up reads `/tmp/gitlab-oauth.env` to enable GitLab; `test-bounce.sh` also runs against AWS via `MIDDLE`/`PLANE`/`KC` env |
 
-**1. Coder client** (`coder.go`):
+### 5.1 Coder + GitLab setup
 
-```go
-type externalAuthStatus struct {
-    Authenticated bool   `json:"authenticated"`
-    ProviderID    string `json:"provider_id"`
-    ValidateError string `json:"validate_error,omitempty"`
-}
+GitLab OAuth application (User/Group/Admin → Applications):
 
-func (c *CoderClient) ExternalAuth(ctx context.Context, userToken, providerID string) (*externalAuthStatus, error) {
-    var out externalAuthStatus
-    path := "/api/v2/external-auth/" + url.PathEscape(providerID)
-    if err := c.do(ctx, http.MethodGet, path, userToken, nil, &out); err != nil {
-        return nil, err
-    }
-    return &out, nil
-}
-```
+- Redirect URI: `https://coder-a.example.com/external-auth/primary-gitlab/callback`
+  (lab: `http://coder.127.0.0.1.sslip.io:3000/external-auth/primary-gitlab/callback`)
+- Confidential, scopes `write_repository` and `read_api` (Coder's GitLab defaults)
 
-**2. Middle handler** (`planes.go` / `external_auth.go`) — check happens **here**:
-
-```go
-// GET /v1/external-auth/{id}?plane=a
-func (s *Service) handleExternalAuthStatus(w http.ResponseWriter, r *http.Request) {
-    email, err := s.emailFromRequest(r)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusUnauthorized)
-        return
-    }
-    providerID := r.PathValue("id") // e.g. "primary-gitlab"
-    p, err := s.plane(r.URL.Query().Get("plane"))
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
-        return
-    }
-    tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusBadGateway)
-        return
-    }
-    st, err := p.Client.ExternalAuth(r.Context(), tok, providerID)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusBadGateway)
-        return
-    }
-    // Ensure cookie so a follow-up window.open(auth_url) is already authenticated.
-    http.SetCookie(w, &http.Cookie{
-        Name:     "coder_session_token",
-        Value:    tok,
-        Path:     "/",
-        HttpOnly: true,
-        SameSite: http.SameSiteLaxMode,
-        MaxAge:   int((2 * time.Hour).Seconds()),
-    })
-    writeJSON(w, http.StatusOK, map[string]any{
-        "provider_id":   providerID,
-        "authenticated": st.Authenticated,
-        "plane_id":      p.ID,
-        // Portal opens this only when authenticated == false
-        "auth_url": p.URL + "/external-auth/" + url.PathEscape(providerID),
-    })
-}
-```
-
-**3. Register route** (`main.go`):
-
-```go
-mux.Handle("GET /v1/external-auth/{id}",
-    svc.requireAuth(http.HandlerFunc(svc.handleExternalAuthStatus)))
-```
-
-**4. Portal** (`app.js`) — only consumes middle JSON:
-
-```js
-async function ensureGitLabLinked(planeId, providerId = "primary-gitlab") {
-  await ensureAppSession(); // middle_session for top-level nav if needed
-  const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
-  const st = await api(`/v1/external-auth/${encodeURIComponent(providerId)}${q}`);
-  if (st.authenticated) return true;
-  // Middle already set coder_session_token on this host; open Coder consent page.
-  window.open(st.auth_url, "_blank", "noopener,noreferrer");
-  return false; // caller may poll / show "Connect GitLab then Refresh"
-}
-
-// Example: before create, or a "Connect GitLab" button
-// if (!(await ensureGitLabLinked(ws.plane_id))) { alert("Complete GitLab login, then retry"); }
-```
-
-Optional poll after the popup:
-
-```js
-async function waitUntilGitLabLinked(planeId, providerId = "primary-gitlab", attempts = 30) {
-  for (let i = 0; i < attempts; i++) {
-    const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
-    const st = await api(`/v1/external-auth/${encodeURIComponent(providerId)}${q}`);
-    if (st.authenticated) return true;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  return false;
-}
-```
-
-### Inside the workspace
+Coder server env (one set per plane, each plane its own GitLab app / redirect URI):
 
 ```bash
-coder external-auth access-token primary-gitlab
-# exit 0 → token on stdout (OK)
-# exit 1 → not linked; stdout is the auth URL to open
+CODER_EXTERNAL_AUTH_0_ID=primary-gitlab
+CODER_EXTERNAL_AUTH_0_TYPE=gitlab
+CODER_EXTERNAL_AUTH_0_CLIENT_ID=…
+CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=…
+# self-managed GitLab: also AUTH_URL, TOKEN_URL, VALIDATE_URL, REVOKE_URL, REGEX
 ```
 
-### Alternatives (not implemented in this lab)
+Template:
 
-| Approach | When |
+```hcl
+data "coder_external_auth" "gitlab" {
+  id       = "primary-gitlab"
+  optional = true   # workspace builds don't block on it; the portal drives consent
+}
+```
+
+### 5.2 Middle config
+
+```yaml
+planes:
+  - id: a
+    url: "https://coder-a.example.com"        # public; also the cookie host
+    api_url: "http://coder-a.internal:3000"   # optional, middle → Coder API
+    owner_token: "…"
+
+portal_origins:
+  - "https://portal.example.com"
+
+bounce:
+  server_id: "middle-prod"                    # audience the Lambda must sign
+  sts_endpoint: "https://sts.us-east-1.amazonaws.com/"
+  path: "/_portal/bounce"
+  done_path: "/_portal/done"                  # default
+  done_redirect: "https://portal.example.com/" # default: first portal_origins entry
+  code_ttl_seconds: 60
+  cookie_max_age_seconds: 900                 # terminal purpose; external-auth uses 300
+  callers:
+    - plane: a
+      account_id: "111122223333"
+      role_name: "coder-bounce-plane-a"
+      role_id: "AROA…"                        # optional pin
+```
+
+### 5.3 Portal (frontend)
+
+```javascript
+// Status drives the button: authenticated=false → consent needed, true → linked.
+const st = await api(`/v1/external-auth/primary-gitlab?plane=a`);
+
+// Consent runs in the same tab so the flow ends back on the portal (?linked=1).
+async function openViaBounce(body, { sameTab = false } = {}) {
+  const w = sameTab ? window : window.open("about:blank", "_blank"); // open sync (popup blockers)
+  if (!sameTab) w.opener = null;
+  const data = await api("/v1/bounce/start", { method: "POST", body: JSON.stringify(body) });
+  const form = w.document.createElement("form");
+  form.method = "POST";                              // keeps the code out of URLs/logs
+  form.action = data.bounce_url;                     // https://coder-a.example.com/_portal/bounce
+  const input = w.document.createElement("input");
+  input.type = "hidden"; input.name = "code"; input.value = data.code;
+  form.appendChild(input);
+  w.document.body.appendChild(form);
+  form.submit();
+}
+
+openViaBounce({ plane: "a", purpose: "external-auth", provider: "primary-gitlab" }, { sameTab: true });
+// Unlink:
+api(`/v1/external-auth/primary-gitlab?plane=a`, { method: "DELETE" });
+```
+
+### 5.4 Middle — start (user-authenticated)
+
+```go
+// POST /v1/bounce/start — redirect computed server-side, never from the client
+case "external-auth":
+    redirect = "/external-auth/" + in.Provider + "/callback?redirect=" + url.QueryEscape(cfg.Bounce.DonePath)
+case "terminal":
+    redirect = fmt.Sprintf("/@%s/%s.%s/terminal", user, workspace, agent)
+code, _ := s.Bounce.Issue(bounceCode{Email: email, Plane: p.ID, Redirect: redirect, Purpose: in.Purpose, Exp: now.Add(60 * time.Second)})
+writeJSON(w, 200, map[string]any{"bounce_url": p.URL + "/_portal/bounce", "code": code})
+```
+
+`/callback` without `?code` makes Coder start the provider redirect immediately (skips Coder's
+"Login with GitLab" page); `?redirect=` is remembered in Coder's `oauth_redirect` cookie and used
+after the link is stored.
+
+### 5.5 Middle — redeem and done (IAM-authenticated)
+
+```go
+// POST /internal/bounce/redeem
+plane, arn, err := s.verifyBounceCaller(ctx, in.IAM, "redeem", in.Code) // STS replay + allowlist
+rec, ok := s.Bounce.Consume(in.Code)                                     // single use
+// rec.Plane == plane && host == plane host, then:
+if rec.Purpose == "external-auth" {
+    tok = mint "bounce-<plane>" key, lifetime 300s                       // revoked at /done
+} else {
+    tok = main "middle-<plane>" key
+}
+writeJSON(w, 200, map[string]any{"session_token": tok, "redirect_path": rec.Redirect, "max_age": maxAge})
+
+// POST /internal/bounce/done
+plane, arn, err := s.verifyBounceCaller(ctx, in.IAM, "done", in.SessionToken)
+// host == plane host; GetMe(token) → user; delete the key whose id == token prefix
+// AND name == "bounce-<plane>"; always answer with the portal URL
+writeJSON(w, 200, map[string]any{"redirect_url": cfg.Bounce.DoneRedirect, "revoked": revoked})
+```
+
+`verifyBounceCaller` requires: `x-middle-server-id` == `bounce.server_id`, `x-middle-code-sha256`
+== sha256(action + "\n" + value), both listed in `SignedHeaders`, body exactly
+`Action=GetCallerIdentity&Version=2011-06-15`, then POSTs to the configured STS endpoint only.
+
+### 5.6 Lambda — two paths
+
+```go
+func (h *Handler) Handle(ctx context.Context, ev events.ALBTargetGroupRequest) (events.ALBTargetGroupResponse, error) {
+    if strings.HasSuffix(ev.Path, "/done") {
+        return h.done(ctx, ev) // cookie → middle /internal/bounce/done → 302 portal + clear cookie
+    }
+    // code (form POST) → middle /internal/bounce/redeem → 302 redirect_path + Set-Cookie
+}
+
+// Identity proof (built, never sent by the Lambda):
+req, _ := http.NewRequest("POST", "https://sts.us-east-1.amazonaws.com/", strings.NewReader(stsBody))
+req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+req.Header.Set("X-Middle-Server-Id", serverID)
+req.Header.Set("X-Middle-Code-Sha256", hex(sha256(action + "\n" + value)))
+v4.NewSigner().SignHTTP(ctx, creds, req, bodyHash, "sts", "us-east-1", time.Now())
+```
+
+Responses:
+
+```text
+redeem: 302 Location: /external-auth/primary-gitlab/callback?redirect=%2F_portal%2Fdone
+        Set-Cookie: coder_session_token=…; Path=/; Max-Age=300; HttpOnly; Secure; SameSite=Lax
+done:   302 Location: https://portal.example.com/?linked=1
+        Set-Cookie: coder_session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+both:   Cache-Control: no-store, Referrer-Policy: no-referrer
+```
+
+Lambda env: `MIDDLE_URL`, `MIDDLE_SERVER_ID`, `STS_REGION`, `COOKIE_SECURE=true`.
+Build: `GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap ./cmd/lambda`.
+
+### 5.7 ALB (per plane)
+
+```text
+HTTPS listener (cert covers coder-a.example.com and *.coder-a.example.com)
+  priority 10: host = coder-a.example.com AND path = /_portal/*  → Lambda target group (bounce-plane-a)
+  default / lower priority: coder-a.example.com, *.coder-a.example.com → coderd
+```
+
+One rule covers both `/_portal/bounce` and `/_portal/done`.
+
+EKS / AWS Load Balancer Controller equivalent: an Ingress in the **same IngressGroup** as Coder's
+with a lower `alb.ingress.kubernetes.io/group.order`, whose `/_portal/` path uses a custom action
+(`alb.ingress.kubernetes.io/actions.bounce` with `forwardConfig.targetGroups[].targetGroupARN`)
+pointing at a Lambda target group created outside the controller (Terraform `aws_lb_target_group`
+`target_type = "lambda"` + `aws_lambda_permission` for `elasticloadbalancing.amazonaws.com`).
+Alternatively manage just this rule in Terraform with `aws_lb_listener_rule`.
+
+## 6. Networking options for Lambda → middle
+
+| Option | When |
 | --- | --- |
-| **B. Portal owns GitLab OAuth** | Portal runs auth-code flow and injects the token into the workspace (env/secret). No Coder External Auth UI at all. |
-| **C. Non-user tokens** | Deploy / project / group tokens — no interactive consent. |
+| Public `https://middle.example.com` | Middle is internet-reachable (lab used private because the ALB was IP-restricted) |
+| **Lambda in VPC → private middle URL** (used in AWS lab) | Middle in same/peered VPC; no NAT needed (signing is local, middle calls STS) |
+| Lambda in VPC → internal NLB in front of middle | Middle elsewhere over TGW/VPN/DX with stable private IPs |
 
-There is no way to finish OAuth **from Terraform alone** with no browser hop; the consent
-step needs a user agent. The hop should be **portal → Coder external-auth URL** (after
-cookie), not “click Login with GitLab on the Coder dashboard.”
+The IAM check is identical in all cases.
 
-## Middle API (multi-plane)
+## 7. Way forward
 
-| Endpoint | Notes |
+### Adopt
+
+1. **One bounce Lambda + IAM role per plane** (`coder-bounce-<plane>`), trusted by middle via the
+   allowlist. Role needs no permissions beyond Lambda basics (+ VPC access if in VPC).
+2. **One ALB rule per plane host** (`/_portal/*`, highest priority), matching the exact plane
+   host — not the wildcard app hosts.
+3. **GitLab OAuth** through the bounce with the `/done` cleanup:
+   - portal shows status from `GET /v1/external-auth/{id}?plane=` (`authenticated`);
+   - "Connect GitLab" = `purpose: "external-auth"` in the same tab; the flow ends on the portal;
+   - consent uses a dedicated 5-minute `bounce-<plane>` key, revoked at `/_portal/done`;
+   - one GitLab OAuth app (redirect URI) per plane host.
+4. **Apps / ttyd**: keep the JSON mint + strip flow ([`open-coder-apps-portal-json-strip.md`](open-coder-apps-portal-json-strip.md)).
+5. **Built-in web terminal**: not needed when ttyd is used. If ever enabled, note that the
+   `terminal` purpose leaves a dashboard-capable cookie on the plane host (by design: the terminal
+   *is* a dashboard page) — either drop the purpose or give it the same dedicated short-lived key.
+
+### Production hardening (not needed for the validation lab)
+
+| Item | Why |
 | --- | --- |
-| `GET /v1/planes` | Configured plane ids + URLs |
-| `GET /v1/workspaces` | Fan-out; each item has `plane_id`, `plane_url` |
-| `POST /v1/workspaces` | Body may include `plane_id` |
-| `GET /v1/workspaces/{id}/access?plane=` | Access choices for that plane |
-| `GET /v1/workspaces/{id}/coder-app/{slug}?plane=` | Host-only cookie + 302 to clean app URL |
-| `POST /v1/logout` | Clears `middle_session` + `coder_session_token` |
+| Shared code store (Redis/DynamoDB TTL, atomic get-and-delete) | Multi-replica middle; exactly-once redeem |
+| Serve `/internal/*` on a private listener / not via the public ALB | Defense in depth (IAM proof already required) |
+| Pin `role_id` in the allowlist | Recreated role with same name isn't auto-trusted |
+| Audit log on redeem/done (user, plane, purpose, caller ARN, revoked) | Traceability of cookie grants / GitLab linking |
+| Periodic sweep of stale `bounce-<plane>` keys | Belt and braces for abandoned consents (they expire in 5 min anyway) |
+| Rate-limit `/v1/bounce/start` per user | Code minting is cheap but should not be abusable |
+| Alarm on `rejected caller` / STS failures | Detect misconfig or probing |
+| GitLab app secret in a secret store, rotated | Coder reads it from env at start |
 
-## Template
+### Still to validate
 
-[`../templates/multiplane-apps/`](../templates/multiplane-apps/)
+| Item | Risk |
+| --- | --- |
+| GitLab consent on the AWS/HTTPS setup (`Secure` cookie, real ALB) | Low — same flow; mechanics already proven on AWS, consent proven locally |
+| Self-managed GitLab (extra `*_URL` / `REGEX` env) | Low — Coder config only |
+| Bounce on EKS via AWS Load Balancer Controller (IngressGroup ordering) | Low — same ALB rule semantics |
 
-## Related: agent tasks in the portal
+## 8. Alternatives considered
 
-Mock agent activity stream (no terminal) → Cursor SDK swap: [`../agent-task-lab/README.md`](../agent-task-lab/README.md).
+| Alternative | Why not (for now) |
+| --- | --- |
+| `Domain=` cookie from a parent domain | Sends the user's Coder token to every workspace app subdomain |
+| Query `?coder_session_token=` | Dashboard SPA and OAuth callback don't use it |
+| Middle served on each plane host | Works, but couples middle routing to every plane; the bounce keeps middle anywhere |
+| Coder device flow via API (external auth) | Cookie-free for GitLab consent, but UX (enter code) and untested with GitLab in Coder |
+| Portal owns GitLab OAuth + credential helper | Bypasses Coder external auth; middle would store/refresh GitLab tokens |
+| Keep the consent cookie (no `/done`) | Leaves a dashboard session on the plane host for its lifetime |
