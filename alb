@@ -1,1551 +1,484 @@
-# Plane-host cookie bounce — GitLab OAuth consent (and other cookie-only Coder pages) when middle is on another host
+# Writable overlay workspaces in Coder without `SYS_ADMIN`
 
-**Status:** validated end to end. This document is self-contained: problem, design, security model,
-all code (middle, Lambda, portal), Coder/GitLab configuration and AWS resources.
+How to give a Coder workspace a copy-on-write `/home/coder/workspace` (read-only lower tree + private upper layer) from a pod that runs in a PSA **`restricted`** namespace with `hostUsers: false`, all capabilities dropped and `allowPrivilegeEscalation: false`.
 
-- Bounce mechanics validated on **real AWS** (ALB + Lambda in VPC + IAM/STS, public domain, HTTPS)
-  and locally (an ALB emulator running the same handler).
-- **GitLab OAuth consent validated with a real gitlab.com OAuth application**: portal → plane host →
-  GitLab → Coder → back to the portal. At the end the consent session is **revoked and its cookie
-  cleared**, so the user cannot reuse it to browse the Coder dashboard.
+Validated on kind (Kubernetes 1.35, containerd, kernel 7.0) with real Coder v2.36.5, September 2026. Bottlerocket-specific behaviour (SELinux) is still to be confirmed on EKS; see [Open items](#open-items).
 
 ---
 
-## 1. Problem
+## 1. What we learned
 
-The portal talks to **middle** (`middle.example.com`); middle talks to one or more Coder control
-planes (`coder-a.example.com`, …) with per-user Coder API tokens. Most things work with tokens in
-API calls, but some Coder pages authenticate **only with the `coder_session_token` cookie on the
-plane host**:
-
-| Page | Why a token in the URL/API doesn't work |
-| --- | --- |
-| External-auth consent `/external-auth/{id}` and callback `/external-auth/{id}/callback` (GitLab OAuth) | GitLab redirects the browser back to the callback; only cookies travel on that redirect. Without the cookie Coder answers `303 /login`. Coder also requires the user to finish the flow on the same domain they started it on. |
-| Built-in web terminal `/@user/ws.agent/terminal` | Dashboard SPA; its fetch/WebSocket calls use the cookie only. Not needed when ttyd is used as a workspace app. |
-
-Constraints:
-
-- A browser only accepts a **host-only** cookie (no `Domain` attribute) from a response **served by
-  that exact host** (port and path don't matter). Middle is on another host, so it cannot set it.
-- A `Domain=example.com` cookie set from a parent domain is ruled out: the browser would send the
-  user's Coder token to **every workspace app subdomain** (`*.coder-a.example.com`), i.e. to code
-  running in workspaces.
-- Coder's `?coder_session_token=` query parameter works for workspace apps but not for dashboard
-  pages or the OAuth callback.
-
-## 2. Solution overview
-
-Put a tiny, stateless **bounce** on the plane host with **one ALB listener rule**
-(`host = coder-a.example.com AND path = /_portal/*` → Lambda). Middle stays where it is and keeps
-all the logic. The Lambda proves who it is to middle with **IAM** (a pre-signed
-`sts:GetCallerIdentity`), so there is no shared secret.
-
-Components:
-
-| Component | Role |
-| --- | --- |
-| Portal (browser SPA) | Shows GitLab link status; "Connect GitLab" asks middle for a one-time code and form-POSTs it to the plane host |
-| Middle | Issues one-time codes (user-authenticated), verifies the Lambda's IAM identity, mints/revokes Coder tokens, returns redirect targets |
-| ALB rule on the plane host | Sends `/_portal/*` to the bounce Lambda; everything else to Coder as before |
-| Bounce Lambda (one IAM role per plane) | Redeems the code with middle, sets the host-only cookie, redirects; at `/_portal/done` revokes + clears the cookie and returns to the portal |
-| Coder | Normal external auth (GitLab) configuration; unchanged |
-
-```mermaid
-sequenceDiagram
-  participant P as Portal (browser)
-  participant M as Middle
-  participant A as ALB coder-a.example.com
-  participant L as Bounce Lambda (role per plane)
-  participant S as AWS STS
-  participant C as Coder plane A
-  participant G as GitLab
-  P->>M: GET /v1/external-auth/primary-gitlab → authenticated: false
-  P->>M: POST /v1/bounce/start {plane, purpose: external-auth, provider} (user JWT)
-  M-->>P: {bounce_url, code} — one-time, 60s, bound to user+plane+redirect
-  P->>A: form POST code → https://coder-a.example.com/_portal/bounce (same tab)
-  A->>L: rule host=coder-a + path=/_portal/* (priority before Coder)
-  L->>M: POST /internal/bounce/redeem {code, host, iam: signed GetCallerIdentity}
-  M->>S: replay signed request (fixed endpoint)
-  S-->>M: arn …:assumed-role/coder-bounce-a/…
-  M->>M: role→plane allowlist, consume code, check host, mint 5-min "bounce-a" token
-  M-->>L: {session_token, redirect_path, max_age: 300}
-  L-->>P: 302 /external-auth/primary-gitlab/callback?redirect=/_portal/done + Set-Cookie (host-only)
-  P->>C: callback (cookie) → Coder stores oauth_redirect=/_portal/done
-  C-->>P: 307 gitlab.com/oauth/authorize (PKCE + state)
-  P->>G: sign in if needed, consent
-  G-->>P: 302 back to Coder callback ?code=…
-  P->>C: callback (cookie) → Coder exchanges code, stores the user's GitLab link
-  C-->>P: 307 /_portal/done
-  P->>A: GET /_portal/done (cookie)
-  A->>L: same rule
-  L->>M: POST /internal/bounce/done {host, session_token, iam}
-  M->>C: delete that API key (only if it is the "bounce-a" key)
-  M-->>L: {redirect_url: portal}
-  L-->>P: 302 portal/?linked=1 + Set-Cookie coder_session_token=; Max-Age=0
-  P->>M: GET /v1/external-auth/primary-gitlab → authenticated: true
-```
-
-## 3. Flow, step by step (HTTP level)
-
-1. **Status.** Portal → middle `GET /v1/external-auth/primary-gitlab?plane=a` (IdP JWT). Middle calls
-   Coder `GET /api/v2/external-auth/primary-gitlab` **as the user** (with the user's main token, server
-   side) and returns `{authenticated, display_name, login}`. `false` → show "Connect GitLab";
-   `true` → "GitLab: linked".
-2. **Start.** User clicks "Connect GitLab". Portal → middle `POST /v1/bounce/start`
-   `{"plane":"a","purpose":"external-auth","provider":"primary-gitlab"}`. Middle computes the redirect
-   itself (`/external-auth/primary-gitlab/callback?redirect=%2F_portal%2Fdone`), stores a random
-   one-time code `{email, plane, redirect, purpose, exp: now+60s}` and returns
-   `{"bounce_url":"https://coder-a.example.com/_portal/bounce","code":"…","method":"POST"}`.
-3. **Bounce.** Portal builds a hidden form and submits it **in the same tab**:
-   `POST https://coder-a.example.com/_portal/bounce` with body `code=…`. The ALB rule sends it to the Lambda.
-4. **Redeem.** Lambda signs (does not send) an `sts:GetCallerIdentity` request with its execution
-   role, including two signed headers: `X-Middle-Server-Id: middle-prod` and
-   `X-Middle-Code-Sha256: sha256("redeem\n" + code)`. It POSTs
-   `{code, host, iam:{headers, body}}` to middle `/internal/bounce/redeem`.
-5. **Verify + mint.** Middle checks the audience header and the hash, requires both headers to be
-   in `SignedHeaders`, requires the body to be exactly `Action=GetCallerIdentity&Version=2011-06-15`,
-   replays the request to its **configured** STS endpoint, parses the returned ARN
-   (`arn:aws:sts::<acct>:assumed-role/<role>/<session>`), maps account + role → plane via the
-   allowlist, consumes the code (single use), checks code plane == caller plane and host == plane
-   host, then mints a **dedicated 5-minute Coder key `bounce-a`** for the user and returns
-   `{session_token, redirect_path, max_age: 300}`.
-6. **Cookie + redirect.** Lambda answers `302 Location: /external-auth/primary-gitlab/callback?redirect=%2F_portal%2Fdone`
-   with `Set-Cookie: coder_session_token=…; Path=/; Max-Age=300; HttpOnly; Secure; SameSite=Lax`
-   (no `Domain`), `Cache-Control: no-store`, `Referrer-Policy: no-referrer`.
-7. **Coder → GitLab.** The callback without `?code` makes Coder start the provider redirect
-   immediately (skips Coder's "Login with GitLab" page). Coder stores the `redirect` value in its
-   `oauth_redirect` cookie, sets `oauth_state` / PKCE cookies and answers
-   `307 https://gitlab.com/oauth/authorize?...&scope=write_repository+read_api&code_challenge_method=S256`.
-8. **Consent.** The user signs in to GitLab if needed and approves (GitLab auto-approves an app the
-   user already authorized). GitLab redirects to Coder's callback with `?code=…&state=…`; the
-   cookie is sent (top-level navigation, `SameSite=Lax`), Coder exchanges the code and stores the
-   user's GitLab token, then redirects to `oauth_redirect` = `/_portal/done`.
-9. **Done.** `GET /_portal/done` hits the Lambda (same rule). It reads `coder_session_token` from the
-   `Cookie` header, signs a proof bound to `sha256("done\n" + token)` and POSTs
-   `{host, session_token, iam}` to middle `/internal/bounce/done`. Middle verifies the caller the
-   same way, resolves the user from the token, deletes the API key whose id is the token's prefix
-   **only if its name is `bounce-a`**, and returns `{redirect_url: "https://portal.example.com/"}`.
-10. **Back to the portal.** Lambda answers `302 https://portal.example.com/?linked=1` with
-    `Set-Cookie: coder_session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`. The portal
-    strips `?linked=1` and refreshes the status → "GitLab: linked". Visiting `https://coder-a.example.com/`
-    now shows Coder's login page.
-11. **Git in workspaces.** Coder injects the user's GitLab token via `GIT_ASKPASS`, so HTTPS
-    `git clone` / `push` to GitLab works inside workspaces whose template declares the provider.
-
-## 4. Security model
-
-| Question | Answer |
-| --- | --- |
-| How does middle know **which user**? | From the **code**, minted while the user was authenticated to middle (IdP JWT). The Lambda never asserts identity. |
-| How does middle know the caller is **the bounce Lambda**? | The Lambda sends a **pre-signed `sts:GetCallerIdentity`**; middle replays it to a **fixed** STS endpoint and gets the caller's ARN. No shared secret; middle needs no AWS credentials. `GetCallerIdentity` needs no IAM permission, and a forged signature is rejected by STS. (Same technique as HashiCorp Vault's AWS "iam" auth method, whose `X-Vault-AWS-IAM-Server-ID` header plays the role of our `X-Middle-Server-Id`.) |
-| Why can't plane A's Lambda redeem plane B's codes? | The allowlist maps **role → plane**; the code's plane must equal the caller's plane and the request host must equal that plane's host. |
-| Why can't a captured signature be reused? | `X-Middle-Server-Id` (audience: this middle) and `X-Middle-Code-Sha256` = sha256(`action` + `\n` + value) are signed: a proof is valid for one middle, one action (`redeem` or `done`), one value (code or session token). SigV4 signatures expire (~15 min); codes are single-use, 60 s. |
-| What if the code leaks? | It contains no token, is single-use and short-lived, bound to one plane host, and only the trusted Lambda can redeem it. It travels in a form POST body, so it is not in history, `Referer` or ALB access logs. |
-| Open redirect? | Redirect paths are computed by middle; the Lambda only accepts a same-origin path (`/…`, not `//…`) on redeem, and on `/done` only an `http(s)` URL returned by middle (`bounce.done_redirect`). |
-| Can the consent cookie be used to browse the Coder dashboard? | Only during the consent round trip. It carries a **dedicated 5-minute key (`bounce-<plane>`)**, which `/done` revokes; the cookie itself is cleared. `/internal/bounce/done` only ever deletes keys named `bounce-<plane>`, never the user's main `middle-<plane>` key. |
-| What if the user abandons consent mid-way? | The bounce key and cookie expire on their own after 5 minutes. |
-| Workspace app subdomains? | The cookie is host-only on `coder-a.example.com`; it is never sent to `*.coder-a.example.com`. The ALB rule matches the exact plane host only. |
-
-Allowlist matching: STS returns `arn:aws:sts::<acct>:assumed-role/<role-name>/<session>` — the role
-**path is not included**, so match **account + role name**; optionally pin the role's unique id
-(`AROA…`, the prefix of `UserId` before `:`) so a deleted and recreated role with the same name is
-not trusted automatically.
-
-### 4.1 Tokens and timers
-
-| Token | Where it lives | Lifetime | Used for |
-| --- | --- | --- | --- |
-| Main `middle-<plane>` key | **Middle only**; never sent to the browser for consent | 24 h, re-minted | Link status, unlink, workspaces… — server side |
-| Dedicated `bounce-<plane>` key | The consent cookie on the plane host | 5 min, **revoked at `/_portal/done`** | GitLab consent round trip only |
-
-- The bounce key is minted **at redeem** (when the Lambda redeems the code), not when the user clicks;
-  minting first deletes any previous `bounce-<plane>` key, so there is at most one per user.
-- Naming: the bounce key is `bounce-a`, not `middle-a-bounce` — middle treats `middle-a-*` names as
-  legacy variants of its main key and deletes them when re-minting.
-
-| Timer | Covers | Recommended | Notes |
-| --- | --- | --- | --- |
-| One-time code (`code_ttl_seconds`) | Click → form POST to `/_portal/bounce` (sub-second) | 30–60 s | Minted on click, single use, consumed **before** the GitLab page |
-| Consent key + cookie (300 s today) | Bounce → GitLab (sign-in, 2FA/SSO, consent) → `/_portal/done` | 5–10 min | Too short and GitLab's redirect back finds no valid cookie → Coder login page, user restarts from the portal. Longer is low-risk: revoked at `/done`, expires if abandoned |
-
-## 5. What was proven
-
-### 5.1 Bounce mechanics
-
-| Check | Local lab (ALB emulator) | AWS lab (real ALB + Lambda) |
-| --- | --- | --- |
-| `/_portal/*` on plane host → bounce, everything else → Coder | Emulator routing | ALB listener rule (priority 10) → Lambda target group |
-| Lambda identity proven to middle | Assumed role via a lab IAM user | **Real Lambda execution role** (`assumed-role/coder-bounce-plane-a/coder-bounce-plane-a`) verified with STS |
-| 302 + host-only cookie, no `Domain=` | `HttpOnly; SameSite=Lax` (http) | `HttpOnly; Secure; SameSite=Lax` |
-| Cookie alone authenticates on the plane host | `/api/v2/users/me` = alice (401 without cookie) | same |
-| No token/code in URLs | Form POST; clean address bar | same |
-| Replay same code | 403 | 403 |
-| Wrong audience (server id) | 403 `audience mismatch` | 403 |
-| Caller not the trusted role (plain IAM user) | 403 `caller is not an assumed role` | — |
-| Direct call to middle redeem without Lambda | — | 403 |
-
-On AWS the ALB turns the Lambda's relative `Location` into an absolute URL on the same host (harmless).
-
-### 5.2 GitLab external auth (real gitlab.com OAuth app)
-
-| Check | Result |
-| --- | --- |
-| Portal shows link status | `authenticated: false` → "Connect GitLab"; `true` → "GitLab: linked" |
-| Bounce → `/external-auth/primary-gitlab/callback?redirect=%2F_portal%2Fdone` | Coder sets `oauth_redirect=/_portal/done` and 307s to `gitlab.com/oauth/authorize` (PKCE S256, `scope=write_repository read_api`) |
-| GitLab consent → Coder callback with the bounced cookie | Link stored |
-| Coder → `/_portal/done` → portal | Browser lands on the portal, button shows "GitLab: linked" |
-| Consent session after `/done` | Bounce key revoked (`revoked=true`, old token → 401), cookie cleared; Coder URL shows the login page, **not the dashboard** |
-| Git inside the workspace | HTTPS `git clone` / push via Coder's GitLab credentials works |
-| Unlink and re-link | Works; to see GitLab's consent screen again, revoke the app in GitLab → User Settings → Applications → Authorized applications |
-
-## 6. Implementation
-
-### 6.1 GitLab and Coder
-
-**GitLab OAuth application** (user, group or instance level → Applications), one per plane host:
-
-- Redirect URI: `https://coder-a.example.com/external-auth/primary-gitlab/callback` — the path segment
-  must equal `CODER_EXTERNAL_AUTH_0_ID`.
-- Confidential: yes. Scopes: `write_repository`, `read_api` (Coder's GitLab defaults; requesting a
-  scope the app doesn't have fails with "The requested scope is invalid, unknown, or malformed").
-
-**Coder server environment** (per plane):
-
-```bash
-CODER_EXTERNAL_AUTH_0_ID=primary-gitlab
-CODER_EXTERNAL_AUTH_0_TYPE=gitlab
-CODER_EXTERNAL_AUTH_0_CLIENT_ID=<GitLab "Application ID">
-CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=<GitLab secret>
-
-# Self-managed GitLab only:
-CODER_EXTERNAL_AUTH_0_AUTH_URL=https://gitlab.example.com/oauth/authorize
-CODER_EXTERNAL_AUTH_0_TOKEN_URL=https://gitlab.example.com/oauth/token
-CODER_EXTERNAL_AUTH_0_VALIDATE_URL=https://gitlab.example.com/oauth/token/info
-CODER_EXTERNAL_AUTH_0_REVOKE_URL=https://gitlab.example.com/oauth/revoke
-CODER_EXTERNAL_AUTH_0_REGEX=gitlab\.example\.com
-```
-
-The callback URL is built from Coder's access URL (`CODER_ACCESS_URL=https://coder-a.example.com`).
-More than one external-auth provider on a deployment requires a Coder Premium license; one GitLab
-provider does not.
-
-**Template** (declares the provider so workspaces get the token via `GIT_ASKPASS`):
-
-```hcl
-data "coder_external_auth" "gitlab" {
-  id       = "primary-gitlab"
-  optional = true   # builds don't block on it; the portal drives consent
-}
-```
-
-**Coder API calls middle uses** (all with a user's token unless noted):
-
-| Call | Purpose |
-| --- | --- |
-| `GET /api/v2/external-auth/{id}` | Link status → `authenticated`, `display_name`, `user.login` |
-| `DELETE /api/v2/external-auth/{id}` | Unlink the calling user |
-| `GET /api/v2/users/me` | Resolve the user behind a token (at `/done`) |
-| `GET /api/v2/users/{id}/keys/tokens` (owner token) | List the user's API keys (name, id) |
-| `POST /api/v2/users/{id}/keys/tokens` (owner token) | Mint a key: `{"token_name":"bounce-a","lifetime":<nanoseconds>}` |
-| `DELETE /api/v2/users/{id}/keys/{keyid}` (owner token) | Revoke a key. A Coder token is `<keyid>-<secret>`, so the key id is the token's prefix |
-
-### 6.2 Middle
-
-#### Configuration
-
-```yaml
-planes:
-  - id: a
-    url: "https://coder-a.example.com"          # public; also the cookie host
-    api_url: "http://coder-a.internal:3000"     # optional: middle → Coder API over a private URL
-    owner_token: "…"                            # Coder owner token (mints user keys)
-
-portal_origins:
-  - "https://portal.example.com"
-
-bounce:
-  server_id: "middle-prod"                      # audience the Lambda must sign
-  sts_endpoint: "https://sts.us-east-1.amazonaws.com/"   # must match the Lambda's STS_REGION
-  path: "/_portal/bounce"                       # default
-  done_path: "/_portal/done"                    # default
-  done_redirect: "https://portal.example.com/"  # default: first portal_origins entry
-  code_ttl_seconds: 60                          # default
-  cookie_max_age_seconds: 900                   # terminal purpose; external-auth uses 300
-  callers:
-    - plane: a
-      account_id: "111122223333"
-      role_name: "coder-bounce-a"
-      role_id: "AROA…"                          # optional pin
-```
-
-```go
-type BounceConfig struct {
-	ServerID            string         `yaml:"server_id"`     // must match signed X-Middle-Server-Id
-	STSEndpoint         string         `yaml:"sts_endpoint"`  // fixed; never taken from the caller
-	Path                string         `yaml:"path"`          // bounce path on the plane host
-	DonePath            string         `yaml:"done_path"`     // post-consent path on the plane host
-	DoneRedirect        string         `yaml:"done_redirect"` // where /done sends the browser (portal)
-	CodeTTLSeconds      int            `yaml:"code_ttl_seconds"`
-	CookieMaxAgeSeconds int            `yaml:"cookie_max_age_seconds"`
-	Callers             []BounceCaller `yaml:"callers"`
-}
-
-type BounceCaller struct {
-	Plane     string `yaml:"plane"`
-	AccountID string `yaml:"account_id"`
-	RoleName  string `yaml:"role_name"`
-	RoleID    string `yaml:"role_id"` // optional AROA… pin
-}
-```
-
-Defaults applied at load: `path=/_portal/bounce`, `done_path=/_portal/done`,
-`done_redirect=<first portal origin>/`, `sts_endpoint=https://sts.us-east-1.amazonaws.com/`,
-`code_ttl_seconds=60`, `cookie_max_age_seconds=900`.
-
-The SigV4 signature covers the `Host` header, so the Lambda's `STS_REGION` and middle's
-`sts_endpoint` must point at the same regional endpoint.
-
-#### Routes
-
-```go
-mux.Handle("POST /v1/bounce/start", svc.requireAuth(http.HandlerFunc(svc.handleBounceStart)))              // user (IdP JWT)
-mux.HandleFunc("POST /internal/bounce/redeem", svc.handleBounceRedeem)                                     // IAM proof
-mux.HandleFunc("POST /internal/bounce/done", svc.handleBounceDone)                                         // IAM proof
-mux.Handle("GET /v1/external-auth/{id}", svc.requireAuth(http.HandlerFunc(svc.handleExternalAuthStatus)))  // user
-mux.Handle("DELETE /v1/external-auth/{id}", svc.requireAuth(http.HandlerFunc(svc.handleExternalAuthDelete))) // user
-```
-
-Helpers assumed from the rest of middle: `requireAuth` validates the IdP JWT and puts the email in
-the context (`emailFromCtx`); `s.plane(id)` returns the plane (default plane if empty);
-`s.ensureCoderTokenOnPlane(ctx, email, plane)` returns the user's **main** `middle-<plane>` key
-(cached; finds or creates the Coder user and re-mints if the cached key is invalid);
-`cookieHostForURL(url)` returns the hostname of a plane URL; `writeJSON` writes a JSON response.
-
-#### One-time codes
-
-```go
-type bounceCode struct {
-	Email    string
-	Plane    string
-	Redirect string
-	Purpose  string
-	Exp      time.Time
-}
-
-// In-memory (single replica). Production: Redis/DynamoDB with TTL and an atomic
-// get-and-delete so any replica can redeem exactly once.
-type BounceStore struct {
-	mu sync.Mutex
-	m  map[string]bounceCode
-}
-
-func NewBounceStore() *BounceStore { return &BounceStore{m: map[string]bounceCode{}} }
-
-func (b *BounceStore) Issue(rec bounceCode) (string, error) {
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	code := base64.RawURLEncoding.EncodeToString(raw)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	for k, v := range b.m {
-		if now.After(v.Exp) {
-			delete(b.m, k)
-		}
-	}
-	b.m[code] = rec
-	return code, nil
-}
-
-func (b *BounceStore) Consume(code string) (bounceCode, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	rec, ok := b.m[code]
-	delete(b.m, code)
-	if !ok || time.Now().After(rec.Exp) {
-		return bounceCode{}, false
-	}
-	return rec, true
-}
-```
-
-#### Start (user-authenticated)
-
-```go
-var providerIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-
-// POST /v1/bounce/start  {plane, purpose: "external-auth"|"terminal", provider?, workspace_id?}
-// Redirect targets are computed here (never taken from the client) to avoid open redirects.
-func (s *Service) handleBounceStart(w http.ResponseWriter, r *http.Request) {
-	email := emailFromCtx(r.Context())
-	var in struct {
-		Plane       string `json:"plane"`
-		Purpose     string `json:"purpose"`
-		WorkspaceID string `json:"workspace_id"`
-		Provider    string `json:"provider"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&in); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	p, err := s.plane(in.Plane)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if !s.bounceTrustsPlane(p.ID) {
-		http.Error(w, "bounce not configured for plane "+p.ID, http.StatusNotImplemented)
-		return
-	}
-
-	var redirect string
-	switch in.Purpose {
-	case "external-auth":
-		if !providerIDRe.MatchString(in.Provider) {
-			http.Error(w, "invalid provider id", http.StatusBadRequest)
-			return
-		}
-		// /callback without ?code starts Coder's OAuth redirect to the provider directly
-		// (skips the "Login with …" button on Coder's page). After linking, Coder returns to
-		// DonePath, where the bounce clears the cookie and revokes the bounce token.
-		redirect = "/external-auth/" + in.Provider + "/callback?redirect=" + url.QueryEscape(s.Config.Bounce.DonePath)
-	case "terminal": // optional: Coder's built-in web terminal (not needed with ttyd)
-		tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		raw, err := p.Client.WorkspaceRaw(r.Context(), tok, in.WorkspaceID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		me, err := p.Client.GetMe(r.Context(), tok)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		name, _ := raw["name"].(string)
-		agent := firstAgentName(raw)
-		if name == "" || agent == "" {
-			http.Error(w, "workspace has no agent yet", http.StatusConflict)
-			return
-		}
-		redirect = fmt.Sprintf("/@%s/%s.%s/terminal",
-			url.PathEscape(me.Username), url.PathEscape(name), url.PathEscape(agent))
-	default:
-		http.Error(w, "purpose must be terminal or external-auth", http.StatusBadRequest)
-		return
-	}
-
-	ttl := time.Duration(s.Config.Bounce.CodeTTLSeconds) * time.Second
-	code, err := s.Bounce.Issue(bounceCode{
-		Email: email, Plane: p.ID, Redirect: redirect, Purpose: in.Purpose, Exp: time.Now().Add(ttl),
-	})
-	if err != nil {
-		http.Error(w, "code issue failed", http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"bounce_url": strings.TrimRight(p.URL, "/") + s.Config.Bounce.Path,
-		"code":       code,
-		"method":     "POST",
-		"expires_in": int(ttl.Seconds()),
-		"plane_id":   p.ID,
-	})
-}
-
-func (s *Service) bounceTrustsPlane(planeID string) bool {
-	for _, c := range s.Config.Bounce.Callers {
-		if c.Plane == planeID {
-			return true
-		}
-	}
-	return false
-}
-```
-
-#### Redeem (IAM-authenticated)
-
-```go
-type iamProof struct {
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"` // base64 of the signed STS form body
-}
-
-const bounceConsentTTLSeconds = 300
-
-// "bounce-a", not "middle-a-bounce": middle-a-* names are treated as the main key's legacy variants.
-func bounceTokenName(planeID string) string { return "bounce-" + planeID }
-
-// POST /internal/bounce/redeem  {code, host, iam}
-// Caller auth is the IAM proof only (no user auth): the user is resolved from the code.
-func (s *Service) handleBounceRedeem(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Code string   `json:"code"`
-		Host string   `json:"host"`
-		IAM  iamProof `json:"iam"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&in); err != nil || in.Code == "" {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	callerPlane, callerARN, err := s.verifyBounceCaller(r.Context(), in.IAM, "redeem", in.Code)
-	if err != nil {
-		log.Printf("bounce redeem rejected caller: %v", err)
-		http.Error(w, "caller not trusted", http.StatusForbidden)
-		return
-	}
-	rec, ok := s.Bounce.Consume(in.Code)
-	if !ok {
-		http.Error(w, "invalid or expired code", http.StatusUnauthorized)
-		return
-	}
-	if rec.Plane != callerPlane {
-		http.Error(w, "plane mismatch", http.StatusForbidden)
-		return
-	}
-	p, err := s.plane(rec.Plane)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	host := in.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	if !strings.EqualFold(host, cookieHostForURL(p.URL)) {
-		http.Error(w, "host mismatch", http.StatusForbidden)
-		return
-	}
-	maxAge := s.Config.Bounce.CookieMaxAgeSeconds
-	var tok string
-	if rec.Purpose == "external-auth" {
-		// Dedicated short-lived key: revoked at DonePath so the cookie can't be reused for
-		// the Coder dashboard, without touching the user's main middle-<plane> key.
-		maxAge = bounceConsentTTLSeconds
-		tok, err = s.mintBounceToken(r.Context(), rec.Email, p, time.Duration(maxAge)*time.Second)
-	} else {
-		tok, err = s.ensureCoderTokenOnPlane(r.Context(), rec.Email, p.ID)
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	log.Printf("bounce redeem ok email=%s plane=%s purpose=%s caller=%s", rec.Email, p.ID, rec.Purpose, callerARN)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session_token": tok,
-		"redirect_path": rec.Redirect,
-		"max_age":       maxAge,
-	})
-}
-
-func (s *Service) mintBounceToken(ctx context.Context, email string, p *Plane, lifetime time.Duration) (string, error) {
-	user, err := p.Client.FindOrCreateUser(ctx, email)
-	if err != nil {
-		return "", err
-	}
-	return p.Client.EnsureReservedUserTokenLifetime(ctx, user.ID, bounceTokenName(p.ID), lifetime)
-}
-```
-
-#### Done (IAM-authenticated)
-
-```go
-// POST /internal/bounce/done  {host, session_token, iam}
-// Called by the bounce at DonePath after Coder finishes external auth. Revokes the cookie's
-// token only if it is this plane's bounce key, and returns where to send the browser.
-func (s *Service) handleBounceDone(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Host         string   `json:"host"`
-		SessionToken string   `json:"session_token"`
-		IAM          iamProof `json:"iam"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&in); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	callerPlane, callerARN, err := s.verifyBounceCaller(r.Context(), in.IAM, "done", in.SessionToken)
-	if err != nil {
-		log.Printf("bounce done rejected caller: %v", err)
-		http.Error(w, "caller not trusted", http.StatusForbidden)
-		return
-	}
-	p, err := s.plane(callerPlane)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	host := in.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	if !strings.EqualFold(host, cookieHostForURL(p.URL)) {
-		http.Error(w, "host mismatch", http.StatusForbidden)
-		return
-	}
-	revoked := false
-	if keyID, _, ok := strings.Cut(in.SessionToken, "-"); ok && keyID != "" {
-		if me, err := p.Client.GetMe(r.Context(), in.SessionToken); err == nil {
-			keys, _ := p.Client.ListUserAPIKeys(r.Context(), me.ID)
-			for _, k := range keys {
-				if k.ID == keyID && k.TokenName == bounceTokenName(p.ID) {
-					revoked = p.Client.DeleteUserAPIKey(r.Context(), me.ID, k.ID) == nil
-				}
-			}
-			log.Printf("bounce done user=%s plane=%s revoked=%v caller=%s", me.Username, p.ID, revoked, callerARN)
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"redirect_url": s.Config.Bounce.DoneRedirect,
-		"revoked":      revoked,
-	})
-}
-```
-
-#### Caller verification (STS replay + allowlist)
-
-```go
-const stsGetCallerIdentityBody = "Action=GetCallerIdentity&Version=2011-06-15"
-
-var forwardedSTSHeaders = []string{
-	"authorization", "x-amz-date", "x-amz-security-token", "content-type",
-	"x-middle-server-id", "x-middle-code-sha256",
-}
-
-// The signature is bound to sha256(action + "\n" + value) so a proof for one action
-// ("redeem" with a code, "done" with a session token) can't be replayed for the other.
-func (s *Service) verifyBounceCaller(ctx context.Context, proof iamProof, action, value string) (plane, arn string, err error) {
-	cfg := s.Config.Bounce
-	if cfg.ServerID == "" || len(cfg.Callers) == 0 {
-		return "", "", errors.New("bounce not configured")
-	}
-	h := map[string]string{}
-	for k, v := range proof.Headers {
-		h[strings.ToLower(k)] = v
-	}
-	if h["x-middle-server-id"] != cfg.ServerID {
-		return "", "", errors.New("audience mismatch")
-	}
-	sum := sha256.Sum256([]byte(action + "\n" + value))
-	if h["x-middle-code-sha256"] != hex.EncodeToString(sum[:]) {
-		return "", "", errors.New("signature not bound to this request")
-	}
-	signed := signedHeaderSet(h["authorization"])
-	if !signed["x-middle-server-id"] || !signed["x-middle-code-sha256"] {
-		return "", "", errors.New("audience/code headers not signed")
-	}
-	body, err := base64.StdEncoding.DecodeString(proof.Body)
-	if err != nil || string(body) != stsGetCallerIdentityBody {
-		return "", "", errors.New("unexpected STS action")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.STSEndpoint, bytes.NewReader(body))
-	if err != nil {
-		return "", "", err
-	}
-	for _, k := range forwardedSTSHeaders {
-		if v := h[k]; v != "" {
-			req.Header.Set(k, v)
-		}
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("sts: %w", err)
-	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-	if res.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("sts rejected signature (%d)", res.StatusCode)
-	}
-	var out struct {
-		Result struct {
-			Arn     string `xml:"Arn"`
-			UserID  string `xml:"UserId"`
-			Account string `xml:"Account"`
-		} `xml:"GetCallerIdentityResult"`
-	}
-	if err := xml.Unmarshal(raw, &out); err != nil {
-		return "", "", fmt.Errorf("sts response: %w", err)
-	}
-	arn = out.Result.Arn
-	// arn:aws:sts::<acct>:assumed-role/<role-name>/<session>  (role path is not included)
-	fields := strings.SplitN(arn, ":", 6)
-	if len(fields) != 6 {
-		return "", arn, errors.New("unexpected arn")
-	}
-	parts := strings.Split(fields[5], "/")
-	if len(parts) < 3 || parts[0] != "assumed-role" {
-		return "", arn, errors.New("caller is not an assumed role")
-	}
-	roleID := strings.SplitN(out.Result.UserID, ":", 2)[0]
-	for _, c := range cfg.Callers {
-		if c.AccountID == out.Result.Account && c.RoleName == parts[1] &&
-			(c.RoleID == "" || c.RoleID == roleID) {
-			return c.Plane, arn, nil
-		}
-	}
-	return "", arn, fmt.Errorf("role %s not in allowlist", arn)
-}
-
-func signedHeaderSet(authz string) map[string]bool {
-	out := map[string]bool{}
-	i := strings.Index(authz, "SignedHeaders=")
-	if i < 0 {
-		return out
-	}
-	rest := authz[i+len("SignedHeaders="):]
-	if j := strings.IndexAny(rest, ", "); j >= 0 {
-		rest = rest[:j]
-	}
-	for _, name := range strings.Split(rest, ";") {
-		out[strings.ToLower(name)] = true
-	}
-	return out
-}
-```
-
-#### GitLab status and unlink (user-authenticated)
-
-```go
-// GET /v1/external-auth/{id}?plane=a — the user's link status on that plane.
-func (s *Service) handleExternalAuthStatus(w http.ResponseWriter, r *http.Request) {
-	email := emailFromCtx(r.Context())
-	providerID := r.PathValue("id")
-	if !providerIDRe.MatchString(providerID) {
-		http.Error(w, "invalid provider id", http.StatusBadRequest)
-		return
-	}
-	p, err := s.plane(r.URL.Query().Get("plane"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	st, err := p.Client.ExternalAuth(r.Context(), tok, providerID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	login := ""
-	if st.User != nil {
-		login = st.User.Login
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"provider_id":   providerID,
-		"plane_id":      p.ID,
-		"authenticated": st.Authenticated,
-		"display_name":  st.DisplayName,
-		"login":         login,
-	})
-}
-
-// DELETE /v1/external-auth/{id}?plane=a — unlink ("Disconnect GitLab").
-func (s *Service) handleExternalAuthDelete(w http.ResponseWriter, r *http.Request) {
-	email := emailFromCtx(r.Context())
-	providerID := r.PathValue("id")
-	if !providerIDRe.MatchString(providerID) {
-		http.Error(w, "invalid provider id", http.StatusBadRequest)
-		return
-	}
-	p, err := s.plane(r.URL.Query().Get("plane"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	if err := p.Client.DeleteExternalAuth(r.Context(), tok, providerID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"provider_id": providerID, "plane_id": p.ID, "authenticated": false})
-}
-```
-
-#### Coder client helpers
-
-```go
-type externalAuthStatus struct {
-	Authenticated bool   `json:"authenticated"`
-	DisplayName   string `json:"display_name"`
-	User          *struct {
-		Login string `json:"login"`
-	} `json:"user"`
-}
-
-func (c *CoderClient) ExternalAuth(ctx context.Context, userToken, providerID string) (*externalAuthStatus, error) {
-	var st externalAuthStatus
-	err := c.do(ctx, http.MethodGet, "/api/v2/external-auth/"+url.PathEscape(providerID), userToken, nil, &st)
-	return &st, err
-}
-
-func (c *CoderClient) DeleteExternalAuth(ctx context.Context, userToken, providerID string) error {
-	return c.do(ctx, http.MethodDelete, "/api/v2/external-auth/"+url.PathEscape(providerID), userToken, nil, nil)
-}
-
-func (c *CoderClient) DeleteUserAPIKey(ctx context.Context, userID, keyID string) error {
-	return c.do(ctx, http.MethodDelete, "/api/v2/users/"+userID+"/keys/"+keyID, c.OwnerToken, nil, nil)
-}
-
-// EnsureReservedUserTokenLifetime deletes any existing key with this name, then mints a fresh one.
-func (c *CoderClient) EnsureReservedUserTokenLifetime(ctx context.Context, userID, name string, lifetime time.Duration) (string, error) {
-	keys, err := c.ListUserAPIKeys(ctx, userID) // GET /api/v2/users/{id}/keys/tokens (owner token)
-	if err != nil {
-		return "", err
-	}
-	for _, k := range keys {
-		if k.TokenName == name {
-			if err := c.DeleteUserAPIKey(ctx, userID, k.ID); err != nil {
-				return "", err
-			}
-		}
-	}
-	body := map[string]any{"token_name": name, "lifetime": int64(lifetime)} // Coder expects nanoseconds
-	var resp struct {
-		Key string `json:"key"`
-	}
-	if err := c.do(ctx, http.MethodPost, "/api/v2/users/"+userID+"/keys/tokens", c.OwnerToken, body, &resp); err != nil {
-		return "", err
-	}
-	if resp.Key == "" {
-		return "", fmt.Errorf("empty token key from coder")
-	}
-	return resp.Key, nil
-}
-```
-
-`c.do(ctx, method, path, token, body, out)` sends JSON to `api_url` (or `url`) with the
-`Coder-Session-Token` header and decodes the JSON response; any status ≥ 300 is an error.
-
-### 6.3 Bounce Lambda
-
-Go module with `github.com/aws/aws-lambda-go` and `github.com/aws/aws-sdk-go-v2`
-(`config`, `aws/signer/v4`, `credentials/stscreds`, `service/sts`).
-
-```go
-// Package bounce is the plane-host cookie bounce, shaped as an ALB → Lambda target.
-// It never mints anything: it proves its IAM identity to middle (signed
-// sts:GetCallerIdentity), redeems the portal's one-time code, then answers the
-// browser with a host-only coder_session_token cookie and a 302.
-package bounce
-
-import (
-	"bytes"
-	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"os"
-	"strings"
-	"time"
-
-	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-)
-
-const stsBody = "Action=GetCallerIdentity&Version=2011-06-15"
-
-type Handler struct {
-	MiddleURL    string // e.g. https://middle.example.com
-	ServerID     string // audience; must match middle bounce.server_id
-	Region       string // STS signing region (same endpoint middle replays to)
-	CookieSecure bool
-	Creds        aws.CredentialsProvider
-	HTTP         *http.Client
-}
-
-// FromEnv reads MIDDLE_URL, MIDDLE_SERVER_ID, STS_REGION, COOKIE_SECURE and the
-// optional BOUNCE_ASSUME_ROLE_ARN (local runs only; a real Lambda uses its execution role).
-func FromEnv(ctx context.Context) (*Handler, error) {
-	region := envOr("STS_REGION", "us-east-1")
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-	if err != nil {
-		return nil, err
-	}
-	creds := cfg.Credentials
-	if role := os.Getenv("BOUNCE_ASSUME_ROLE_ARN"); role != "" {
-		creds = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), role,
-			func(o *stscreds.AssumeRoleOptions) { o.RoleSessionName = "bounce-local" }))
-	}
-	h := &Handler{
-		MiddleURL:    strings.TrimRight(os.Getenv("MIDDLE_URL"), "/"),
-		ServerID:     os.Getenv("MIDDLE_SERVER_ID"),
-		Region:       region,
-		CookieSecure: envOr("COOKIE_SECURE", "true") != "false",
-		Creds:        creds,
-		HTTP:         &http.Client{Timeout: 8 * time.Second},
-	}
-	if h.MiddleURL == "" || h.ServerID == "" {
-		return nil, fmt.Errorf("MIDDLE_URL and MIDDLE_SERVER_ID are required")
-	}
-	return h, nil
-}
-
-// Handle serves both /_portal/bounce and /_portal/done. With multi-value headers enabled on the
-// target group the ALB only accepts multiValueHeaders in the response, so the reply mirrors the
-// request's format.
-func (h *Handler) Handle(ctx context.Context, ev events.ALBTargetGroupRequest) (events.ALBTargetGroupResponse, error) {
-	var res events.ALBTargetGroupResponse
-	var err error
-	if strings.HasSuffix(ev.Path, "/done") {
-		res, err = h.done(ctx, ev)
-	} else {
-		res, err = h.bounce(ctx, ev)
-	}
-	if len(ev.MultiValueHeaders) > 0 && res.Headers != nil {
-		res.MultiValueHeaders = map[string][]string{}
-		for k, v := range res.Headers {
-			res.MultiValueHeaders[k] = []string{v}
-		}
-		res.Headers = nil
-	}
-	return res, err
-}
-
-func (h *Handler) bounce(ctx context.Context, ev events.ALBTargetGroupRequest) (events.ALBTargetGroupResponse, error) {
-	code := codeFromEvent(ev)
-	host := header(ev, "host")
-	if code == "" {
-		return page(http.StatusBadRequest, "Missing code."), nil
-	}
-	proof, err := h.signedIdentity(ctx, "redeem", code)
-	if err != nil {
-		log.Printf("bounce: sign identity: %v", err)
-		return page(http.StatusInternalServerError, "Bounce misconfigured."), nil
-	}
-	body, _ := json.Marshal(map[string]any{"code": code, "host": host, "iam": proof})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.MiddleURL+"/internal/bounce/redeem", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	res, err := h.HTTP.Do(req)
-	if err != nil {
-		log.Printf("bounce: redeem: %v", err)
-		return page(http.StatusBadGateway, "Middle unreachable, retry from the portal."), nil
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-		log.Printf("bounce: redeem %d: %s", res.StatusCode, strings.TrimSpace(string(msg)))
-		return page(http.StatusForbidden, "This link expired or was already used. Retry from the portal."), nil
-	}
-	var out struct {
-		SessionToken string `json:"session_token"`
-		RedirectPath string `json:"redirect_path"`
-		MaxAge       int    `json:"max_age"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || out.SessionToken == "" ||
-		!strings.HasPrefix(out.RedirectPath, "/") || strings.HasPrefix(out.RedirectPath, "//") {
-		return page(http.StatusBadGateway, "Unexpected middle response."), nil
-	}
-	cookie := (&http.Cookie{
-		Name:     "coder_session_token",
-		Value:    out.SessionToken,
-		Path:     "/",
-		MaxAge:   out.MaxAge,
-		HttpOnly: true,
-		Secure:   h.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-	}).String()
-	return events.ALBTargetGroupResponse{
-		StatusCode:        http.StatusFound,
-		StatusDescription: "302 Found",
-		Headers: map[string]string{
-			"Location":        out.RedirectPath,
-			"Set-Cookie":      cookie,
-			"Cache-Control":   "no-store",
-			"Referrer-Policy": "no-referrer",
-		},
-	}, nil
-}
-
-// done is where Coder lands after external auth (?redirect=/_portal/done). It asks middle to
-// revoke the bounce token carried by the cookie, clears the cookie, and returns to the portal,
-// so the consent session can't be reused for the Coder dashboard.
-func (h *Handler) done(ctx context.Context, ev events.ALBTargetGroupRequest) (events.ALBTargetGroupResponse, error) {
-	token := cookieValue(header(ev, "cookie"), "coder_session_token")
-	proof, err := h.signedIdentity(ctx, "done", token)
-	if err != nil {
-		log.Printf("bounce done: sign identity: %v", err)
-		return page(http.StatusInternalServerError, "Bounce misconfigured."), nil
-	}
-	body, _ := json.Marshal(map[string]any{"host": header(ev, "host"), "session_token": token, "iam": proof})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.MiddleURL+"/internal/bounce/done", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	clear := (&http.Cookie{
-		Name: "coder_session_token", Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: h.CookieSecure, SameSite: http.SameSiteLaxMode,
-	}).String()
-	res, err := h.HTTP.Do(req)
-	if err != nil {
-		log.Printf("bounce done: %v", err)
-		return withCookie(page(http.StatusBadGateway, "Linked, but middle was unreachable. Return to the portal."), clear), nil
-	}
-	defer res.Body.Close()
-	var out struct {
-		RedirectURL string `json:"redirect_url"`
-		Revoked     bool   `json:"revoked"`
-	}
-	if res.StatusCode != http.StatusOK || json.NewDecoder(res.Body).Decode(&out) != nil {
-		log.Printf("bounce done: middle status %d", res.StatusCode)
-		return withCookie(page(http.StatusForbidden, "Linked. Return to the portal."), clear), nil
-	}
-	u, err := url.Parse(out.RedirectURL)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return withCookie(page(http.StatusOK, "Linked. Return to the portal."), clear), nil
-	}
-	q := u.Query()
-	q.Set("linked", "1")
-	u.RawQuery = q.Encode()
-	log.Printf("bounce done: revoked=%v", out.Revoked)
-	return events.ALBTargetGroupResponse{
-		StatusCode:        http.StatusFound,
-		StatusDescription: "302 Found",
-		Headers: map[string]string{
-			"Location":        u.String(),
-			"Set-Cookie":      clear,
-			"Cache-Control":   "no-store",
-			"Referrer-Policy": "no-referrer",
-		},
-	}, nil
-}
-
-func withCookie(r events.ALBTargetGroupResponse, c string) events.ALBTargetGroupResponse {
-	r.Headers["Set-Cookie"] = c
-	return r
-}
-
-func cookieValue(raw, name string) string {
-	if raw == "" {
-		return ""
-	}
-	req := http.Request{Header: http.Header{"Cookie": {raw}}}
-	if c, err := req.Cookie(name); err == nil {
-		return c.Value
-	}
-	return ""
-}
-
-// signedIdentity builds (but does not send) an sts:GetCallerIdentity request signed with
-// this function's role. X-Middle-Server-Id and X-Middle-Code-Sha256 (= sha256(action\nvalue))
-// are signed so the proof is only valid for this middle, this action and this value.
-func (h *Handler) signedIdentity(ctx context.Context, action, value string) (map[string]any, error) {
-	creds, err := h.Creds.Retrieve(ctx)
-	if err != nil {
-		return nil, err
-	}
-	endpoint := fmt.Sprintf("https://sts.%s.amazonaws.com/", h.Region)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(stsBody))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-	req.Header.Set("X-Middle-Server-Id", h.ServerID)
-	codeSum := sha256.Sum256([]byte(action + "\n" + value))
-	req.Header.Set("X-Middle-Code-Sha256", hex.EncodeToString(codeSum[:]))
-	bodySum := sha256.Sum256([]byte(stsBody))
-	if err := v4.NewSigner().SignHTTP(ctx, creds, req, hex.EncodeToString(bodySum[:]), "sts", h.Region, time.Now()); err != nil {
-		return nil, err
-	}
-	headers := map[string]string{}
-	for k := range req.Header {
-		headers[strings.ToLower(k)] = req.Header.Get(k)
-	}
-	return map[string]any{
-		"headers": headers,
-		"body":    base64.StdEncoding.EncodeToString([]byte(stsBody)),
-	}, nil
-}
-
-// codeFromEvent accepts a form POST (preferred: keeps the code out of URLs and ALB
-// access logs) or ?code= on GET.
-func codeFromEvent(ev events.ALBTargetGroupRequest) string {
-	if strings.EqualFold(ev.HTTPMethod, http.MethodPost) {
-		body := ev.Body
-		if ev.IsBase64Encoded {
-			if b, err := base64.StdEncoding.DecodeString(body); err == nil {
-				body = string(b)
-			}
-		}
-		if v, err := url.ParseQuery(body); err == nil && v.Get("code") != "" {
-			return v.Get("code")
-		}
-	}
-	raw := ev.QueryStringParameters["code"] // ALB passes query values still percent-encoded
-	if vs := ev.MultiValueQueryStringParameters["code"]; raw == "" && len(vs) > 0 {
-		raw = vs[0]
-	}
-	if v, err := url.QueryUnescape(raw); err == nil {
-		return v
-	}
-	return raw
-}
-
-// header reads single- or multi-value ALB headers. Without multi-value headers the ALB keeps only
-// the last of repeated headers, which can drop cookies (HTTP/2 browsers may split them), so enable
-// lambda.multi_value_headers.enabled on the target group.
-func header(ev events.ALBTargetGroupRequest, name string) string {
-	for k, v := range ev.Headers {
-		if strings.EqualFold(k, name) {
-			return v
-		}
-	}
-	for k, vs := range ev.MultiValueHeaders {
-		if strings.EqualFold(k, name) {
-			if strings.EqualFold(name, "cookie") {
-				return strings.Join(vs, "; ")
-			}
-			if len(vs) > 0 {
-				return vs[0]
-			}
-		}
-	}
-	return ""
-}
-
-func page(status int, msg string) events.ALBTargetGroupResponse {
-	return events.ALBTargetGroupResponse{
-		StatusCode:        status,
-		StatusDescription: fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Headers:           map[string]string{"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
-		Body:              msg + "\n",
-	}
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-```
-
-Entrypoint:
-
-```go
-package main
-
-import (
-	"context"
-	"log"
-
-	"github.com/aws/aws-lambda-go/lambda"
-
-	"bouncelambda/bounce"
-)
-
-func main() {
-	h, err := bounce.FromEnv(context.Background())
-	if err != nil {
-		log.Fatal(err)
-	}
-	lambda.Start(h.Handle)
-}
-```
-
-Build and package (runtime `provided.al2023`, arm64):
-
-```bash
-GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap ./cmd/lambda
-zip lambda.zip bootstrap
-```
-
-Environment: `MIDDLE_URL`, `MIDDLE_SERVER_ID` (= middle `bounce.server_id`), `STS_REGION`
-(= region of middle's `sts_endpoint`), `COOKIE_SECURE=true`.
-
-ALB ↔ Lambda facts the handler relies on:
-
-- The ALB sends a JSON event (`httpMethod`, `path`, `queryStringParameters`, `headers` with lowercase
-  names, `body`, `isBase64Encoded`) and adds `X-Forwarded-For/Port/Proto`. Query values arrive
-  **still percent-encoded**. Form bodies (`application/x-www-form-urlencoded`) arrive base64-encoded.
-- The response is `statusCode`, `statusDescription`, `headers`, optional `body`; `Set-Cookie` in
-  `headers` is passed to the browser.
-- Without multi-value headers the ALB keeps only the **last** value of a repeated request header
-  and accepts one value per response header. With `lambda.multi_value_headers.enabled` it sends
-  `multiValueHeaders` / `multiValueQueryStringParameters` and **requires** `multiValueHeaders` in
-  the response. The handler supports both; enable it so `/done` always sees the full `Cookie`.
-- Request and response bodies are limited to 1 MB; WebSockets are not supported (not needed).
-
-### 6.4 Portal
-
-Button (top bar):
-
-```html
-<button type="button" id="gitlabConnect" class="btn btn--ghost" title="Link GitLab for git clone/push in workspaces">
-  <span class="btn-label">GitLab: checking…</span>
-</button>
-```
-
-Logic (`api(path, opts)` is the portal's fetch wrapper: `MIDDLE_URL + path`, `Authorization: Bearer <IdP JWT>`,
-JSON, throws on non-2xx):
-
-```javascript
-const GITLAB_PROVIDER = "primary-gitlab";
-
-async function gitlabStatus(planeId = "") {
-  const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
-  return api(`/v1/external-auth/${GITLAB_PROVIDER}${q}`);
-}
-
-async function refreshGitLabStatus() {
-  const btn = document.getElementById("gitlabConnect");
-  if (!btn) return null;
-  const label = btn.querySelector(".btn-label");
-  try {
-    const st = await gitlabStatus();
-    label.textContent = st.authenticated ? `GitLab: linked${st.login ? ` (${st.login})` : ""}` : "Connect GitLab";
-    btn.dataset.linked = st.authenticated ? "1" : "";
-    return st;
-  } catch {
-    label.textContent = "GitLab: unavailable";
-    return null;
-  }
-}
-
-/**
- * Cookie-only Coder pages via the plane-host bounce: middle returns a one-time code; we POST it
- * to {plane}/_portal/bounce so it never appears in a URL.
- */
-async function openViaBounce(body, { sameTab = false } = {}) {
-  const w = sameTab ? window : window.open("about:blank", "_blank"); // open synchronously (popup blockers)
-  if (!w) throw new Error("popup blocked — allow popups to open Coder pages");
-  if (!sameTab) w.opener = null;
-  try {
-    const data = await api("/v1/bounce/start", { method: "POST", body: JSON.stringify(body) });
-    const doc = w.document;
-    const form = doc.createElement("form");
-    form.method = "POST";
-    form.action = data.bounce_url;
-    const input = doc.createElement("input");
-    input.type = "hidden";
-    input.name = "code";
-    input.value = data.code;
-    form.appendChild(input);
-    doc.body.appendChild(form);
-    form.submit();
-  } catch (e) {
-    if (!sameTab) w.close();
-    throw e;
-  }
-}
-
-/**
- * Consent runs on the plane host (cookie-only page) via the bounce, in this tab. Coder then
- * redirects to {plane}/_portal/done, which revokes the bounce token, clears the cookie and
- * sends the browser back here with ?linked=1.
- */
-async function connectGitLab(planeId = "") {
-  await openViaBounce({ plane: planeId, purpose: "external-auth", provider: GITLAB_PROVIDER }, { sameTab: true });
-}
-
-async function disconnectGitLab(planeId = "") {
-  const q = planeId ? `?plane=${encodeURIComponent(planeId)}` : "";
-  await api(`/v1/external-auth/${GITLAB_PROVIDER}${q}`, { method: "DELETE" });
-  return refreshGitLabStatus();
-}
-
-document.getElementById("gitlabConnect")?.addEventListener("click", async (ev) => {
-  const btn = ev.currentTarget;
-  try {
-    if (btn.dataset.linked) {
-      if (confirm("Disconnect GitLab from Coder?")) await disconnectGitLab();
-      return;
-    }
-    await connectGitLab();
-  } catch (e) {
-    alert(String(e.message || e));
-  }
-});
-
-if (new URLSearchParams(location.search).has("linked")) {
-  history.replaceState(null, "", location.pathname);
-}
-
-// After login is shown: refreshGitLabStatus();
-```
-
-The portal's login must survive a same-tab round trip (store the IdP session in `localStorage`
-or re-login silently); the return lands on `done_redirect`, so that must be the origin the user
-logged in on.
-
-### 6.5 AWS resources (per plane)
-
-Terraform (same resources were created with the AWS CLI in the validation lab):
-
-```hcl
-# Execution role: its ARN is what middle trusts (allowlist account + role name [+ role id]).
-resource "aws_iam_role" "bounce" {
-  name = "coder-bounce-a"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "lambda.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-}
-
-# Logs + ENIs for a Lambda in a VPC. No other permission is needed (GetCallerIdentity needs none).
-resource "aws_iam_role_policy_attachment" "bounce_vpc" {
-  role       = aws_iam_role.bounce.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
-resource "aws_security_group" "bounce" {
-  name   = "coder-bounce-a"
-  vpc_id = var.vpc_id
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-# Middle's security group must allow ingress from aws_security_group.bounce on middle's port.
-
-resource "aws_lambda_function" "bounce" {
-  function_name    = "coder-bounce-a"
-  role             = aws_iam_role.bounce.arn
-  runtime          = "provided.al2023"
-  architectures    = ["arm64"]
-  handler          = "bootstrap"
-  filename         = "lambda.zip"
-  source_code_hash = filebase64sha256("lambda.zip")
-  timeout          = 10
-  memory_size      = 256
-
-  vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [aws_security_group.bounce.id]
-  }
-
-  environment {
-    variables = {
-      MIDDLE_URL       = "https://middle.internal.example.com"
-      MIDDLE_SERVER_ID = "middle-prod"
-      STS_REGION       = "us-east-1"
-      COOKIE_SECURE    = "true"
-    }
-  }
-}
-
-resource "aws_lb_target_group" "bounce" {
-  name                               = "coder-bounce-a"
-  target_type                        = "lambda"
-  lambda_multi_value_headers_enabled = true
-}
-
-resource "aws_lambda_permission" "alb" {
-  statement_id  = "alb-invoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.bounce.function_name
-  principal     = "elasticloadbalancing.amazonaws.com"
-  source_arn    = aws_lb_target_group.bounce.arn
-}
-
-resource "aws_lb_target_group_attachment" "bounce" {
-  target_group_arn = aws_lb_target_group.bounce.arn
-  target_id        = aws_lambda_function.bounce.arn
-  depends_on       = [aws_lambda_permission.alb]
-}
-
-# Highest priority on the plane's HTTPS listener; exact plane host only (not *.coder-a…).
-resource "aws_lb_listener_rule" "bounce" {
-  listener_arn = var.https_listener_arn
-  priority     = 10
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.bounce.arn
-  }
-  condition {
-    host_header { values = ["coder-a.example.com"] }
-  }
-  condition {
-    path_pattern { values = ["/_portal/*"] }
-  }
-}
-```
-
-Listener layout:
+### Running `fuse-overlayfs` directly cannot work
 
 ```text
-HTTPS :443 (certificate covers coder-a.example.com and *.coder-a.example.com)
-  priority 10 : host = coder-a.example.com AND path = /_portal/*  → Lambda target group coder-bounce-a
-  lower prio  : coder-a.example.com, *.coder-a.example.com       → coderd
+fusermount3: mount failed: Operation not permitted
+fuse-overlayfs: cannot mount: Operation not permitted
 ```
 
-One rule covers both `/_portal/bounce` and `/_portal/done`. The ALB can only forward to targets
-(instances, IPs, Lambda), not to an arbitrary URL — hence the Lambda, which then calls middle
-wherever it runs.
+1. `fuse-overlayfs` (libfuse) first calls `mount()` itself. The pod has no capabilities, so the kernel refuses.
+2. libfuse then falls back to the setuid helper `fusermount3`. With `allowPrivilegeEscalation: false` (`NoNewPrivs: 1`) the setuid bit is ignored; with `drop: ["ALL"]` the bounding set is empty, so even setuid root gains nothing. Its `mount()` fails too.
 
-**EKS with the AWS Load Balancer Controller** (Coder exposed by an Ingress): create the Lambda,
-target group and permission with Terraform as above, then add an Ingress in the **same IngressGroup**
-as Coder's, ordered first, forwarding `/_portal/` to that external target group:
+Adding `SETUID`, `SETGID`, `SETFCAP` and `allowPrivilegeEscalation: true` (PSA `baseline`) does not help: `fusermount3` then runs with those three capabilities, but mounting needs `CAP_SYS_ADMIN`. Tested: same error.
+
+### The fix: mount inside a user namespace the process creates
+
+The kernel lets a process mount FUSE (Linux ≥ 4.18) and overlayfs (≥ 5.11) inside a user namespace it created, where it holds full capabilities. Those capabilities do not extend outside it.
+
+```sh
+unshare -Urm fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W /home/coder/workspace
+```
+
+`-U` new user namespace, `-r` map yourself to root inside it (still uid 1000 on disk), `-m` new mount namespace. `fusermount3` is never used.
+
+### RuntimeDefault seccomp blocks `unshare`
+
+containerd's RuntimeDefault (same as moby `default.json`) only allows `unshare`, `mount`, `umount2`, `setns` and the new mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`, ...) when the process has `CAP_SYS_ADMIN`. With `drop: ["ALL"]` they return EPERM before the kernel is consulted. You need a **Localhost** seccomp profile. PSA `restricted` accepts Localhost profiles.
+
+Minimal additions to RuntimeDefault (measured one syscall at a time):
+
+| Tool | Extra syscalls |
+| --- | --- |
+| `fuse-overlayfs` | `unshare`, `mount`, `umount2` |
+| kernel `mount -t overlay`, util-linux 2.38 (Debian bookworm) | `unshare`, `mount`, `umount2` |
+| kernel `mount -t overlay`, util-linux 2.41 (Debian trixie, new mount API) | the three above + `fsopen`, `fsconfig`, `fsmount`, `move_mount` |
+| debugging from `kubectl exec` (`nsenter`) | + `setns` |
+
+`open_tree` and `mount_setattr` were not needed.
+
+### Gotcha: containerd ignores `includes.caps` in Localhost profiles
+
+Docker/Podman-format profiles gate rules with `"includes": {"caps": ["CAP_SYS_ADMIN"]}`. containerd loads a Localhost file straight into the OCI seccomp struct, which has no `includes`/`excludes`, so **every cap-gated rule applies to everyone**. Using moby `default.json` or Podman `seccomp.json` as a Localhost profile on containerd (Bottlerocket, EKS AL2023, kind) allows `mount`, `unshare`, `setns`, `bpf`, `ptrace`, ... without any capability. Generate a pre-resolved profile instead ([section 3](#3-seccomp-profile)). CRI-O (OpenShift) does evaluate `includes.caps`.
+
+### `SYS_ADMIN` is neither needed nor sufficient
+
+Under `hostUsers: false`, root + `SYS_ADMIN` + RuntimeDefault could not mount overlay directly (`cannot mount overlay read-only`). It worked only after also adding `MKNOD`, `DAC_OVERRIDE`, `FOWNER`, `CHOWN`, which is PSA `privileged` territory. The user-namespace route needs no capabilities and stays `restricted`.
+
+### The mount is private to its namespace
+
+Only processes started inside the nested namespace see the overlay.
+
+| Started from | Sees `/home/coder/workspace` overlay |
+| --- | --- |
+| container entrypoint → `unshare` → Coder agent → web terminal, code-server, `coder ssh`, VS Code Desktop | **yes** |
+| agent `startup_script` / `coder_script` / a terminal running `unshare` | only that command's own children |
+| `kubectl exec`, other containers, init containers | no (empty directory) |
+
+So the overlay must be mounted **at container startup, before the agent**, and the agent must be started inside it.
+
+### PID 1 must stay in the original namespaces
+
+If the entrypoint does `exec unshare ...`, PID 1 moves into the nested namespaces. `kubectl exec` (runc joins PID 1's namespaces) then fails with `error executing setns process`; exec probes and `kubectl cp` break too. Run the `unshare` tree as a child and `wait` for it.
+
+### Running as `coder` again
+
+Inside `unshare -r` you are uid 0. A second user namespace **without** a new mount namespace keeps the mount and maps back:
+
+```sh
+unshare -U --map-user=1000 --map-group=1000 <command>
+```
+
+Inside: `uid=1000(coder)`, writes and copy-up work, upper files owned by 1000. Only this single uid is mapped (multi-uid maps need `newuidmap`, which needs privilege escalation). Image files owned by root show as `nobody` but stay readable/executable.
+
+---
+
+## 2. Requirements checklist
+
+**Node**
+- Kernel ≥ 5.11 (overlay in userns) / ≥ 4.18 (FUSE in userns).
+- `user.max_user_namespaces` > 0 (already true if `hostUsers: false` pods start).
+- `/dev/fuse` exposed via a device plugin (e.g. smarter-device-manager: resource `smarter-devices/fuse`; the EKS lab used `github.com/fuse`).
+- Seccomp profile on every node under `/var/lib/kubelet/seccomp/` (DaemonSet copy or Security Profiles Operator; SPO `SeccompProfile` is OCI-format, so use the same resolved rules).
+
+**Namespace**
+- `pod-security.kubernetes.io/enforce: restricted`.
+
+**Pod**
+- `hostUsers: false`
+- `runAsNonRoot: true`, `runAsUser/runAsGroup/fsGroup: 1000`
+- `seccompProfile: {type: Localhost, localhostProfile: <profile>.json}`
+- `allowPrivilegeEscalation: false`, `capabilities: {drop: ["ALL"]}`
+- `/dev/fuse` resource request
+- upper/work on a real POSIX filesystem (ext4/xfs PVC or `emptyDir`), **not** inside the merged dir, not on FUSE/s3fs/another overlay
+- container `command` = wrapper entrypoint, agent init script passed as env
+
+**Image**
+- `fuse-overlayfs`, `util-linux` ≥ 2.38 (`unshare --map-user`), `curl` (Coder init script), a `coder` user with uid 1000.
+- `fuse3`/`fusermount3` not required.
+
+**Terraform / Coder**
+- `kubernetes_manifest` to set `hostUsers: false` (typed `kubernetes_deployment` cannot).
+- The Coder provisioner identity needs read-only `get`, `list` on `customresourcedefinitions` (`apiextensions.k8s.io`) for `kubernetes_manifest` plan-time schema discovery.
+- Use a **Deployment**, not a bare Pod ([section 6](#6-gotchas)).
+
+---
+
+## 3. Seccomp profile
+
+Generate from moby's default profile, resolved for a container with no capabilities, plus the overlay syscalls. Pin the moby URL to a commit for production.
+
+```python
+#!/usr/bin/env python3
+# gen-seccomp.py > overlay-userns.json          (production)
+# gen-seccomp.py --debug > overlay-userns-debug.json   (+ setns for nsenter from kubectl exec)
+import copy, json, sys, urllib.request
+
+URL = "https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json"
+ARCHES = {"amd64", "arm64", "x86", "x32"}
+EXTRA = ["unshare", "mount", "umount2", "fsopen", "fsconfig", "fsmount", "move_mount"]
+if "--debug" in sys.argv:
+    EXTRA.append("setns")
+
+profile = json.load(urllib.request.urlopen(URL))
+rules = []
+for rule in profile["syscalls"]:
+    inc, exc = rule.get("includes", {}), rule.get("excludes", {})
+    if inc.get("caps"):
+        continue                                    # needs a capability the pod does not have
+    if inc.get("arches") and not set(inc["arches"]) & ARCHES:
+        continue                                    # other architectures only
+    if exc.get("arches") and set(exc["arches"]) >= ARCHES:
+        continue
+    rule = copy.deepcopy(rule)
+    rule.pop("includes", None)
+    rule.pop("excludes", None)
+    rules.append(rule)
+rules.append({"names": EXTRA, "action": "SCMP_ACT_ALLOW"})
+profile["syscalls"] = rules
+json.dump(profile, sys.stdout, indent=2)
+```
+
+The 7-syscall list covers both `fuse-overlayfs` and kernel overlay with either util-linux version. Drop `fsopen`/`fsconfig`/`fsmount`/`move_mount` if you only use `fuse-overlayfs`.
+
+---
+
+## 4. Wrapper entrypoint
+
+Mounted from a ConfigMap at `/opt/ws/entrypoint.sh` (or baked into the image). Adjust `L` to where the read-only tree lives.
+
+```sh
+#!/bin/sh
+set -e
+L=/data/lower U=/data/overlay/upper W=/data/overlay/work M=/home/coder/workspace
+mkdir -p "$L" "$U" "$W" "$M"
+
+# PID 1 must stay in the container's original namespaces, or kubectl exec / exec probes break.
+unshare -Urm sh -c '
+  fuse-overlayfs -o "lowerdir=$1,upperdir=$2,workdir=$3" "$4"
+  exec unshare -U --map-user=1000 --map-group=1000 sh -c "$5"
+' sh "$L" "$U" "$W" "$M" "$CODER_INIT_SCRIPT" &
+child=$!
+trap 'kill -TERM "$child"' TERM INT
+wait "$child"
+```
+
+What happens:
+
+1. PID 1 (`sh`) stays in the container's namespaces and waits.
+2. Child: new user + mount namespace (uid 0 inside), `fuse-overlayfs` mounts the merged view and keeps running to serve it.
+3. Inner user namespace maps back to uid 1000 (mount namespace inherited) and runs the Coder agent init script.
+4. Everything the agent starts (terminal, code-server, SSH sessions) inherits the overlay.
+
+Kernel overlay alternative (no `/dev/fuse` needed, subject to Bottlerocket SELinux): replace the `fuse-overlayfs` line with `mount -t overlay overlay -o "lowerdir=$1,upperdir=$2,workdir=$3,userxattr" "$4"`.
+
+The lab seeded the lower dir on first start (`git clone --depth 1 ... "$L"`). In the real design the lower dir is the pinned, materialized Git commit.
+
+---
+
+## 5. Coder template
+
+Verified template (`kubernetes_manifest` Deployment). Lab-specific values to change for EKS:
+
+| Lab value | Change to |
+| --- | --- |
+| `image = "coder-ovl-ws:lab"`, `imagePullPolicy = "Never"` | your registry image, `IfNotPresent` |
+| `arch = "arm64"` | `amd64` for x86 nodes |
+| `internal_url` + `replace(...)` of `http://localhost:8080` | drop if pods can reach your `CODER_ACCESS_URL`; keep the pattern if pods need an internal URL |
+| `smarter-devices/fuse` | the resource name your fuse device plugin registers |
+| `overlay-userns-debug.json` | `overlay-userns.json` (no `setns`) unless you want `nsenter` debugging |
+| code-server installed at startup from the internet | pre-installed in the image or a Coder module |
+
+```hcl
+terraform {
+  required_providers {
+    coder = {
+      source = "coder/coder"
+    }
+    kubernetes = {
+      source = "hashicorp/kubernetes"
+    }
+  }
+}
+
+provider "kubernetes" {}
+
+variable "namespace" {
+  type    = string
+  default = "coder-ws"
+}
+
+data "coder_workspace" "me" {}
+data "coder_workspace_owner" "me" {}
+
+locals {
+  name = "coder-${lower(data.coder_workspace_owner.me.name)}-${lower(data.coder_workspace.me.name)}"
+  # Browser uses the port-forward (localhost:8080); pods reach Coder through the in-cluster Service.
+  internal_url = "http://coder.coder.svc.cluster.local"
+}
+
+resource "coder_agent" "main" {
+  os   = "linux"
+  arch = "arm64"
+  dir  = "/home/coder/workspace"
+
+  startup_script = <<-EOT
+    set -e
+    if [ ! -x /tmp/code-server/bin/code-server ]; then
+      curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server >/tmp/code-server-install.log 2>&1
+    fi
+    /tmp/code-server/bin/code-server --auth none --port 13337 /home/coder/workspace >/tmp/code-server.log 2>&1 &
+  EOT
+
+  metadata {
+    display_name = "Overlay mounted"
+    key          = "overlay"
+    script       = "grep -q ' /home/coder/workspace fuse' /proc/self/mountinfo && echo yes || echo NO"
+    interval     = 10
+    timeout      = 2
+  }
+}
+
+resource "coder_app" "code_server" {
+  agent_id     = coder_agent.main.id
+  slug         = "code-server"
+  display_name = "VS Code (browser)"
+  url          = "http://localhost:13337/?folder=/home/coder/workspace"
+  icon         = "/icon/code.svg"
+  subdomain    = false
+  share        = "owner"
+
+  healthcheck {
+    url       = "http://localhost:13337/healthz"
+    interval  = 5
+    threshold = 20
+  }
+}
+
+resource "kubernetes_config_map_v1" "entrypoint" {
+  metadata {
+    name      = "${local.name}-entrypoint"
+    namespace = var.namespace
+  }
+  data = {
+    "entrypoint.sh" = file("${path.module}/entrypoint.sh")
+  }
+}
+
+resource "kubernetes_persistent_volume_claim_v1" "data" {
+  metadata {
+    name      = "${local.name}-data"
+    namespace = var.namespace
+  }
+  wait_until_bound = false
+  spec {
+    access_modes = ["ReadWriteOnce"]
+    resources {
+      requests = {
+        storage = "2Gi"
+      }
+    }
+  }
+}
+
+resource "kubernetes_manifest" "workspace" {
+  count = data.coder_workspace.me.start_count
+
+  # Deployment, not a bare Pod: the API server injects the service account token volume into a Pod's
+  # spec.volumes, which kubernetes_manifest reports as "wrong final value type ... tuple required".
+  manifest = {
+    apiVersion = "apps/v1"
+    kind       = "Deployment"
+    metadata = {
+      name      = local.name
+      namespace = var.namespace
+    }
+    spec = {
+      replicas = 1
+      strategy = { type = "Recreate" }
+      selector = { matchLabels = { "coder.workspace" = local.name } }
+      template = {
+        metadata = { labels = { "coder.workspace" = local.name } }
+        spec     = local.pod_spec
+      }
+    }
+  }
+}
+
+locals {
+  pod_spec = {
+    hostUsers = false
+    securityContext = {
+      runAsNonRoot = true
+      runAsUser    = 1000
+      runAsGroup   = 1000
+      fsGroup      = 1000
+      seccompProfile = {
+        type             = "Localhost"
+        localhostProfile = "overlay-userns-debug.json"
+      }
+    }
+    containers = [{
+      name            = "dev"
+      image           = "coder-ovl-ws:lab"
+      imagePullPolicy = "Never"
+      command         = ["/opt/ws/entrypoint.sh"]
+      env = [
+        { name = "CODER_AGENT_TOKEN", value = coder_agent.main.token },
+        { name = "CODER_AGENT_URL", value = local.internal_url },
+        { name = "CODER_INIT_SCRIPT", value = replace(coder_agent.main.init_script, "http://localhost:8080", local.internal_url) },
+      ]
+      securityContext = {
+        allowPrivilegeEscalation = false
+        capabilities = {
+          drop = ["ALL"]
+        }
+      }
+      resources = {
+        limits   = { "smarter-devices/fuse" = "1", cpu = "2", memory = "2Gi" }
+        requests = { "smarter-devices/fuse" = "1", cpu = "250m", memory = "512Mi" }
+      }
+      volumeMounts = [
+        { name = "data", mountPath = "/data" },
+        { name = "entrypoint", mountPath = "/opt/ws" },
+      ]
+    }]
+    volumes = [
+      { name = "data", persistentVolumeClaim = { claimName = kubernetes_persistent_volume_claim_v1.data.metadata[0].name } },
+      { name = "entrypoint", configMap = { name = kubernetes_config_map_v1.entrypoint.metadata[0].name, defaultMode = 493 } },
+    ]
+  }
+}
+```
+
+`entrypoint.sh` sits next to `main.tf` in the template directory.
+
+Workspace image used in the lab:
+
+```dockerfile
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse-overlayfs util-linux procps curl ca-certificates git \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -u 1000 -m -s /bin/bash coder
+USER 1000
+WORKDIR /home/coder
+```
+
+RBAC for the Coder provisioner service account (namespace-scoped workspace objects + the cluster-scoped read-only CRD rule `kubernetes_manifest` needs):
 
 ```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
 metadata:
-  name: coder-a-bounce
-  namespace: coder
-  annotations:
-    alb.ingress.kubernetes.io/group.name: coder-a          # same group as Coder's Ingress
-    alb.ingress.kubernetes.io/group.order: "-100"          # lower = evaluated first
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/actions.bounce: >
-      {"type":"forward","forwardConfig":{"targetGroups":[
-        {"targetGroupARN":"arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/coder-bounce-a/0123456789abcdef"}]}}
-spec:
-  ingressClassName: alb
-  rules:
-    - host: coder-a.example.com
-      http:
-        paths:
-          - path: /_portal/
-            pathType: Prefix
-            backend:
-              service:
-                name: bounce            # must match the actions.<name> suffix
-                port:
-                  name: use-annotation
+  name: coder-workspaces
+  namespace: coder-ws
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coder-workspaces
+  namespace: coder-ws
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: coder-workspaces}
+subjects: [{kind: ServiceAccount, name: coder, namespace: coder}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coder-crd-read
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: coder-crd-read
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: coder-crd-read}
+subjects: [{kind: ServiceAccount, name: coder, namespace: coder}]
 ```
 
-Alternatively leave the Ingress alone and manage only the listener rule with
-`aws_lb_listener_rule` against the controller-created listener.
+---
 
-### 6.6 Networking: Lambda → middle
+## 6. Gotchas
 
-| Option | When |
-| --- | --- |
-| Public `https://middle.example.com` | Middle is internet-reachable (Lambda outside a VPC, or in a VPC with NAT) |
-| **Lambda in VPC → private middle URL** (validated) | Middle in the same/peered VPC. No NAT needed: signing is local and middle (not the Lambda) calls STS |
-| Lambda in VPC → internal NLB in front of middle | Middle elsewhere over Transit Gateway / VPN / Direct Connect with stable private IPs |
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `fusermount3: mount failed: Operation not permitted` | `fuse-overlayfs` run directly, no caps | wrap in `unshare -Urm` |
+| `unshare: unshare failed: Operation not permitted` | RuntimeDefault (or profile missing `unshare`) | Localhost profile from section 3 |
+| terminal / VS Code shows empty `/home/coder/workspace` | mount done by agent `startup_script` or a terminal | mount in the container entrypoint, start the agent inside |
+| `kubectl exec`: `error executing setns process` | entrypoint did `exec unshare` (PID 1 moved) | background the `unshare` tree, `wait` |
+| `kubectl exec` shows empty workspace | expected, original namespace | debug with `nsenter` (below) |
+| `wrong final value type: attribute "spec": attribute "volumes": tuple required` | bare Pod in `kubernetes_manifest`; API server adds the SA token volume | use a Deployment |
+| `cannot list resource "customresourcedefinitions"` at plan | `kubernetes_manifest` schema discovery | CRD `get`/`list` ClusterRole |
+| template fix not picked up | `coder start` keeps the workspace's template version | `coder update <ws>` |
+| `Transport endpoint is not connected` | `fuse-overlayfs` process died | restart the workspace (entrypoint remounts) |
 
-The IAM check is identical in all cases. Middle needs outbound HTTPS to the STS endpoint.
+---
 
-### 6.7 Local lab without AWS
+## 7. Verify and debug
 
-The same handler runs in-process behind a small reverse proxy that emulates the ALB rule:
+From a Coder terminal or `coder ssh`:
 
-```go
-// host == plane host && path starts with /_portal/ → bounce handler (ALB event shape)
-// everything else (plane host + wildcard app hosts) → Coder, Host header preserved
-proxy := &httputil.ReverseProxy{
-	Rewrite: func(pr *httputil.ProxyRequest) {
-		pr.SetURL(upstream) // coderd, e.g. http://127.0.0.1:3001
-		pr.Out.Host = pr.In.Host
-		pr.SetXForwarded()
-	},
-	FlushInterval: -1,
-}
-mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	host := r.Host
-	if hh, _, err := net.SplitHostPort(host); err == nil {
-		host = hh
-	}
-	if strings.EqualFold(host, planeHost) && strings.HasPrefix(r.URL.Path, "/_portal/") {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
-		ev := events.ALBTargetGroupRequest{
-			HTTPMethod: r.Method, Path: r.URL.Path,
-			QueryStringParameters: map[string]string{}, Headers: map[string]string{"host": r.Host},
-			IsBase64Encoded: len(body) > 0, Body: base64.StdEncoding.EncodeToString(body),
-		}
-		for k := range r.URL.Query() {
-			ev.QueryStringParameters[k] = url.QueryEscape(r.URL.Query().Get(k))
-		}
-		for k := range r.Header {
-			ev.Headers[strings.ToLower(k)] = r.Header.Get(k)
-		}
-		res, _ := h.Handle(r.Context(), ev)
-		for k, v := range res.Headers {
-			w.Header().Set(k, v)
-		}
-		w.WriteHeader(res.StatusCode)
-		io.WriteString(w, res.Body)
-		return
-	}
-	proxy.ServeHTTP(w, r)
-})
+```sh
+id                                              # uid=1000(coder)
+grep ' /home/coder/workspace ' /proc/self/mountinfo   # fuse-overlayfs
+ls -la /home/coder/workspace
 ```
 
-Lab setup used: Coder with `--access-url http://coder.127.0.0.1.sslip.io:3000` and
-`--wildcard-access-url '*.coder.127.0.0.1.sslip.io'` listening on `:3001`, the emulator on `:3000`
-(`COOKIE_SECURE=false`, `BOUNCE_ASSUME_ROLE_ARN=<bounce role>` so a local IAM user produces the
-same `assumed-role/…` identity), middle and the portal on other hosts/ports, Keycloak as IdP, and a
-GitLab OAuth app with redirect URI `http://coder.127.0.0.1.sslip.io:3000/external-auth/primary-gitlab/callback`.
-Some home routers refuse DNS answers pointing public names at `127.0.0.1` (rebinding protection);
-use an `/etc/hosts` entry or `curl --resolve`.
+Where edits land (from `kubectl exec`, original namespace):
 
-## 7. Way forward
+```sh
+kubectl exec deploy/<workspace> -- ls -la /data/overlay/upper /data/lower
+# edits in upper; deletions as c--------- whiteouts; lower unchanged
+```
 
-### Adopt
+See the overlay from `kubectl exec` (profile must allow `setns`):
 
-1. **One bounce Lambda + IAM role per plane** (`coder-bounce-<plane>`), trusted by middle via the
-   allowlist. The role needs nothing beyond Lambda basics (+ VPC access if in a VPC).
-2. **One ALB rule per plane host** (`/_portal/*`, highest priority), matching the exact plane host —
-   not the wildcard app hosts. Enable multi-value headers on the target group.
-3. **GitLab OAuth** through the bounce with the `/done` cleanup:
-   - portal shows status from `GET /v1/external-auth/{id}?plane=` (`authenticated`);
-   - "Connect GitLab" = `purpose: "external-auth"` in the same tab; the flow ends on the portal;
-   - consent uses a dedicated 5-minute `bounce-<plane>` key, revoked at `/_portal/done`;
-   - one GitLab OAuth application (redirect URI) per plane host.
-4. **Workspace apps / ttyd**: keep the existing JSON mint + token-strip flow (middle returns the app
-   URL with a query token; the portal opens it and Coder converts it to an app cookie). The bounce is
-   only for cookie-only Coder dashboard pages.
-5. **Built-in web terminal**: not needed when ttyd is used. If ever enabled, the `terminal` purpose
-   leaves a dashboard-capable cookie on the plane host (the terminal *is* a dashboard page) — either
-   drop the purpose or give it the same dedicated short-lived key.
+```sh
+kubectl exec -it deploy/<workspace> -- sh -c 'nsenter -t $(pgrep -x fuse-overlayfs) -U -m --preserve-credentials sh'
+```
 
-### Production hardening
+You appear as root there (uid 1000 on disk). Joining the agent's inner user namespace directly fails for the mount namespace (`reassociate to namespace 'ns/mnt' failed`) because the mount namespace belongs to the outer nested user namespace.
 
-| Item | Why |
+---
+
+## 8. Evidence (kind)
+
+| Test | Result |
 | --- | --- |
-| Shared code store (Redis/DynamoDB TTL, atomic get-and-delete) | Multi-replica middle; exactly-once redeem |
-| Serve `/internal/*` on a private listener, not via the public entry point | Defense in depth (IAM proof already required) |
-| Pin `role_id` in the allowlist | A recreated role with the same name isn't auto-trusted |
-| Audit log on redeem/done (user, plane, purpose, caller ARN, revoked) | Traceability of cookie grants and GitLab linking |
-| Periodic sweep of stale `bounce-<plane>` keys | Belt and braces for abandoned consents (they expire in 5 min anyway) |
-| Rate-limit `/v1/bounce/start` per user | Code minting is cheap but should not be abusable |
-| Alarm on `rejected caller` / STS failures | Detect misconfiguration or probing |
-| GitLab application secret in a secret store, rotated | Coder reads it from its environment at start |
-| Make the consent lifetime configurable (e.g. `bounce.consent_ttl_seconds`, 5–10 min) | Fit GitLab sign-in + 2FA/SSO |
+| restricted, RuntimeDefault, `fuse-overlayfs` direct | `cannot mount: Operation not permitted` |
+| restricted, RuntimeDefault, `unshare -Urm` | `unshare` EPERM |
+| restricted, Localhost profile, `unshare -Urm` + `fuse-overlayfs` | OK: COW, whiteouts, lower untouched |
+| restricted, Localhost profile, `unshare -Urm` + kernel overlay | OK |
+| baseline, `SETUID`/`SETGID`/`SETFCAP` + priv-esc, `fuse-overlayfs` direct | same `fusermount3` error |
+| privileged, root + `SYS_ADMIN`, kernel overlay direct | fails; needs + `MKNOD`, `DAC_OVERRIDE`, `FOWNER`, `CHOWN` |
+| restricted, admission of `SYS_ADMIN` or `allowPrivilegeEscalation: true` | rejected |
+| Coder v2.36.5 workspace with wrapper entrypoint, `coder ssh` | overlay visible, `uid=1000(coder)`, writes to upper |
+| code-server app via Coder | HTTP 200 on the workspace folder |
+| `kubectl exec` into the workspace | works, sees empty dir (expected) |
 
-### Still to validate
+---
 
-| Item | Risk |
-| --- | --- |
-| GitLab consent on the AWS/HTTPS setup (`Secure` cookie, real ALB) | Low — same flow; mechanics proven on AWS, consent proven locally |
-| `/_portal/done` behind a real ALB with multi-value headers enabled | Low — handler supports it; without it the ALB may drop cookies from repeated `cookie` headers (worst case: cookie cleared but key not revoked, expires in 5 min) |
-| Self-managed GitLab (extra `*_URL` / `REGEX` environment) | Low — Coder configuration only |
-| Bounce on EKS via the AWS Load Balancer Controller (IngressGroup ordering) | Low — same ALB rule semantics |
+## Open items
 
-## 8. Alternatives considered
-
-| Alternative | Why not |
-| --- | --- |
-| `Domain=` cookie from a parent domain | Sends the user's Coder token to every workspace app subdomain |
-| Query `?coder_session_token=` | Dashboard pages and the OAuth callback don't use it |
-| Middle served on each plane host | Works, but couples middle routing to every plane; the bounce keeps middle anywhere |
-| ALB forwarding straight to middle's URL | Not possible: ALB targets are instances, IPs or Lambda functions |
-| Coder device flow via API (external auth) | Cookie-free, but UX (enter a code) and untested with GitLab in Coder |
-| Portal owns GitLab OAuth + a credential helper | Bypasses Coder external auth; middle would store and refresh GitLab tokens |
-| Keep the consent cookie (no `/done`) | Leaves a dashboard session on the plane host for its lifetime |
+- **Bottlerocket SELinux**: not testable on kind. Confirm `unshare -Urm true` and the FUSE mount on an EKS Bottlerocket node; if `unshare` works but the mount fails, SELinux policy is the suspect.
+- **Security trade-off**: unprivileged user namespaces + FUSE/overlay widen kernel attack surface (e.g. CVE-2023-0386). `hostUsers: false` limits the blast radius. Keep nodes patched.
+- **Single uid inside**: fine for a file overlay; tools needing many uids (nested Podman) need `newuidmap` and more privilege.
+- **Real Coder web terminal in a browser**: the lab verified via `coder ssh` (same agent session path) and code-server over HTTP; visual browser check is still worth doing on the target cluster.
