@@ -1,801 +1,1101 @@
-# Writable overlay workspaces in Coder without `SYS_ADMIN`
+# Step by step: a JupyterLab "Workspace" menu that runs `ws-publish` and `ws-base`
 
-How to give a Coder workspace a copy-on-write `/home/coder/workspace` (read-only lower tree + private upper layer) from a pod that runs in a PSA **`restricted`** namespace with `hostUsers: false`, all capabilities dropped and `allowPrivilegeEscalation: false`.
+Follow this top to bottom inside your Coder overlay workspace. Every block is meant to be copied and pasted.
 
-Validated on kind (Kubernetes 1.35, containerd, kernel 7.0) with real Coder v2.36.5, September 2026. Bottlerocket-specific behaviour (SELinux) is still to be confirmed on EKS; see [Open items](#open-items).
+The result is a **Workspace** button in the JupyterLab file browser toolbar (and a **Workspace** top menu). Each item runs a command behind the scene, so users never open a terminal:
 
----
-
-## 1. What we learned
-
-### Running `fuse-overlayfs` directly cannot work
-
-```text
-fusermount3: mount failed: Operation not permitted
-fuse-overlayfs: cannot mount: Operation not permitted
-```
-
-1. `fuse-overlayfs` (libfuse) first calls `mount()` itself. The pod has no capabilities, so the kernel refuses.
-2. libfuse then falls back to the setuid helper `fusermount3`. With `allowPrivilegeEscalation: false` (`NoNewPrivs: 1`) the setuid bit is ignored; with `drop: ["ALL"]` the bounding set is empty, so even setuid root gains nothing. Its `mount()` fails too.
-
-Adding `SETUID`, `SETGID`, `SETFCAP` and `allowPrivilegeEscalation: true` (PSA `baseline`) does not help: `fusermount3` then runs with those three capabilities, but mounting needs `CAP_SYS_ADMIN`. Tested: same error.
-
-### The fix: mount inside a user namespace the process creates
-
-The kernel lets a process mount FUSE (Linux ≥ 4.18) and overlayfs (≥ 5.11) inside a user namespace it created, where it holds full capabilities. Those capabilities do not extend outside it.
-
-```sh
-unshare -Urm fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W /home/coder/workspace
-```
-
-`-U` new user namespace, `-r` map yourself to root inside it (still uid 1000 on disk), `-m` new mount namespace. `fusermount3` is never used.
-
-### RuntimeDefault seccomp blocks `unshare`
-
-containerd's RuntimeDefault (same as moby `default.json`) only allows `unshare`, `mount`, `umount2`, `setns` and the new mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`, ...) when the process has `CAP_SYS_ADMIN`. With `drop: ["ALL"]` they return EPERM before the kernel is consulted. You need a **Localhost** seccomp profile. PSA `restricted` accepts Localhost profiles.
-
-Minimal additions to RuntimeDefault (measured one syscall at a time):
-
-| Tool | Extra syscalls |
-| --- | --- |
-| `fuse-overlayfs` | `unshare`, `mount`, `umount2` |
-| kernel `mount -t overlay`, util-linux 2.38 (Debian bookworm) | `unshare`, `mount`, `umount2` |
-| kernel `mount -t overlay`, util-linux 2.41 (Debian trixie, new mount API) | the three above + `fsopen`, `fsconfig`, `fsmount`, `move_mount` |
-| debugging from `kubectl exec` (`nsenter`) | + `setns` |
-
-`open_tree` and `mount_setattr` were not needed.
-
-### Gotcha: containerd ignores `includes.caps` in Localhost profiles
-
-Docker/Podman-format profiles gate rules with `"includes": {"caps": ["CAP_SYS_ADMIN"]}`. containerd loads a Localhost file straight into the OCI seccomp struct, which has no `includes`/`excludes`, so **every cap-gated rule applies to everyone**. Using moby `default.json` or Podman `seccomp.json` as a Localhost profile on containerd (Bottlerocket, EKS AL2023, kind) allows `mount`, `unshare`, `setns`, `bpf`, `ptrace`, ... without any capability. Generate a pre-resolved profile instead ([section 3](#3-seccomp-profile)). CRI-O (OpenShift) does evaluate `includes.caps`.
-
-### `SYS_ADMIN` is neither needed nor sufficient
-
-Under `hostUsers: false`, root + `SYS_ADMIN` + RuntimeDefault could not mount overlay directly (`cannot mount overlay read-only`). It worked only after also adding `MKNOD`, `DAC_OVERRIDE`, `FOWNER`, `CHOWN`, which is PSA `privileged` territory. The user-namespace route needs no capabilities and stays `restricted`.
-
-### The mount is private to its namespace
-
-Only processes started inside the nested namespace see the overlay.
-
-| Started from | Sees `/home/coder/workspace` overlay |
-| --- | --- |
-| container entrypoint → `unshare` → Coder agent → web terminal, code-server, `coder ssh`, VS Code Desktop | **yes** |
-| agent `startup_script` / `coder_script` / a terminal running `unshare` | only that command's own children |
-| `kubectl exec`, other containers, init containers | no (empty directory) |
-
-So the overlay must be mounted **at container startup, before the agent**, and the agent must be started inside it.
-
-### PID 1 must stay in the original namespaces
-
-If the entrypoint does `exec unshare ...`, PID 1 moves into the nested namespaces. `kubectl exec` (runc joins PID 1's namespaces) then fails with `error executing setns process`; exec probes and `kubectl cp` break too. Run the `unshare` tree as a child and `wait` for it.
-
-### Running as `coder` again
-
-Inside `unshare -r` you are uid 0. A second user namespace **without** a new mount namespace keeps the mount and maps back:
-
-```sh
-unshare -U --map-user=1000 --map-group=1000 <command>
-```
-
-Inside: `uid=1000(coder)`, writes and copy-up work, upper files owned by 1000. Only this single uid is mapped (multi-uid maps need `newuidmap`, which needs privilege escalation). Image files owned by root show as `nobody` but stay readable/executable.
-
-### Lower tree owned by root needs `squash_to_root`
-
-The nested namespace maps only container uid 1000. A lower tree written by anything else (the reconciler writes `commits/<sha>/` as host root; with `hostUsers: false` the kubelet idmaps the volume so it shows as uid 0 in the container) appears as `nobody` inside, and the overlay becomes read-mostly:
-
-| Action on a root-owned lower file | Without `squash_to_root` | With `squash_to_root` |
+| Menu item | Runs | What the user sees |
 | --- | --- | --- |
-| edit / append | `Permission denied` | OK (copy-up) |
-| `rm` | `Value too large for defined data type` | OK (whiteout) |
-| create inside a lower directory | `Permission denied` | OK |
-| create at the top level | OK | OK |
+| Workspace status | `ws-base status` | a dialog with base, latest, number of changes |
+| Share a snapshot… | `ws-publish share` | confirm, then "Share: ok share ref=ws/alice/20260926-181500" |
+| Promote… | `ws-publish promote` or `ws-publish promote -from-tag ws/…` | choose "my current changes" or "an existing share tag" |
+| Update to latest… | `ws-base check latest`, then `ws-base use latest` (`--force` if the user accepts conflicts) | "No conflicts, update?" or the list of conflicting files with an "Update anyway" button |
+| Go back to previous base… | `ws-base back` (`--force` if refused and the user insists) | confirm, then "rebased … -> …" |
 
-`fuse-overlayfs -o ...,squash_to_root` presents every file as owned by the namespace root, i.e. `coder` for the agent. The upper dir stays clean: uid 1000 on disk, whiteouts as `c---------` 0/0 (what `ws-publish` expects). Earlier labs missed this because their lower was owned by uid 1000.
+How it fits together:
 
-Related: the kubelet's idmapped bind mount needs a filesystem that supports idmapped mounts (ext4/XFS on EKS are fine). On kind, a hostPath under the node's overlay rootfs (`/mnt`) failed with `failed to set MOUNT_ATTR_IDMAP ... invalid argument`; under `/var/lib` (ext4) it worked.
+```mermaid
+flowchart LR
+  U[Browser: Workspace menu] -->|POST /ws-actions/run/share| S[Jupyter server extension\nws_actions/handlers.py]
+  S -->|ws-publish share| P[ws-publish\nreads /data/overlay/upper + .base_commit_sha\npushes tag to GitLab]
+  S -->|ws-base use latest| B[ws-base client]
+  B -->|FIFO /tmp/ws-base/req| C[ws-base serve\nouter namespace: remounts the overlay]
+```
+
+JupyterLab is started by the Coder agent (through the Coder `jupyterlab` module), so it runs inside the overlay namespace like the terminal does: it sees the merged `/home/coder/workspace`, and `ws-base use` reaches the controller exactly as from a terminal.
+
+Status: written for you to try; not yet run end to end in a Coder overlay workspace. The extension layout, build and packaging are the same as the validated `jupyter_keytab` lab; the new parts are the `ws-publish`/`ws-base` calls and the two dev scripts. Start with the dry run in [step 7.1](#71-first-run-in-dry-run-mode-ui-only-nothing-executed).
+
+The approach for testing: keep the Coder `jupyterlab` module unchanged (it installs JupyterLab with `pipx` at workspace start), then link the extension source into that JupyterLab in "develop" mode. You edit, rebuild, refresh. When you are happy, you build a wheel and bake it into the image ([step 10](#10-when-you-are-happy-build-the-wheel-and-bake-it-into-the-image)).
 
 ---
 
-## 2. Requirements checklist
+## Contents
 
-**Node**
-- Kernel ≥ 5.11 (overlay in userns) / ≥ 4.18 (FUSE in userns).
-- `user.max_user_namespaces` > 0 (already true if `hostUsers: false` pods start).
-- `/dev/fuse` exposed via a device plugin (e.g. smarter-device-manager: resource `smarter-devices/fuse`; the EKS lab used `github.com/fuse`).
-- Seccomp profile on every node under `/var/lib/kubelet/seccomp/` (DaemonSet copy or Security Profiles Operator; SPO `SeccompProfile` is OCI-format, so use the same resolved rules).
-
-**Namespace**
-- `pod-security.kubernetes.io/enforce: restricted`.
-
-**Pod**
-- `hostUsers: false`
-- `runAsNonRoot: true`, `runAsUser/runAsGroup/fsGroup: 1000`
-- `seccompProfile: {type: Localhost, localhostProfile: <profile>.json}`
-- `allowPrivilegeEscalation: false`, `capabilities: {drop: ["ALL"]}`
-- `/dev/fuse` resource request
-- upper/work on a real POSIX filesystem (ext4/xfs PVC or `emptyDir`), **not** inside the merged dir, not on FUSE/s3fs/another overlay
-- container `command` = wrapper entrypoint, agent init script passed as env
-
-**Image**
-- `fuse-overlayfs`, `util-linux` ≥ 2.38 (`unshare --map-user`), `curl` (Coder init script), a `coder` user with uid 1000.
-- `fuse3`/`fusermount3` not required.
-
-**Terraform / Coder**
-- `kubernetes_manifest` to set `hostUsers: false` (typed `kubernetes_deployment` cannot).
-- The Coder provisioner identity needs read-only `get`, `list` on `customresourcedefinitions` (`apiextensions.k8s.io`) for `kubernetes_manifest` plan-time schema discovery.
-- Use a **Deployment**, not a bare Pod ([section 6](#6-gotchas)).
+1. [Add the dev tools to the workspace image](#1-add-the-dev-tools-to-the-workspace-image)
+2. [Add the module and the environment to the template](#2-add-the-module-and-the-environment-to-the-template)
+3. [Check the workspace](#3-check-the-workspace)
+4. [Run the backend commands by hand first](#4-run-the-backend-commands-by-hand-first)
+5. [Create the extension source](#5-create-the-extension-source)
+6. [Create the two helper scripts](#6-create-the-two-helper-scripts)
+7. [Install it into the running JupyterLab](#7-install-it-into-the-running-jupyterlab)
+8. [Try it in the browser](#8-try-it-in-the-browser)
+9. [The edit loop](#9-the-edit-loop)
+10. [When you are happy: build the wheel and bake it into the image](#10-when-you-are-happy-build-the-wheel-and-bake-it-into-the-image)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Things to know about `ws-publish` today](#12-things-to-know-about-ws-publish-today)
+13. [File reference](#13-file-reference)
 
 ---
 
-## 3. Seccomp profile
+## 1. Add the dev tools to the workspace image
 
-Generate from moby's default profile, resolved for a container with no capabilities, plus the overlay syscalls. Pin the moby URL to a commit for production.
+The overlay image (`debian:bookworm-slim` + `fuse-overlayfs util-linux procps curl ca-certificates git`) needs, for this test only:
 
-```python
-#!/usr/bin/env python3
-# gen-seccomp.py > overlay-userns.json          (production)
-# gen-seccomp.py --debug > overlay-userns-debug.json   (+ setns for nsenter from kubectl exec)
-import copy, json, sys, urllib.request
-
-URL = "https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json"
-ARCHES = {"amd64", "arm64", "x86", "x32"}
-EXTRA = ["unshare", "mount", "umount2", "fsopen", "fsconfig", "fsmount", "move_mount"]
-if "--debug" in sys.argv:
-    EXTRA.append("setns")
-
-profile = json.load(urllib.request.urlopen(URL))
-rules = []
-for rule in profile["syscalls"]:
-    inc, exc = rule.get("includes", {}), rule.get("excludes", {})
-    if inc.get("caps"):
-        continue                                    # needs a capability the pod does not have
-    if inc.get("arches") and not set(inc["arches"]) & ARCHES:
-        continue                                    # other architectures only
-    if exc.get("arches") and set(exc["arches"]) >= ARCHES:
-        continue
-    rule = copy.deepcopy(rule)
-    rule.pop("includes", None)
-    rule.pop("excludes", None)
-    rules.append(rule)
-rules.append({"names": EXTRA, "action": "SCMP_ACT_ALLOW"})
-profile["syscalls"] = rules
-json.dump(profile, sys.stdout, indent=2)
-```
-
-The 7-syscall list covers both `fuse-overlayfs` and kernel overlay with either util-linux version. Drop `fsopen`/`fsconfig`/`fsmount`/`move_mount` if you only use `fuse-overlayfs`.
-
----
-
-## 4. Wrapper entrypoint
-
-Mounted from a ConfigMap at `/opt/ws/entrypoint.sh` (or baked into the image). Adjust `L` to where the read-only tree lives.
-
-```sh
-#!/bin/sh
-set -e
-L=/data/lower U=/data/overlay/upper W=/data/overlay/work M=/home/coder/workspace
-mkdir -p "$L" "$U" "$W" "$M"
-
-# PID 1 must stay in the container's original namespaces, or kubectl exec / exec probes break.
-unshare -Urm sh -c '
-  fuse-overlayfs -o "lowerdir=$1,upperdir=$2,workdir=$3,squash_to_root" "$4"
-  exec unshare -U --map-user=1000 --map-group=1000 sh -c "$5"
-' sh "$L" "$U" "$W" "$M" "$CODER_INIT_SCRIPT" &
-child=$!
-trap 'kill -TERM "$child"' TERM INT
-wait "$child"
-```
-
-`squash_to_root` is needed when the lower tree is owned by anyone other than uid 1000 (e.g. the reconciler's root-owned `commits/<sha>/`); see [Lower tree owned by root](#lower-tree-owned-by-root-needs-squash_to_root).
-
-What happens:
-
-1. PID 1 (`sh`) stays in the container's namespaces and waits.
-2. Child: new user + mount namespace (uid 0 inside), `fuse-overlayfs` mounts the merged view and keeps running to serve it.
-3. Inner user namespace maps back to uid 1000 (mount namespace inherited) and runs the Coder agent init script.
-4. Everything the agent starts (terminal, code-server, SSH sessions) inherits the overlay.
-
-Kernel overlay alternative (no `/dev/fuse` needed, subject to Bottlerocket SELinux): replace the `fuse-overlayfs` line with `mount -t overlay overlay -o "lowerdir=$1,upperdir=$2,workdir=$3,userxattr" "$4"`.
-
-The lab seeded the lower dir on first start (`git clone --depth 1 ... "$L"`). In the real design the lower dir is the pinned, materialized Git commit.
-
-### 4b. Moving the base to newer commits and back (`ws-base`)
-
-With the distributed Git storage, the lower is a pinned `commits/<sha>/` materialized by the node reconciler, and new commits keep arriving after the workspace started. `ws-base` lets the user move the workspace onto a newer commit and back again, keeping their upper-layer edits. Full script: [Appendix A](#appendix-a-ws-base). Lab: `ws-base/` (`run.sh`).
-
-**Where it runs.** Only the **outer** nested user namespace (created by `unshare -Urm`) can unmount/mount: it owns the mount namespace. The agent, terminals and code-server run in the inner namespace and get `must be superuser to unmount`, so users cannot touch the mount directly. `ws-base serve` runs in the outer namespace as a small controller; user commands send it requests through a FIFO under `/tmp/ws-base/`.
-
-**Entrypoint** (replaces section 4 when you use `ws-base`):
-
-```sh
-#!/bin/sh
-set -e
-export PATH=/opt/ws:$PATH
-
-# PID 1 must stay in the container's original namespaces, or kubectl exec / exec probes break.
-# The rebase controller lives in the outer nested namespace: it owns the mount namespace.
-unshare -Urm sh -c '
-  ws-base mount
-  ws-base serve &
-  exec unshare -U --map-user=1000 --map-group=1000 sh -c "$1"
-' sh "$CODER_INIT_SCRIPT" &
-child=$!
-trap 'kill -TERM "$child"' TERM INT
-wait "$child"
-```
-
-**Mount the export root, not one commit.** The lower must come from a volume holding the whole reconciler export root (`commits/`, `CURRENT_SHA`, `tags/`), mounted read-only at `WS_GIT_ROOT` (default `/git-backend`). The reconciler materializes into a temp dir and renames it into `commits/<sha>`, so a new commit is just a new directory on an already-mounted filesystem and shows up inside the nested namespace with no mount propagation. Mounting `commits/<sha>` alone (as in `example-workspace-pod.yaml`) makes later commits invisible.
-
-**State** lives on the scratch PVC next to `upper/` and `work/` (`WS_SCRATCH`, default `/data/overlay`), so it survives restarts:
-
-| File | Role |
-| --- | --- |
-| `.base_commit_sha` | current base; `ws-base mount` pins it on first start (`WS_BASE_REF`, default `latest`) and remounts it after a restart. It is also the parent `ws-publish` uses, so it must change with the remount (it does, atomically). |
-| `.base_history` | stack of previous bases; `use` pushes, `back` pops |
-
-**Commands** (from a Coder terminal):
-
-| Command | Effect |
-| --- | --- |
-| `ws-base status` | base, latest (`CURRENT_SHA`), what `back` returns to, number of upper entries |
-| `ws-base list` | materialized commits and tags on this node |
-| `ws-base check <ref>` | dry run: which of your changes would hide an upstream change |
-| `ws-base use latest` / `use <sha-prefix>` / `use tag/<name>` | switch base; refuses if `check` finds conflicts |
-| `ws-base back` | return to the previous base |
-| add `--force` | switch anyway and keep your copies |
-
-**Conflict check.** Moving the upper onto a different lower is not a Git rebase: any file in `upper/` simply shadows the new lower. If upstream changed a file you also edited (or deleted), your copy would silently hide their change, and a later `ws-publish` would revert it. Before switching, `ws-base` walks only `upper/` (cheap, no repo scan) and flags a path when the two bases differ there **and** your version differs from the new one. Convergent changes are not flagged (both deleted, or your edit equals upstream's). The check compares old base vs new base, not your file's original base, so after several switches it can be conservative (see `old.txt` below). Opaque directories stored as xattrs (kernel overlay) are not detected.
-
-**Lab run** (kind, `restricted`, `hostUsers: false`, no added caps; a reconciler container adds commits to a shared volume after the workspace started; the workspace mounts it read-only):
-
-```text
-## start on A; user edits shared.txt, deletes old.txt, adds notes.txt
-## B arrives (changes upstream.txt, adds new-in-b.txt)
-$ ws-base check latest      ->  no conflicts
-$ ws-base use latest        ->  rebased 6dcd4ce23d88 -> ae4f281df5a5
-  VERSION=B, upstream.txt=u2, new-in-b.txt visible, shared.txt = "my edit"
-## C arrives (edits shared.txt, deletes old.txt)
-$ ws-base use latest        ->  refused: ... shared.txt        (old.txt converged: not flagged)
-$ ws-base use latest --force->  rebased ae4f281df5a5 -> 32096c2e0eff, kept your copy of shared.txt
-  .base_commit_sha = C (ws-publish parent)
-$ ws-base back              ->  refused: old.txt, shared.txt
-$ ws-base back --force      ->  B
-$ ws-base back              ->  A
-$ ws-base back              ->  no previous base
-$ ws-base use tag/C --force ->  C
-$ ws-base use ../../etc     ->  bad ref;  use tag/../../etc -> bad tag name
-$ umount -l ~/workspace     ->  must be superuser to unmount
-one fuse-overlayfs left (old ones exit once nothing holds the detached mount)
-```
-
-Things to watch:
-
-- **Retention/GC must respect pins.** The reconciler only materializes `ACTIVE_COMMIT` and tagged commits, and a GC of `commits/<sha>/` is planned. A workspace's `.base_commit_sha` and `.base_history` entries must stay materialized, or the workspace cannot remount after a restart (`pinned base ... is not materialized on this node`) and `back` fails. Same after a reschedule to another git-worker. Options: have workspaces publish their pins (e.g. a ConfigMap/annotation the reconciler materializes and GC skips), or keep commits for N days.
-- **Getting the export root into a restricted pod.** PSA `baseline` and `restricted` forbid `hostPath` volumes in the pod spec. Use a `PersistentVolume` (hostPath or `local`, with node affinity to git-workers) bound to a `ReadOnlyMany` PVC, or a CSI bind (non-FUSE) mode of git-csi. Tested: a hostPath PV + ROX PVC is admitted in `restricted` with `hostUsers: false`.
-- **`squash_to_root` is mandatory** for the reconciler's root-owned tree ([section 1](#lower-tree-owned-by-root-needs-squash_to_root)); `ws-base` sets it.
-- **Open handles keep the old view.** A shell whose cwd was inside the workspace, or an editor with open files, keeps seeing the old base until it re-enters the directory or reloads. Until the detached mount is released, those handles can still write into the same upper dir. Switch when the workspace is quiet.
-- **Only the user's own workspace can request.** The FIFO is mode 0600 in the pod; anything running in the workspace can use it, which is the same trust level as the user. Requests are validated (hex SHA prefix that exists under `commits/`, `latest`, or `tag/<name>` without `..`).
-- **Kernel overlay alternative.** If you use `mount -t overlay ... userxattr` instead of FUSE, keep `redirect_dir`, `metacopy` and `index` off (the defaults in a user namespace): changing the lower under an existing upper is only supported without them.
-
----
-
-## 5. Coder template
-
-Verified template (`kubernetes_manifest` Deployment). Lab-specific values to change for EKS:
-
-| Lab value | Change to |
-| --- | --- |
-| `image = "coder-ovl-ws:lab"`, `imagePullPolicy = "Never"` | your registry image, `IfNotPresent` |
-| `arch = "arm64"` | `amd64` for x86 nodes |
-| `internal_url` + `replace(...)` of `http://localhost:8080` | drop if pods can reach your `CODER_ACCESS_URL`; keep the pattern if pods need an internal URL |
-| `smarter-devices/fuse` | the resource name your fuse device plugin registers |
-| `overlay-userns-debug.json` | `overlay-userns.json` (no `setns`) unless you want `nsenter` debugging |
-| code-server installed at startup from the internet | pre-installed in the image or a Coder module |
-
-```hcl
-terraform {
-  required_providers {
-    coder = {
-      source = "coder/coder"
-    }
-    kubernetes = {
-      source = "hashicorp/kubernetes"
-    }
-  }
-}
-
-provider "kubernetes" {}
-
-variable "namespace" {
-  type    = string
-  default = "coder-ws"
-}
-
-data "coder_workspace" "me" {}
-data "coder_workspace_owner" "me" {}
-
-locals {
-  name = "coder-${lower(data.coder_workspace_owner.me.name)}-${lower(data.coder_workspace.me.name)}"
-  # Browser uses the port-forward (localhost:8080); pods reach Coder through the in-cluster Service.
-  internal_url = "http://coder.coder.svc.cluster.local"
-}
-
-resource "coder_agent" "main" {
-  os   = "linux"
-  arch = "arm64"
-  dir  = "/home/coder/workspace"
-
-  startup_script = <<-EOT
-    set -e
-    if [ ! -x /tmp/code-server/bin/code-server ]; then
-      curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server >/tmp/code-server-install.log 2>&1
-    fi
-    /tmp/code-server/bin/code-server --auth none --port 13337 /home/coder/workspace >/tmp/code-server.log 2>&1 &
-  EOT
-
-  metadata {
-    display_name = "Overlay mounted"
-    key          = "overlay"
-    script       = "grep -q ' /home/coder/workspace fuse' /proc/self/mountinfo && echo yes || echo NO"
-    interval     = 10
-    timeout      = 2
-  }
-}
-
-resource "coder_app" "code_server" {
-  agent_id     = coder_agent.main.id
-  slug         = "code-server"
-  display_name = "VS Code (browser)"
-  url          = "http://localhost:13337/?folder=/home/coder/workspace"
-  icon         = "/icon/code.svg"
-  subdomain    = false
-  share        = "owner"
-
-  healthcheck {
-    url       = "http://localhost:13337/healthz"
-    interval  = 5
-    threshold = 20
-  }
-}
-
-resource "kubernetes_config_map_v1" "entrypoint" {
-  metadata {
-    name      = "${local.name}-entrypoint"
-    namespace = var.namespace
-  }
-  data = {
-    "entrypoint.sh" = file("${path.module}/entrypoint.sh")
-  }
-}
-
-resource "kubernetes_persistent_volume_claim_v1" "data" {
-  metadata {
-    name      = "${local.name}-data"
-    namespace = var.namespace
-  }
-  wait_until_bound = false
-  spec {
-    access_modes = ["ReadWriteOnce"]
-    resources {
-      requests = {
-        storage = "2Gi"
-      }
-    }
-  }
-}
-
-resource "kubernetes_manifest" "workspace" {
-  count = data.coder_workspace.me.start_count
-
-  # Deployment, not a bare Pod: the API server injects the service account token volume into a Pod's
-  # spec.volumes, which kubernetes_manifest reports as "wrong final value type ... tuple required".
-  manifest = {
-    apiVersion = "apps/v1"
-    kind       = "Deployment"
-    metadata = {
-      name      = local.name
-      namespace = var.namespace
-    }
-    spec = {
-      replicas = 1
-      strategy = { type = "Recreate" }
-      selector = { matchLabels = { "coder.workspace" = local.name } }
-      template = {
-        metadata = { labels = { "coder.workspace" = local.name } }
-        spec     = local.pod_spec
-      }
-    }
-  }
-}
-
-locals {
-  pod_spec = {
-    hostUsers = false
-    securityContext = {
-      runAsNonRoot = true
-      runAsUser    = 1000
-      runAsGroup   = 1000
-      fsGroup      = 1000
-      seccompProfile = {
-        type             = "Localhost"
-        localhostProfile = "overlay-userns-debug.json"
-      }
-    }
-    containers = [{
-      name            = "dev"
-      image           = "coder-ovl-ws:lab"
-      imagePullPolicy = "Never"
-      command         = ["/opt/ws/entrypoint.sh"]
-      env = [
-        { name = "CODER_AGENT_TOKEN", value = coder_agent.main.token },
-        { name = "CODER_AGENT_URL", value = local.internal_url },
-        { name = "CODER_INIT_SCRIPT", value = replace(coder_agent.main.init_script, "http://localhost:8080", local.internal_url) },
-      ]
-      securityContext = {
-        allowPrivilegeEscalation = false
-        capabilities = {
-          drop = ["ALL"]
-        }
-      }
-      resources = {
-        limits   = { "smarter-devices/fuse" = "1", cpu = "2", memory = "2Gi" }
-        requests = { "smarter-devices/fuse" = "1", cpu = "250m", memory = "512Mi" }
-      }
-      volumeMounts = [
-        { name = "data", mountPath = "/data" },
-        { name = "entrypoint", mountPath = "/opt/ws" },
-      ]
-    }]
-    volumes = [
-      { name = "data", persistentVolumeClaim = { claimName = kubernetes_persistent_volume_claim_v1.data.metadata[0].name } },
-      { name = "entrypoint", configMap = { name = kubernetes_config_map_v1.entrypoint.metadata[0].name, defaultMode = 493 } },
-    ]
-  }
-}
-```
-
-`entrypoint.sh` sits next to `main.tf` in the template directory.
-
-Workspace image used in the lab:
+- `python3`, `python3-venv`, `pipx`: the Coder `jupyterlab` module installs JupyterLab with `pipx` if it is not already there. (Its other branch, `uv`, needs an existing `~/.venv`; stick to `pipx`.)
+- `node`: compiles the TypeScript half of the extension. `jlpm` (yarn) ships with JupyterLab.
+- `ws-publish` and `ws-base` on the `PATH` (you already have these in `/opt/ws`).
 
 ```dockerfile
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fuse-overlayfs util-linux procps curl ca-certificates git \
+      python3 python3-venv pipx \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -u 1000 -m -s /bin/bash coder
+COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+# ws-publish (Go binary) and ws-base, if not mounted from a ConfigMap
+COPY ws-publish ws-base /opt/ws/
+ENV PATH=/opt/ws:/home/coder/.local/bin:$PATH
 USER 1000
 WORKDIR /home/coder
 ```
 
-RBAC for the Coder provisioner service account (namespace-scoped workspace objects + the cluster-scoped read-only CRD rule `kubernetes_manifest` needs):
+Network: at workspace start the module runs `pipx install jupyterlab` (PyPI), and step 7 runs `pip install -e` (PyPI, for `hatchling`) and `jlpm install` (npm registry). If the workspace has no internet, point them at your mirrors in the pod env: `PIP_INDEX_URL=https://…`, `YARN_NPM_REGISTRY_SERVER=https://…`.
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: coder-workspaces
-  namespace: coder-ws
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "persistentvolumeclaims", "configmaps", "secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: coder-workspaces
-  namespace: coder-ws
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: coder-workspaces}
-subjects: [{kind: ServiceAccount, name: coder, namespace: coder}]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: coder-crd-read
-rules:
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: coder-crd-read
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: coder-crd-read}
-subjects: [{kind: ServiceAccount, name: coder, namespace: coder}]
+
+## 2. Add the module and the environment to the template
+
+In the overlay template (`main.tf` from `OVERLAY-CODER-GUIDE.md` section 5), add the module next to `coder_agent.main`:
+
+```hcl
+module "jupyterlab" {
+  count     = data.coder_workspace.me.start_count
+  source    = "registry.coder.com/coder/jupyterlab/coder"
+  version   = "<pin a version>"
+  agent_id  = coder_agent.main.id
+  subdomain = false
+  config = jsonencode({
+    ServerApp = {
+      root_dir = "/home/coder/workspace"
+      tornado_settings = {
+        headers = {
+          "Content-Security-Policy" = "frame-ancestors 'self' ${data.coder_workspace.me.access_url}"
+        }
+      }
+    }
+    FileCheckpoints = {
+      root_dir = "/home/coder/.jupyter-checkpoints"
+    }
+  })
+}
+```
+
+- `subdomain = false` makes it a path app: `https://<coder>/@<owner>/<workspace>/apps/jupyterlab/`. The app slug is `jupyterlab`, so the middle's link is `/go/jupyterlab`.
+- `config` is written to `~/.jupyter/jupyter_server_config.json` by the module on **every** start (so don't hand-edit that file, it gets overwritten). `root_dir` opens the file browser on the overlay; `FileCheckpoints.root_dir` keeps `.ipynb_checkpoints` folders out of the overlay (otherwise they land in `upper/` and get published). The `Content-Security-Policy` line is what the module adds by itself when `config` is empty; keep it when you set `config`.
+
+Add the variables `ws-publish` needs to the container `env` list in `local.pod_spec` (the Coder agent and everything it starts, including JupyterLab, inherit them):
+
+```hcl
+data "coder_external_auth" "gitlab" {
+  id = "gitlab"
+}
+
+# in local.pod_spec.containers[0].env, next to CODER_AGENT_TOKEN:
+        { name = "GITLAB_REMOTE", value = "https://gitlab.example.com/group/repo.git" },
+        { name = "WS_USER", value = data.coder_workspace_owner.me.name },
+        { name = "GITLAB_TOKEN", value = data.coder_external_auth.gitlab.access_token },
+        { name = "SCRATCH_ROOT", value = "/data/overlay" },
+```
+
+- `SCRATCH_ROOT`: `ws-publish` defaults to `/scratch`; the overlay keeps `upper/` and `.base_commit_sha` in `/data/overlay`. (The extension also defaults it to `/data/overlay` if unset.)
+- `GITLAB_TOKEN`: here from Coder external auth (the user connects GitLab once). The value is captured when the workspace starts; if your GitLab OAuth tokens are short-lived, restart the workspace to refresh it. A static test PAT in a Kubernetes Secret works too for a first test.
+
+Push the template and move the workspace onto it:
+
+```bash
+coder templates push <template> -d .
+coder update <workspace>
 ```
 
 ---
 
-## 6. Gotchas
+## 3. Check the workspace
+
+Open a terminal in the workspace (Coder web terminal, or `coder ssh <workspace>`):
+
+```bash
+command -v ws-publish ws-base git node pipx
+cat /data/overlay/.base_commit_sha
+ls /data/overlay/upper | head
+echo "remote=$GITLAB_REMOTE user=$WS_USER token_set=$([ -n "$GITLAB_TOKEN" ] && echo yes || echo NO)"
+
+# the module's JupyterLab: installed by pipx and running
+ls ~/.local/bin/jupyter-lab
+pgrep -af 'jupyter-lab --no-browser'
+tail -5 /tmp/jupyterlab.log
+```
+
+All five commands found, a base SHA, `token_set=yes`, and one `jupyter-lab --no-browser …` process. If JupyterLab is not there yet, the module is still installing it: wait and look at `/tmp/jupyterlab.log`.
+
+Open JupyterLab once from the Coder dashboard (the **JupyterLab** app) to confirm it loads.
+
+---
+
+## 4. Run the backend commands by hand first
+
+Before any UI work, make sure the commands behind the menu work from a terminal. The extension runs exactly these:
+
+```bash
+ws-base status
+ws-base check latest
+ws-publish share          # pushes a tag ws/<you>/<time> to GitLab
+ws-publish promote        # pushes a branch ws/<you>/<time>
+```
+
+If `ws-publish share` fails here, fix that first (remote, token, base commit present in GitLab). The menu will show the same error.
+
+---
+
+## 5. Create the extension source
+
+The source lives in **`/home/coder/dev/ws_actions`**:
+
+- in `/home/coder`, which is backed by a PVC, so it survives workspace restarts (the module's `pipx` JupyterLab in `~/.local` survives too);
+- **not** inside `/home/coder/workspace`: that is the overlay, anything created there lands in `upper/` and would be published by `ws-publish share`.
+
+Paste each block into the terminal. Each one creates one file.
+
+### 5.1 Folders
+
+```bash
+mkdir -p /home/coder/dev/ws_actions/{ws_actions,src,schema,style,jupyter-config/server-config}
+cd /home/coder/dev/ws_actions
+```
+
+### 5.2 `pyproject.toml` (Python packaging: where each piece lands)
+
+```bash
+cat > /home/coder/dev/ws_actions/pyproject.toml <<'EOF'
+[build-system]
+requires = ["hatchling>=1.5.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ws_actions"
+version = "0.1.0"
+description = "JupyterLab Workspace menu: share, promote and rebase the overlay workspace (ws-publish / ws-base)"
+requires-python = ">=3.9"
+dependencies = ["jupyter_server>=2.0.0,<3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ws_actions"]
+exclude = ["ws_actions/labextension"]
+
+# Where each piece lands inside the Python environment (sys.prefix):
+[tool.hatch.build.targets.wheel.shared-data]
+"ws_actions/labextension" = "share/jupyter/labextensions/ws-actions"
+"install.json" = "share/jupyter/labextensions/ws-actions/install.json"
+"jupyter-config/server-config" = "etc/jupyter/jupyter_server_config.d"
+EOF
+```
+
+### 5.3 `package.json`, `tsconfig.json`, `.yarnrc.yml` (frontend build)
+
+```bash
+cat > /home/coder/dev/ws_actions/package.json <<'EOF'
+{
+  "name": "ws-actions",
+  "version": "0.1.0",
+  "description": "Workspace menu: share, promote and rebase the overlay workspace (ws-publish / ws-base)",
+  "keywords": ["jupyter", "jupyterlab", "jupyterlab-extension"],
+  "license": "BSD-3-Clause",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "style": "style/index.css",
+  "files": ["lib/**/*.{d.ts,js}", "style/**/*.css", "schema/*.json"],
+  "scripts": {
+    "build": "jlpm build:lib && jlpm build:labextension:dev",
+    "build:prod": "jlpm build:lib && jlpm build:labextension",
+    "build:lib": "tsc",
+    "build:labextension": "jupyter labextension build .",
+    "build:labextension:dev": "jupyter labextension build --development True ."
+  },
+  "dependencies": {
+    "@jupyterlab/application": "^4.0.0",
+    "@jupyterlab/apputils": "^4.0.0",
+    "@jupyterlab/coreutils": "^6.0.0",
+    "@jupyterlab/filebrowser": "^4.0.0",
+    "@jupyterlab/services": "^7.0.0",
+    "@jupyterlab/ui-components": "^4.0.0",
+    "@lumino/widgets": "^2.0.0"
+  },
+  "devDependencies": {
+    "@jupyterlab/builder": "^4.0.0",
+    "typescript": "~5.5.4"
+  },
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "ws_actions/labextension",
+    "schemaDir": "schema"
+  }
+}
+EOF
+
+cat > /home/coder/dev/ws_actions/tsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "allowSyntheticDefaultImports": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "jsx": "react",
+    "module": "esnext",
+    "moduleResolution": "node",
+    "noEmitOnError": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "outDir": "lib",
+    "rootDir": "src",
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2018"
+  },
+  "include": ["src/*"]
+}
+EOF
+
+cat > /home/coder/dev/ws_actions/.yarnrc.yml <<'EOF'
+nodeLinker: node-modules
+EOF
+```
+
+### 5.4 `install.json` and the server auto-enable file
+
+```bash
+cat > /home/coder/dev/ws_actions/install.json <<'EOF'
+{
+  "packageManager": "python",
+  "packageName": "ws_actions",
+  "uninstallInstructions": "Use your Python package manager (pip, pipx runpip, ...) to uninstall the package ws_actions"
+}
+EOF
+
+cat > /home/coder/dev/ws_actions/jupyter-config/server-config/ws_actions.json <<'EOF'
+{
+  "ServerApp": {
+    "jpserver_extensions": {
+      "ws_actions": true
+    }
+  }
+}
+EOF
+```
+
+### 5.5 `schema/plugin.json` (where the button and the top menu appear)
+
+```bash
+cat > /home/coder/dev/ws_actions/schema/plugin.json <<'EOF'
+{
+  "title": "Workspace actions",
+  "description": "File browser 'Workspace' dropdown and top menu: status, share, promote, update base, go back.",
+  "jupyter.lab.toolbars": {
+    "FileBrowser": [
+      { "name": "ws-actions", "command": "ws-actions:menu", "rank": 36 }
+    ]
+  },
+  "jupyter.lab.menus": {
+    "main": [
+      {
+        "id": "jp-mainmenu-ws-actions",
+        "label": "Workspace",
+        "rank": 80,
+        "items": [
+          { "command": "ws-actions:status" },
+          { "type": "separator" },
+          { "command": "ws-actions:share" },
+          { "command": "ws-actions:promote" },
+          { "type": "separator" },
+          { "command": "ws-actions:rebase" },
+          { "command": "ws-actions:back" }
+        ]
+      }
+    ]
+  },
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
+EOF
+```
+
+### 5.6 `style/index.css`
+
+```bash
+cat > /home/coder/dev/ws_actions/style/index.css <<'EOF'
+.jp-WsActions-output {
+  max-height: 50vh;
+  max-width: 70vw;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  font-family: var(--jp-code-font-family);
+  font-size: var(--jp-code-font-size);
+  white-space: pre-wrap;
+  background: var(--jp-layout-color2);
+  border-radius: 4px;
+}
+
+.jp-WsActions-field {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 4px 0 8px;
+}
+EOF
+```
+
+### 5.7 `ws_actions/__init__.py` (registers both halves with Jupyter)
+
+```bash
+cat > /home/coder/dev/ws_actions/ws_actions/__init__.py <<'EOF'
+from .handlers import setup_handlers
+
+
+def _jupyter_labextension_paths():
+    return [{"src": "labextension", "dest": "ws-actions"}]
+
+
+def _jupyter_server_extension_points():
+    return [{"module": "ws_actions"}]
+
+
+def _load_jupyter_server_extension(server_app):
+    setup_handlers(server_app.web_app)
+    server_app.log.info("ws_actions server extension loaded")
+EOF
+```
+
+### 5.8 `ws_actions/handlers.py` (the server side: runs the commands)
+
+This is where the menu items become commands. Things it takes care of:
+
+- **Fixed commands, no shell.** Each action maps to a fixed argv list; the only user input is the share tag for Promote, checked against `ws/<user>/<yyyymmdd-hhmmss>`.
+- **Token never in argv or output.** `ws-publish` reads `GITLAB_TOKEN` from the environment itself. Its git errors print the push URL with the token inside (`https://oauth2:<token>@…`); the output is redacted before it reaches the browser.
+- **One action at a time.** A second click while one runs gets "another workspace action is still running".
+- **Timeouts.** 10 minutes for `ws-publish` (clone + push), 2 minutes for `ws-base`.
+- **`ws-base` exit codes.** `ws-base use/back` answer `refused: …` or `failed: …` with exit code 0, so success means "output starts with `rebased` or `already on`".
+- **Dry run.** With `WS_ACTIONS_DRY_RUN=1` it only shows the command it would run.
+
+```bash
+cat > /home/coder/dev/ws_actions/ws_actions/handlers.py <<'EOF'
+import asyncio
+import json
+import os
+import re
+from asyncio.subprocess import DEVNULL, PIPE, STDOUT
+
+import tornado
+from jupyter_server.base.handlers import APIHandler
+from jupyter_server.utils import url_path_join
+
+WS_PUBLISH = os.environ.get("WS_PUBLISH_BIN", "ws-publish")
+WS_BASE = os.environ.get("WS_BASE_BIN", "ws-base")
+# Show the command that would run instead of running it (UI testing without the backend).
+DRY_RUN = os.environ.get("WS_ACTIONS_DRY_RUN", "") == "1"
+SHARE_TAG_RE = re.compile(r"^ws/[A-Za-z0-9._-]{1,64}/[0-9]{8}-[0-9]{6}$")
+URL_CREDENTIALS_RE = re.compile(r"(https?://)[^/@\s]+@")
+BASE_SWITCHED_RE = re.compile(r"^(rebased|already on)")
+MAX_OUTPUT = 8000
+
+_lock = asyncio.Lock()
+
+
+def _force(body):
+    return ["--force"] if body.get("force") is True else []
+
+
+def _promote(body):
+    tag = str(body.get("from_tag") or "").strip()
+    if not tag:
+        return [WS_PUBLISH, "promote"]
+    if not SHARE_TAG_RE.match(tag):
+        raise tornado.web.HTTPError(400, "invalid share tag (expected ws/<user>/<yyyymmdd-hhmmss>)")
+    return [WS_PUBLISH, "promote", "-from-tag", tag]
+
+
+# action -> (argv builder, timeout in seconds). ws-publish clones and pushes, so it gets longer.
+ACTIONS = {
+    "status": (lambda b: [WS_BASE, "status"], 30),
+    "share": (lambda b: [WS_PUBLISH, "share"], 600),
+    "promote": (_promote, 600),
+    "check": (lambda b: [WS_BASE, "check", "latest"], 120),
+    "rebase": (lambda b: [WS_BASE, "use", "latest", *_force(b)], 120),
+    "back": (lambda b: [WS_BASE, "back", *_force(b)], 120),
+}
+
+
+def _env():
+    env = os.environ.copy()
+    # ws-publish defaults to /scratch; the overlay workspace keeps upper/ and .base_commit_sha here.
+    env.setdefault("SCRATCH_ROOT", env.get("WS_SCRATCH", "/data/overlay"))
+    return env
+
+
+def _redact(text):
+    token = os.environ.get("GITLAB_TOKEN", "")
+    if token:
+        text = text.replace(token, "***")
+    return URL_CREDENTIALS_RE.sub(r"\1***@", text)
+
+
+async def _run(argv, timeout):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=DEVNULL, stdout=PIPE, stderr=STDOUT, env=_env(), cwd=os.path.expanduser("~")
+        )
+    except FileNotFoundError:
+        return 127, f"{argv[0]}: command not found (set WS_PUBLISH_BIN / WS_BASE_BIN or fix PATH)"
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, f"{argv[0]} timed out after {timeout}s"
+    return proc.returncode, out.decode(errors="replace")
+
+
+class ActionHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self, action):
+        build, timeout = ACTIONS[action]
+        argv = build(self.get_json_body() or {})
+        if DRY_RUN:
+            code, output = 0, "(dry run) would run: " + " ".join(argv)
+        else:
+            if _lock.locked():
+                raise tornado.web.HTTPError(409, "another workspace action is still running")
+            async with _lock:
+                code, output = await _run(argv, timeout)
+        output = _redact(output).strip()[-MAX_OUTPUT:]
+        ok = code == 0
+        # ws-base answers "refused: ..." / "failed: ..." with exit code 0.
+        if action in ("rebase", "back") and not DRY_RUN:
+            ok = ok and bool(BASE_SWITCHED_RE.match(output))
+        self.log.info("ws_actions %s exit=%s ok=%s", action, code, ok)
+        self.finish(json.dumps({"ok": ok, "output": output}))
+
+
+def setup_handlers(web_app):
+    base_url = web_app.settings["base_url"]
+    actions = "|".join(ACTIONS)
+    web_app.add_handlers(".*$", [
+        (url_path_join(base_url, "ws-actions", "run", f"({actions})"), ActionHandler),
+    ])
+EOF
+```
+
+To add another action later: add one line to `ACTIONS` (name → argv + timeout), one command in `index.ts`, and one entry in `schema/plugin.json`.
+
+### 5.9 `src/handler.ts` (calls the server with Jupyter's auth and XSRF handling)
+
+```bash
+cat > /home/coder/dev/ws_actions/src/handler.ts <<'EOF'
+import { URLExt } from '@jupyterlab/coreutils';
+import { ServerConnection } from '@jupyterlab/services';
+
+/**
+ * Calls this extension's server routes (/ws-actions/<endPoint>) with Jupyter's auth and
+ * XSRF handling.
+ */
+export async function requestAPI<T>(endPoint = '', init: RequestInit = {}): Promise<T> {
+  const settings = ServerConnection.makeSettings();
+  const requestUrl = URLExt.join(settings.baseUrl, 'ws-actions', endPoint);
+  let response: Response;
+  try {
+    response = await ServerConnection.makeRequest(requestUrl, init, settings);
+  } catch (error) {
+    throw new ServerConnection.NetworkError(error as TypeError);
+  }
+  let data: any = await response.text();
+  if (data.length > 0) {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      // not JSON
+    }
+  }
+  if (!response.ok) {
+    throw new ServerConnection.ResponseError(response, data.message || data);
+  }
+  return data;
+}
+EOF
+```
+
+### 5.10 `src/index.ts` (the button, the menu, the dialogs)
+
+What it does:
+
+- One toolbar button (custom "branches" icon) opens a dropdown; the same commands are in the **Workspace** top menu.
+- Every action shows an in-progress notification that turns into the result, with a **Details** button that opens the full command output.
+- **Update to latest** runs the conflict check first and changes the confirm button to a red **Update anyway** when there are conflicts.
+- **Go back** offers **Go back anyway** if `ws-base` refuses.
+- After a base switch it refreshes the file browser and reminds the user to reload open files and restart kernels (open handles keep the old view, see the overlay guide).
+
+```bash
+cat > /home/coder/dev/ws_actions/src/index.ts <<'EOF'
+import { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
+import { Dialog, Notification, showDialog } from '@jupyterlab/apputils';
+import { IDefaultFileBrowser } from '@jupyterlab/filebrowser';
+import { LabIcon, listIcon, moveUpIcon, refreshIcon, shareIcon, undoIcon } from '@jupyterlab/ui-components';
+import { Menu, Widget } from '@lumino/widgets';
+
+import { requestAPI } from './handler';
+
+const CMD = {
+  menu: 'ws-actions:menu',
+  status: 'ws-actions:status',
+  share: 'ws-actions:share',
+  promote: 'ws-actions:promote',
+  rebase: 'ws-actions:rebase',
+  back: 'ws-actions:back'
+};
+
+const workspaceIcon = new LabIcon({
+  name: 'ws-actions:workspace',
+  svgstr:
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" viewBox="0 0 24 24"><g fill="none" stroke-width="2">' +
+    '<circle class="jp-icon3" stroke="#616161" cx="6" cy="5" r="2"/>' +
+    '<circle class="jp-icon3" stroke="#616161" cx="6" cy="19" r="2"/>' +
+    '<circle class="jp-icon3" stroke="#616161" cx="18" cy="7" r="2"/>' +
+    '<path class="jp-icon3" stroke="#616161" d="M6 7v10M18 9c0 5-7 4-11 8.5"/></g></svg>'
+});
+
+interface IResult {
+  ok: boolean;
+  output: string;
+}
+
+function outputBody(text: string): Widget {
+  const body = new Widget();
+  const pre = document.createElement('pre');
+  pre.className = 'jp-WsActions-output';
+  pre.textContent = text || '(no output)';
+  body.node.appendChild(pre);
+  return body;
+}
+
+async function showOutput(title: string, text: string): Promise<void> {
+  await showDialog({ title, body: outputBody(text), buttons: [Dialog.okButton({ label: 'Close' })] });
+}
+
+/** The line worth putting in a notification: "ok share ref=..." for ws-publish, else the last line. */
+function summary(output: string): string {
+  const lines = output.split('\n').map(l => l.trim()).filter(Boolean);
+  return lines.find(l => l.startsWith('ok ')) ?? lines[lines.length - 1] ?? '';
+}
+
+/** POST /ws-actions/run/<action>, with an in-progress notification that turns into the result. */
+async function run(action: string, title: string, payload: object = {}): Promise<IResult | null> {
+  const id = Notification.emit(`${title}…`, 'in-progress', { autoClose: false });
+  try {
+    const res = await requestAPI<IResult>(`run/${action}`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    Notification.update({
+      id,
+      message: `${title}: ${summary(res.output) || (res.ok ? 'done' : 'failed')}`,
+      type: res.ok ? 'success' : 'error',
+      autoClose: res.ok ? 6000 : false,
+      actions: [{ label: 'Details', callback: () => void showOutput(title, res.output) }]
+    });
+    return res;
+  } catch (e) {
+    Notification.update({ id, message: `${title} failed: ${(e as Error).message}`, type: 'error', autoClose: 8000 });
+    return null;
+  }
+}
+
+/** Promote from the current changes, or from an existing share tag. */
+class PromoteBody extends Widget {
+  private source = document.createElement('select');
+  private tag = document.createElement('input');
+
+  constructor() {
+    super();
+    const sourceLabel = document.createElement('label');
+    sourceLabel.textContent = 'Promote';
+    this.source.add(new Option('My current changes', 'changes'));
+    this.source.add(new Option('An existing share tag', 'tag'));
+    this.tag.placeholder = 'ws/<user>/<yyyymmdd-hhmmss>';
+    this.tag.disabled = true;
+    this.source.onchange = () => {
+      this.tag.disabled = this.source.value !== 'tag';
+      if (!this.tag.disabled) {
+        this.tag.focus();
+      }
+    };
+    for (const el of [this.source, this.tag]) {
+      el.className = 'jp-mod-styled jp-WsActions-field';
+    }
+    this.node.append(sourceLabel, this.source, this.tag);
+  }
+
+  getValue(): { from_tag?: string } {
+    return this.source.value === 'tag' ? { from_tag: this.tag.value.trim() } : {};
+  }
+}
+
+const plugin: JupyterFrontEndPlugin<void> = {
+  id: 'ws-actions:plugin',
+  description: 'Workspace menu: share, promote and rebase the overlay workspace.',
+  autoStart: true,
+  requires: [IDefaultFileBrowser],
+  activate: (app: JupyterFrontEnd, browser: IDefaultFileBrowser) => {
+    /** After the lower layer changed: refresh the listing and tell the user about open files. */
+    const afterBaseSwitch = async (res: IResult | null) => {
+      if (res?.ok) {
+        await browser.model.refresh();
+        Notification.info('Reload open files and restart kernels to see the new base.', { autoClose: 8000 });
+      }
+    };
+
+    app.commands.addCommand(CMD.status, {
+      label: 'Workspace status',
+      icon: listIcon,
+      execute: async () => {
+        const res = await run('status', 'Workspace status');
+        if (res) {
+          await showOutput('Workspace status', res.output);
+        }
+      }
+    });
+
+    app.commands.addCommand(CMD.share, {
+      label: 'Share a snapshot…',
+      caption: 'Commit all your changes on the current base and push them as a ws/<user>/<time> tag',
+      icon: shareIcon,
+      execute: async () => {
+        const result = await showDialog({
+          title: 'Share a snapshot',
+          body: 'Commit all your changes on top of the current base and push them as a tag ws/<you>/<time>?',
+          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Share' })]
+        });
+        if (result.button.accept) {
+          await run('share', 'Share');
+        }
+      }
+    });
+
+    app.commands.addCommand(CMD.promote, {
+      label: 'Promote…',
+      caption: 'Push your changes (or a share tag) as a ws/<user>/<time> branch for a merge request',
+      icon: moveUpIcon,
+      execute: async () => {
+        const result = await showDialog<{ from_tag?: string }>({
+          title: 'Promote',
+          body: new PromoteBody(),
+          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Promote' })]
+        });
+        if (!result.button.accept || !result.value) {
+          return;
+        }
+        if (result.value.from_tag === '') {
+          Notification.warning('Enter the share tag to promote.', { autoClose: 5000 });
+          return;
+        }
+        await run('promote', 'Promote', result.value);
+      }
+    });
+
+    app.commands.addCommand(CMD.rebase, {
+      label: 'Update to latest…',
+      caption: 'Move your workspace onto the latest commit, keeping your changes',
+      icon: refreshIcon,
+      execute: async () => {
+        const check = await run('check', 'Checking for conflicts');
+        if (!check?.ok) {
+          return;
+        }
+        const clean = check.output.startsWith('no conflicts');
+        const result = await showDialog({
+          title: 'Update to latest',
+          body: clean
+            ? 'No conflicts. Move your workspace onto the latest commit? Your changes are kept.'
+            : outputBody(
+                'Upstream also changed these files. Updating keeps YOUR copy and hides their change:\n\n' +
+                  check.output
+              ),
+          buttons: [
+            Dialog.cancelButton(),
+            clean ? Dialog.okButton({ label: 'Update' }) : Dialog.warnButton({ label: 'Update anyway' })
+          ]
+        });
+        if (result.button.accept) {
+          await afterBaseSwitch(await run('rebase', 'Update to latest', { force: !clean }));
+        }
+      }
+    });
+
+    app.commands.addCommand(CMD.back, {
+      label: 'Go back to previous base…',
+      caption: 'Return to the commit you were on before the last update',
+      icon: undoIcon,
+      execute: async () => {
+        const confirm = await showDialog({
+          title: 'Go back',
+          body: 'Move your workspace back to the previous base commit? Your changes are kept.',
+          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Go back' })]
+        });
+        if (!confirm.button.accept) {
+          return;
+        }
+        let res = await run('back', 'Go back');
+        if (res && !res.ok && res.output.startsWith('refused')) {
+          const force = await showDialog({
+            title: 'Go back anyway?',
+            body: outputBody(res.output),
+            buttons: [Dialog.cancelButton(), Dialog.warnButton({ label: 'Go back anyway' })]
+          });
+          if (!force.button.accept) {
+            return;
+          }
+          res = await run('back', 'Go back', { force: true });
+        }
+        await afterBaseSwitch(res);
+      }
+    });
+
+    const menu = new Menu({ commands: app.commands });
+    menu.title.label = 'Workspace';
+    menu.addItem({ command: CMD.status });
+    menu.addItem({ type: 'separator' });
+    menu.addItem({ command: CMD.share });
+    menu.addItem({ command: CMD.promote });
+    menu.addItem({ type: 'separator' });
+    menu.addItem({ command: CMD.rebase });
+    menu.addItem({ command: CMD.back });
+
+    app.commands.addCommand(CMD.menu, {
+      label: args => (args.toolbar ? '' : 'Workspace actions'),
+      caption: 'Share, promote or update your workspace',
+      icon: workspaceIcon,
+      execute: () => {
+        const button = document.querySelector(`.jp-FileBrowser [data-command="${CMD.menu}"]`);
+        const r = button?.getBoundingClientRect();
+        menu.open(r ? r.left : window.innerWidth / 2, r ? r.bottom : window.innerHeight / 3);
+      }
+    });
+  }
+};
+
+export default plugin;
+EOF
+```
+
+---
+
+## 6. Create the two helper scripts
+
+### 6.1 `dev-setup.sh`: link the source into the module's JupyterLab
+
+The module installed JupyterLab with `pipx`, so it lives in its own environment (`~/.local/share/pipx/venvs/jupyterlab` or similar; `pipx environment` tells you). The extension must be installed into **that** environment.
+
+```bash
+mkdir -p /home/coder/dev/scripts
+cat > /home/coder/dev/scripts/dev-setup.sh <<'EOF'
+#!/usr/bin/env bash
+# Link the ws_actions source into the JupyterLab environment the Coder jupyterlab module created
+# with pipx, build the frontend, then restart JupyterLab so the server half loads.
+# Safe to re-run. Survives workspace restarts (/home/coder is on a PVC); re-run only after
+# a pipx upgrade/reinstall of jupyterlab.
+set -euo pipefail
+
+SRC=${WS_ACTIONS_SRC:-/home/coder/dev/ws_actions}
+HERE=$(cd "$(dirname "$0")" && pwd)
+VENV="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab"
+
+[ -x "$VENV/bin/jupyter-lab" ] || { echo "JupyterLab not found in $VENV (has the module finished installing it?)"; exit 1; }
+[ -f "$SRC/pyproject.toml" ] || { echo "extension source not found in $SRC"; exit 1; }
+export PATH="$VENV/bin:$PATH"
+cd "$SRC"
+
+echo "==> editable install into $VENV"
+pipx runpip jupyterlab install -q -e "$SRC"
+
+echo "==> build the frontend"
+jlpm install >/dev/null
+jlpm build
+
+echo "==> link the frontend and enable the server extension"
+jupyter labextension develop . --overwrite
+jupyter server extension enable --sys-prefix ws_actions
+
+jupyter labextension list 2>&1 | grep -i ws-actions || { echo "frontend not registered"; exit 1; }
+jupyter server extension list 2>&1 | grep -i ws_actions || { echo "server extension not registered"; exit 1; }
+
+"$HERE/restart-jupyter.sh"
+EOF
+```
+
+What each step does:
+
+| Step | Effect |
+| --- | --- |
+| `pipx runpip jupyterlab install -e` | Jupyter imports `ws_actions/*.py` straight from `/home/coder/dev/ws_actions` |
+| `jlpm install` / `jlpm build` | compiles `src/*.ts` into `ws_actions/labextension/` |
+| `jupyter labextension develop` | symlinks `ws_actions/labextension/` into the environment, so each rebuild is picked up |
+| `jupyter server extension enable --sys-prefix` | turns the server half on in that environment |
+
+### 6.2 `restart-jupyter.sh`: restart JupyterLab with the module's own arguments
+
+Needed after Python changes. It reuses the arguments of the running JupyterLab, and adds `--ServerApp.root_dir` and `--FileCheckpoints.root_dir` only if they are missing (same values as the module `config` in step 2, as a safety net if you test without that `config`).
+
+```bash
+cat > /home/coder/dev/scripts/restart-jupyter.sh <<'EOF'
+#!/usr/bin/env bash
+# Restart the JupyterLab started by the Coder jupyterlab module, with the same arguments,
+# so Python changes (handlers.py) are picked up. Also points the file browser at the workspace
+# and keeps .ipynb_checkpoints out of the overlay (they would end up in upper/ and get published).
+set -euo pipefail
+
+LOG=${JUPYTER_LOG:-/tmp/jupyterlab.log}
+ROOT=${JUPYTER_ROOT:-$HOME/workspace}
+CHECKPOINTS=${JUPYTER_CHECKPOINTS:-/home/coder/.jupyter-checkpoints}
+PATTERN='jupyter-lab --no-browser'
+
+ARGS=$(pgrep -af "$PATTERN" | head -1 | cut -d' ' -f2-) || true
+[ -n "$ARGS" ] || { echo "JupyterLab is not running (start/restart the workspace first)"; exit 1; }
+
+case "$ARGS" in *--ServerApp.root_dir=*) ;; *) ARGS="$ARGS --ServerApp.root_dir=$ROOT" ;; esac
+case "$ARGS" in *--FileCheckpoints.root_dir=*) ;; *) ARGS="$ARGS --FileCheckpoints.root_dir=$CHECKPOINTS" ;; esac
+mkdir -p "$CHECKPOINTS"
+
+pkill -f "$PATTERN"
+for _ in $(seq 1 30); do pgrep -f "$PATTERN" >/dev/null || break; sleep 0.5; done
+
+# Start from $HOME, not inside the overlay: a cwd inside it would pin the old mount after an update.
+cd "$HOME"
+# shellcheck disable=SC2086  # ARGS is the module's argument list, split on spaces on purpose
+setsid nohup $ARGS >"$LOG" 2>&1 </dev/null &
+
+for _ in $(seq 1 60); do
+  if grep -q 'ws_actions server extension loaded' "$LOG" 2>/dev/null; then
+    echo "JupyterLab restarted; ws_actions loaded (log: $LOG)"
+    exit 0
+  fi
+  sleep 1
+done
+echo "JupyterLab restarted but ws_actions was not seen in $LOG:"
+tail -20 "$LOG"
+exit 1
+EOF
+
+chmod +x /home/coder/dev/scripts/*.sh
+```
+
+Run it from a Coder terminal (or `coder ssh`), not from `kubectl exec`: only processes started under the agent see the overlay.
+
+---
+
+## 7. Install it into the running JupyterLab
+
+### 7.1 First run in dry-run mode (UI only, nothing executed)
+
+```bash
+/home/coder/dev/scripts/dev-setup.sh
+WS_ACTIONS_DRY_RUN=1 /home/coder/dev/scripts/restart-jupyter.sh
+```
+
+Expected at the end: a `ws-actions … enabled OK` line (frontend), a `ws_actions … OK` line (server extension), then `JupyterLab restarted; ws_actions loaded (log: /tmp/jupyterlab.log)`.
+
+(`dev-setup.sh` restarts JupyterLab once normally; the second line restarts it again with the dry-run variable. JupyterLab inherits the variable from your terminal.)
+
+Reload the JupyterLab browser tab. Every menu item now answers `(dry run) would run: ws-publish share` etc., which lets you check the buttons, dialogs and wording without touching GitLab or the overlay.
+
+### 7.2 Then for real
+
+```bash
+/home/coder/dev/scripts/restart-jupyter.sh
+```
+
+(Without `WS_ACTIONS_DRY_RUN`, so the commands run.)
+
+---
+
+## 8. Try it in the browser
+
+Open JupyterLab from the Coder dashboard (or `/go/jupyterlab` through the middle). In the file browser toolbar, next to the upload/refresh buttons, there is a new "branches" icon; there is also a **Workspace** top menu.
+
+| Try | Expected |
+| --- | --- |
+| Workspace status | dialog with `base:`, `latest:`, `back ->`, `changes:` |
+| Create or edit a file in the workspace, then Share a snapshot… → Share | "Share…" spinner, then "Share: ok share ref=ws/alice/2026…"; **Details** shows the full output |
+| Promote… → My current changes | "Promote: ok promote ref=ws/alice/2026…" (a branch in GitLab) |
+| Promote… → An existing share tag, paste the tag from Share | branch created from that tag |
+| Promote… → share tag `foo` | error "invalid share tag (expected ws/<user>/<yyyymmdd-hhmmss>)" |
+| Update to latest… when nothing changed upstream in your files | "No conflicts…" → Update → "rebased … -> …", file browser refreshes |
+| Update to latest… after upstream changed a file you edited | the file list and a red **Update anyway**; accepting runs `ws-base use latest --force` |
+| Go back to previous base… | "rebased … -> …", or a **Go back anyway** dialog if refused |
+| Click Share twice quickly | second one: "another workspace action is still running" |
+
+Check from the terminal that it did what the menu said:
+
+```bash
+ws-base status
+cat /data/overlay/.base_commit_sha
+grep ws_actions /tmp/jupyterlab.log          # one line per action: name, exit code, ok
+git ls-remote --tags "$GITLAB_REMOTE" 'ws/*' # needs the token in a credential helper, or check GitLab UI
+```
+
+---
+
+## 9. The edit loop
+
+Put this in `~/.bashrc` (or run it in each terminal) so `jlpm` and `jupyter` point at the module's environment:
+
+```bash
+export PATH="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab/bin:$PATH"
+```
+
+| You changed | Do |
+| --- | --- |
+| `src/index.ts` (labels, dialogs, icons, menu order) | `cd /home/coder/dev/ws_actions && jlpm build`, then reload the browser tab |
+| `schema/plugin.json` (toolbar position, top menu) | `jlpm build`, reload; if nothing changes, `restart-jupyter.sh` then reload |
+| `ws_actions/handlers.py` (which command runs, validation, timeouts) | `/home/coder/dev/scripts/restart-jupyter.sh`, reload |
+| `style/index.css` | `jlpm build`, reload |
+
+Built-in icons you can use instead of the custom one: `import { <name> } from '@jupyterlab/ui-components'`. Common ones: `shareIcon`, `moveUpIcon`, `refreshIcon`, `undoIcon`, `redoIcon`, `listIcon`, `runIcon`, `saveIcon`, `downloadIcon`, `buildIcon`, `bugIcon`, `settingsIcon`, `checkIcon`, `closeIcon`.
+
+**After a workspace restart** there is nothing to redo. `/home/coder` is on the PVC, so the module finds the `pipx` JupyterLab in `~/.local` (it skips the install, or `pipx` says "already installed"), starts it, and the editable install, the frontend link and the server enable are all still there. Only run `dev-setup.sh` again if you delete `~/.local/share/pipx` or run `pipx upgrade jupyterlab` / `pipx reinstall jupyterlab`.
+
+---
+
+## 10. When you are happy: build the wheel and bake it into the image
+
+### 10.1 Build the wheel (in the workspace)
+
+```bash
+cd /home/coder/dev/ws_actions
+export PATH="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab/bin:$PATH"
+jlpm build:prod
+pipx runpip jupyterlab install -q build
+python -m build --wheel --no-isolation --outdir dist
+ls dist/          # ws_actions-0.1.0-py3-none-any.whl
+```
+
+Commit `/home/coder/dev/ws_actions` to your own repo (without `node_modules/`, `lib/`, `ws_actions/labextension/`, `dist/`) so the image build can produce the wheel in CI.
+
+### 10.2 Production image: JupyterLab and the wheel pre-installed
+
+```dockerfile
+# Build the extension wheel. Context: the folder that contains ws_actions/
+FROM python:3.12-bookworm AS build
+COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+RUN pip install --no-cache-dir "jupyterlab>=4.2,<5" build hatchling
+WORKDIR /src
+COPY ws_actions/ ./
+RUN jlpm install && jlpm build:prod && python -m build --wheel --no-isolation --outdir /dist
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse-overlayfs util-linux procps curl ca-certificates git python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -u 1000 -m -s /bin/bash coder
+# One environment for JupyterLab and the extension (Debian's system pip refuses installs: PEP 668).
+COPY --from=build /dist/*.whl /tmp/
+RUN python3 -m venv /opt/jupyter \
+ && /opt/jupyter/bin/pip install --no-cache-dir "jupyterlab>=4.2,<5" /tmp/*.whl \
+ && rm /tmp/*.whl
+COPY ws-publish ws-base /opt/ws/
+ENV PATH=/opt/ws:/opt/jupyter/bin:$PATH
+USER 1000
+WORKDIR /home/coder
+```
+
+No node, no pipx in the final image. The module finds `jupyter-lab` on the `PATH`, skips its install and starts it; the extension is already there (the wheel enables its server half by itself).
+
+Check the image:
+
+```bash
+docker run --rm <image> sh -c 'command -v jupyter-lab; jupyter labextension list; jupyter server extension list'
+# /opt/jupyter/bin/jupyter-lab, "ws-actions ... enabled OK", "ws_actions enabled ... OK"
+```
+
+### 10.3 Template
+
+Keep the `module "jupyterlab"` block (with its `config`) and the `GITLAB_*`, `WS_USER`, `SCRATCH_ROOT` env from [step 2](#2-add-the-module-and-the-environment-to-the-template) unchanged; only the image changes.
+
+Existing workspaces still have the dev JupyterLab in `~/.local/share/pipx/venvs/jupyterlab` on their PVC. It is harmless as long as `/opt/jupyter/bin` comes before `~/.local/bin` on the `PATH` (the production image above does not add `~/.local/bin` at all); to clean up: `pipx uninstall jupyterlab && rm -rf ~/dev`.
+
+---
+
+## 11. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `fusermount3: mount failed: Operation not permitted` | `fuse-overlayfs` run directly, no caps | wrap in `unshare -Urm` |
-| `unshare: unshare failed: Operation not permitted` | RuntimeDefault (or profile missing `unshare`) | Localhost profile from section 3 |
-| terminal / VS Code shows empty `/home/coder/workspace` | mount done by agent `startup_script` or a terminal | mount in the container entrypoint, start the agent inside |
-| `kubectl exec`: `error executing setns process` | entrypoint did `exec unshare` (PID 1 moved) | background the `unshare` tree, `wait` |
-| `kubectl exec` shows empty workspace | expected, original namespace | debug with `nsenter` (below) |
-| `wrong final value type: attribute "spec": attribute "volumes": tuple required` | bare Pod in `kubernetes_manifest`; API server adds the SA token volume | use a Deployment |
-| `cannot list resource "customresourcedefinitions"` at plan | `kubernetes_manifest` schema discovery | CRD `get`/`list` ClusterRole |
-| template fix not picked up | `coder start` keeps the workspace's template version | `coder update <ws>` |
-| `Transport endpoint is not connected` | `fuse-overlayfs` process died | restart the workspace (entrypoint remounts) |
-| editing/deleting base files: `Permission denied` / `Value too large for defined data type`; files show as `nobody` | lower owned by a uid not mapped in the nested namespace (reconciler writes as root) | `fuse-overlayfs -o ...,squash_to_root` |
-| `failed to set MOUNT_ATTR_IDMAP ... invalid argument` at container start | hostPath/PV on a filesystem without idmapped-mount support (`hostUsers: false`) | put the tree on ext4/XFS |
-| `umount: ... must be superuser to unmount` from a terminal | the terminal is in the inner namespace | rebase through `ws-base` (controller in the outer namespace) |
-| `pinned base ... is not materialized on this node` | base commit GC'd, or pod moved to a node without it | materialize pinned commits; exempt them from GC |
+| `dev-setup.sh`: "JupyterLab not found in …" | module still installing, or it used `uv` | wait for `/tmp/jupyterlab.log`; make sure `pipx` is in the image |
+| `pipx environment: error: unrecognized arguments: --value` | old pipx | use `pipx environment` and read `PIPX_LOCAL_VENVS`, or `VENV=~/.local/share/pipx/venvs/jupyterlab` (older pipx: `~/.local/pipx/venvs/jupyterlab`) |
+| `pip install -e` / `jlpm install` hang or fail | no access to PyPI / npm | `PIP_INDEX_URL`, `YARN_NPM_REGISTRY_SERVER` to your mirrors |
+| No button after `dev-setup.sh` | browser tab not reloaded, or build failed | reload; `jupyter labextension list` must show `ws-actions … enabled OK` |
+| Button there, every action "404 Not Found" | server half not loaded | `grep ws_actions /tmp/jupyterlab.log`; rerun `restart-jupyter.sh` |
+| "ws-publish: command not found" | not on JupyterLab's `PATH` | set `WS_PUBLISH_BIN=/opt/ws/ws-publish` (and `WS_BASE_BIN`) in the pod env, or fix `PATH` |
+| Share: "read base sha: … /scratch/.base_commit_sha" | `SCRATCH_ROOT` wrong | `SCRATCH_ROOT=/data/overlay` in the pod env |
+| Share: "upperdir empty — nothing to publish" | no changes in the overlay | edit a file in `~/workspace` first |
+| Update: "controller not running (/tmp/ws-base/req missing)" | `ws-base serve` not started by the entrypoint | use the `ws-base` entrypoint from the overlay guide (section 4b) |
+| After Update, an open notebook still shows old content | open handles keep the old mount | reload the file, restart the kernel (the menu reminds the user) |
+| Share output shows `https://***@…` | a git error from `ws-publish` | expected: the token is redacted; read the rest of the message |
+| `.ipynb_checkpoints` in a shared commit | JupyterLab ran without the checkpoint setting | module `config` from step 2 (`FileCheckpoints.root_dir`); delete the folder from `~/workspace` |
+| All actions "(dry run) …" | JupyterLab still has `WS_ACTIONS_DRY_RUN=1` | `restart-jupyter.sh` from a terminal without that variable |
 
 ---
 
-## 7. Verify and debug
+## 12. Things to know about `ws-publish` today
 
-From a Coder terminal or `coder ssh`:
+`ws-publish` is still a skeleton. Three behaviours matter for the menu:
 
-```sh
-id                                              # uid=1000(coder)
-grep ' /home/coder/workspace ' /proc/self/mountinfo   # fuse-overlayfs
-ls -la /home/coder/workspace
-```
+1. **The token is in the push URL.** It pushes to `https://oauth2:<token>@host/…`, so the token is in `git`'s argv (visible to `ps` inside the workspace) and in error messages. The extension redacts it from what the browser sees; the real fix is a `GIT_ASKPASS` helper in `ws-publish`.
+2. **It never fetches after the first clone.** It clones into `/tmp/ws-publish-git` once and reuses it. After **Update to latest** moves `.base_commit_sha` to a commit that clone has never seen, Share/Promote fail with `checkout base …`. Until `ws-publish` runs `git fetch` before `checkout`, clear the clone: `rm -rf /tmp/ws-publish-git`.
+3. **It publishes everything in `upper/`.** Anything JupyterLab or Python writes inside `~/workspace` (`__pycache__/`, `.ipynb_checkpoints/` without the setting above, `.virtual_documents/`) ends up in the commit. Keep the checkpoint setting, set `PYTHONDONTWRITEBYTECODE=1` in the pod env, or add an ignore list to `ws-publish`.
 
-Where edits land (from `kubectl exec`, original namespace):
-
-```sh
-kubectl exec deploy/<workspace> -- ls -la /data/overlay/upper /data/lower
-# edits in upper; deletions as c--------- whiteouts; lower unchanged
-```
-
-See the overlay from `kubectl exec` (profile must allow `setns`):
-
-```sh
-kubectl exec -it deploy/<workspace> -- sh -c 'nsenter -t $(pgrep -x fuse-overlayfs) -U -m --preserve-credentials sh'
-```
-
-You appear as root there (uid 1000 on disk). Joining the agent's inner user namespace directly fails for the mount namespace (`reassociate to namespace 'ns/mnt' failed`) because the mount namespace belongs to the outer nested user namespace.
+Promote pushes a branch; the merge request API call is still a TODO in `ws-publish` (it prints `MR API not implemented yet`).
 
 ---
 
-## 8. Evidence (kind)
+## 13. File reference
 
-| Test | Result |
-| --- | --- |
-| restricted, RuntimeDefault, `fuse-overlayfs` direct | `cannot mount: Operation not permitted` |
-| restricted, RuntimeDefault, `unshare -Urm` | `unshare` EPERM |
-| restricted, Localhost profile, `unshare -Urm` + `fuse-overlayfs` | OK: COW, whiteouts, lower untouched |
-| restricted, Localhost profile, `unshare -Urm` + kernel overlay | OK |
-| baseline, `SETUID`/`SETGID`/`SETFCAP` + priv-esc, `fuse-overlayfs` direct | same `fusermount3` error |
-| privileged, root + `SYS_ADMIN`, kernel overlay direct | fails; needs + `MKNOD`, `DAC_OVERRIDE`, `FOWNER`, `CHOWN` |
-| restricted, admission of `SYS_ADMIN` or `allowPrivilegeEscalation: true` | rejected |
-| Coder v2.36.5 workspace with wrapper entrypoint, `coder ssh` | overlay visible, `uid=1000(coder)`, writes to upper |
-| code-server app via Coder | HTTP 200 on the workspace folder |
-| `kubectl exec` into the workspace | works, sees empty dir (expected) |
-| root-owned lower (hostPath PV + ROX PVC, `restricted`), no squash | edit `Permission denied`, `rm` EOVERFLOW, new files only |
-| same with `squash_to_root` | edit, `rm`, create all OK; upper uid 1000, `c` 0/0 whiteouts |
-| `ws-base`: commits arriving after start; `use latest`, conflict refusal, `--force`, `back` x3, `use tag/C` | OK; `.base_commit_sha` follows; bad refs rejected; one `fuse-overlayfs` left |
+The same files are in this repo under `spike-middle/ws-actions-lab/`:
 
----
-
-## Open items
-
-- **Bottlerocket SELinux**: not testable on kind. Confirm `unshare -Urm true` and the FUSE mount on an EKS Bottlerocket node; if `unshare` works but the mount fails, SELinux policy is the suspect.
-- **Security trade-off**: unprivileged user namespaces + FUSE/overlay widen kernel attack surface (e.g. CVE-2023-0386). `hostUsers: false` limits the blast radius. Keep nodes patched.
-- **Single uid inside**: fine for a file overlay; tools needing many uids (nested Podman) need `newuidmap` and more privilege.
-- **Real Coder web terminal in a browser**: the lab verified via `coder ssh` (same agent session path) and code-server over HTTP; visual browser check is still worth doing on the target cluster.
-
----
-
-## Appendix A: `ws-base`
-
-Install at `/opt/ws/ws-base` (ConfigMap with `defaultMode: 0755`, or bake into the image). Needs `bash`, `fuse-overlayfs`, `util-linux`, `diffutils`, `findutils`, `coreutils` (all in `debian:bookworm-slim` + `fuse-overlayfs util-linux`).
-
-```bash
-#!/bin/bash
-# ws-base: move the workspace overlay's lower dir between materialized commits.
-#
-#   ws-base mount                            pin (first start) + mount; outer nested namespace
-#   ws-base serve                            rebase controller; outer nested namespace, background
-#   ws-base status | list                    read-only, from any terminal
-#   ws-base check <ref>                      files whose upstream changed under your edits
-#   ws-base use <sha|latest|tag/NAME> [--force]
-#   ws-base back [--force]                   return to the previous base
-#
-# Layout (reconciler export root and ws-publish scratch root):
-#   $WS_GIT_ROOT/commits/<sha>/  CURRENT_SHA  tags/<name> -> ../commits/<sha>
-#   $WS_SCRATCH/upper/  work/  .base_commit_sha  .base_history
-set -uo pipefail
-
-GIT_ROOT=${WS_GIT_ROOT:-/git-backend}
-SCRATCH=${WS_SCRATCH:-/data/overlay}
-MERGED=${WS_MERGED:-/home/coder/workspace}
-CTL=${WS_BASE_CTL:-/tmp/ws-base}
-U=$SCRATCH/upper W=$SCRATCH/work
-BASE_FILE=$SCRATCH/.base_commit_sha HIST=$SCRATCH/.base_history
-
-err() { echo "ws-base: $*" >&2; return 1; }
-
-current_base() { tr -d '[:space:]' < "$BASE_FILE" 2>/dev/null; }
-latest_sha() { tr -d '[:space:]' < "$GIT_ROOT/CURRENT_SHA" 2>/dev/null; }
-
-resolve() {
-  local ref=$1 sha name
-  local -a hits
-  case $ref in
-    latest)
-      sha=$(latest_sha) ;;
-    tag/*)
-      name=${ref#tag/}
-      case $name in ""|*..*|/*|*[!A-Za-z0-9._/-]*) err "bad tag name: $name"; return ;; esac
-      sha=$(readlink "$GIT_ROOT/tags/$name") || { err "no such tag: $name"; return; }
-      sha=${sha##*/} ;;
-    *)
-      case $ref in ""|*[!0-9a-f]*) err "bad ref: $ref"; return ;; esac
-      [ ${#ref} -ge 7 ] || { err "sha prefix too short: $ref"; return; }
-      shopt -s nullglob
-      hits=("$GIT_ROOT/commits/$ref"*)
-      shopt -u nullglob
-      [ ${#hits[@]} -eq 1 ] || { err "$ref matches ${#hits[@]} materialized commits"; return; }
-      sha=${hits[0]##*/} ;;
-  esac
-  case $sha in ""|*[!0-9a-f]*) err "cannot resolve $ref"; return ;; esac
-  [ -d "$GIT_ROOT/commits/$sha" ] || { err "$sha is not materialized on this node"; return; }
-  echo "$sha"
-}
-
-lower_differs() {
-  local a=$1/$3 b=$2/$3
-  if [ -L "$a" ] || [ -L "$b" ]; then
-    [ "$(readlink "$a" 2>/dev/null)" != "$(readlink "$b" 2>/dev/null)" ]
-  elif [ -d "$a" ] || [ -d "$b" ]; then
-    ! diff -rq --no-dereference "$a" "$b" >/dev/null 2>&1
-  elif [ -e "$a" ] || [ -e "$b" ]; then
-    ! cmp -s "$a" "$b"
-  else
-    return 1
-  fi
-}
-
-# Upper entries that shadow a path whose content differs between two bases:
-# after the switch the user's copy (or whiteout) silently hides the upstream change.
-stale_paths() {
-  local old=$GIT_ROOT/commits/$1 new=$GIT_ROOT/commits/$2 p name rel
-  (cd "$U" && find . -mindepth 1 ! -type d -print0) | while IFS= read -r -d '' p; do
-    p=${p#./} name=${p##*/}
-    case $name in
-      .wh..wh..opq) rel=$(dirname "$p") ;;
-      .wh.*) rel=$(dirname "$p")/${name#.wh.}; rel=${rel#./} ;;
-      *) rel=$p ;;
-    esac
-    lower_differs "$old" "$new" "$rel" || continue
-    # Converged with upstream: deleted on both sides, or identical content.
-    if [ -c "$U/$p" ] || [ "$name" != "${name#.wh.}" ]; then
-      [ -e "$new/$rel" ] || [ -L "$new/$rel" ] || continue
-    elif [ -f "$U/$p" ] && [ ! -L "$U/$p" ] && cmp -s "$U/$p" "$new/$rel"; then
-      continue
-    fi
-    printf '%s\n' "$rel"
-  done | sort -u
-}
-
-# squash_to_root: the reconciler's files are owned by host root, which is unmapped in the nested
-# namespace (shows as nobody); without it copy-up fails with EACCES/EOVERFLOW.
-mount_overlay() {
-  fuse-overlayfs -o "lowerdir=$GIT_ROOT/commits/$1,upperdir=$U,workdir=$W,squash_to_root" "$MERGED" 2> >(grep -v lazytime >&2)
-}
-
-write_base() {
-  printf '%s\n' "$1" > "$BASE_FILE.tmp" && mv "$BASE_FILE.tmp" "$BASE_FILE"
-}
-
-do_mount() {
-  local sha
-  mkdir -p "$U" "$W" "$MERGED"
-  if [ -z "$(current_base)" ]; then
-    sha=$(resolve "${WS_BASE_REF:-latest}") || return
-    write_base "$sha"
-  fi
-  sha=$(current_base)
-  [ -d "$GIT_ROOT/commits/$sha" ] || { err "pinned base $sha is not materialized on this node"; return; }
-  mount_overlay "$sha"
-}
-
-switch_to() {
-  local cmd=$1 target=$2 force=$3 cur stale
-  cur=$(current_base)
-  [ "$target" != "$cur" ] || { echo "already on $cur"; return 0; }
-  stale=$(stale_paths "$cur" "$target")
-  if [ -n "$stale" ] && [ "$force" != force ]; then
-    echo "refused: upstream changed these paths between ${cur:0:12} and ${target:0:12},"
-    echo "and your copy would hide that change (re-run with --force to keep yours):"
-    printf '%s\n' "$stale" | sed 's/^/  /'
-    return 0
-  fi
-  if ! umount -l "$MERGED"; then echo "failed: could not unmount $MERGED"; return 0; fi
-  if ! mount_overlay "$target"; then
-    mount_overlay "$cur" && echo "failed: mount on $target; restored $cur" \
-      || echo "failed: mount on $target and restore of $cur; restart the workspace"
-    return 0
-  fi
-  if [ "$cmd" = back ]; then sed -i '$d' "$HIST"; else echo "$cur" >> "$HIST"; fi
-  write_base "$target"
-  echo "rebased ${cur:0:12} -> ${target:0:12}"
-  [ -z "$stale" ] || { echo "kept your copy of:"; printf '%s\n' "$stale" | sed 's/^/  /'; }
-  echo "cd out and back into $MERGED (and reload the editor) to see the new base"
-}
-
-handle() {
-  local cmd=$1 arg=$2 force=$3 target
-  case $cmd in
-    use)  target=$(resolve "$arg" 2>&1) || { echo "$target"; return 0; } ;;
-    back) target=$(tail -n1 "$HIST" 2>/dev/null)
-          [ -n "$target" ] || { echo "no previous base"; return 0; }
-          [ -d "$GIT_ROOT/commits/$target" ] || { echo "previous base $target is no longer materialized"; return 0; } ;;
-    *)    echo "unknown request: $cmd"; return 0 ;;
-  esac
-  switch_to "$cmd" "$target" "$force"
-}
-
-serve() {
-  local id cmd arg force
-  mkdir -p -m 0700 "$CTL"
-  rm -f "$CTL/req"; mkfifo -m 0600 "$CTL/req"
-  exec 3<> "$CTL/req"
-  while read -r id cmd arg force <&3; do
-    case $id in ""|*[!0-9.]*) continue ;; esac
-    handle "$cmd" "$arg" "$force" > "$CTL/res.$id.tmp" 2>&1
-    mv "$CTL/res.$id.tmp" "$CTL/res.$id"
-  done
-}
-
-request() {
-  local id=$$.$RANDOM i
-  [ -p "$CTL/req" ] || err "controller not running ($CTL/req missing)" || return
-  printf '%s %s %s %s\n' "$id" "$1" "${2:--}" "${3:--}" | timeout 5 tee "$CTL/req" >/dev/null \
-    || { err "controller not responding"; return; }
-  for i in $(seq 1 600); do
-    [ -f "$CTL/res.$id" ] && { cat "$CTL/res.$id"; rm -f "$CTL/res.$id"; return 0; }
-    sleep 0.1
-  done
-  err "timed out waiting for the controller"
-}
-
-status() {
-  local cur latest n
-  cur=$(current_base) latest=$(latest_sha)
-  n=$( (cd "$U" && find . -mindepth 1 ! -type d) 2>/dev/null | wc -l)
-  echo "base:    $cur"
-  echo "latest:  $latest$([ "$cur" = "$latest" ] && echo "  (up to date)")"
-  echo "back ->  $(tail -n1 "$HIST" 2>/dev/null || true)"
-  echo "changes: $n entries in upper"
-}
-
-list() {
-  local cur latest d s t
-  cur=$(current_base) latest=$(latest_sha)
-  for d in "$GIT_ROOT"/commits/*/; do
-    s=$(basename "$d")
-    case $s in *[!0-9a-f]*) continue ;; esac
-    printf '%s %s%s\n' "$s" "$([ "$s" = "$cur" ] && echo '[base]')" "$([ "$s" = "$latest" ] && echo '[latest]')"
-  done
-  [ -d "$GIT_ROOT/tags" ] && (cd "$GIT_ROOT/tags" && find . -type l | sed 's|^\./||') | while read -r t; do
-    printf 'tag/%s -> %s\n' "$t" "$(basename "$(readlink "$GIT_ROOT/tags/$t")")"
-  done
-}
-
-force=-
-[ "${3:-}" = --force ] || [ "${2:-}" = --force ] && force=force
-case ${1:-} in
-  mount)  do_mount ;;
-  serve)  serve ;;
-  status) status ;;
-  list)   list ;;
-  check)  t=$(resolve "${2:?ref}") && s=$(stale_paths "$(current_base)" "$t") \
-            && { [ -n "$s" ] && printf '%s\n' "$s" || echo "no conflicts with $t"; } ;;
-  use)    [ -n "${2:-}" ] && [ "$2" != --force ] || { err "usage: ws-base use <sha|latest|tag/NAME> [--force]"; exit 2; }
-          request use "$2" "$force" ;;
-  back)   request back - "$force" ;;
-  *)      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
-esac
+```text
+ws-actions-lab/
+├── scripts/
+│   ├── dev-setup.sh           # step 6.1
+│   └── restart-jupyter.sh     # step 6.2
+└── ws_actions/
+    ├── pyproject.toml         # 5.2
+    ├── package.json           # 5.3
+    ├── tsconfig.json          # 5.3
+    ├── .yarnrc.yml            # 5.3
+    ├── install.json           # 5.4
+    ├── jupyter-config/server-config/ws_actions.json   # 5.4
+    ├── schema/plugin.json     # 5.5
+    ├── style/index.css        # 5.6
+    ├── ws_actions/__init__.py # 5.7
+    ├── ws_actions/handlers.py # 5.8
+    ├── src/handler.ts         # 5.9
+    └── src/index.ts           # 5.10
 ```
+
+Related docs: `overlay-restricted-lab/OVERLAY-CODER-GUIDE.md` (overlay, `ws-base`), `spike-middle/docs/jupyter-custom-actions-and-coder-sso.md` (extension concepts, Coder SSO through the middle), `adr-001-git-csi-kind-quest/workspace-publish/` (`ws-publish`).
