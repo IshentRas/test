@@ -79,6 +79,21 @@ unshare -U --map-user=1000 --map-group=1000 <command>
 
 Inside: `uid=1000(coder)`, writes and copy-up work, upper files owned by 1000. Only this single uid is mapped (multi-uid maps need `newuidmap`, which needs privilege escalation). Image files owned by root show as `nobody` but stay readable/executable.
 
+### Lower tree owned by root needs `squash_to_root`
+
+The nested namespace maps only container uid 1000. A lower tree written by anything else (the reconciler writes `commits/<sha>/` as host root; with `hostUsers: false` the kubelet idmaps the volume so it shows as uid 0 in the container) appears as `nobody` inside, and the overlay becomes read-mostly:
+
+| Action on a root-owned lower file | Without `squash_to_root` | With `squash_to_root` |
+| --- | --- | --- |
+| edit / append | `Permission denied` | OK (copy-up) |
+| `rm` | `Value too large for defined data type` | OK (whiteout) |
+| create inside a lower directory | `Permission denied` | OK |
+| create at the top level | OK | OK |
+
+`fuse-overlayfs -o ...,squash_to_root` presents every file as owned by the namespace root, i.e. `coder` for the agent. The upper dir stays clean: uid 1000 on disk, whiteouts as `c---------` 0/0 (what `ws-publish` expects). Earlier labs missed this because their lower was owned by uid 1000.
+
+Related: the kubelet's idmapped bind mount needs a filesystem that supports idmapped mounts (ext4/XFS on EKS are fine). On kind, a hostPath under the node's overlay rootfs (`/mnt`) failed with `failed to set MOUNT_ATTR_IDMAP ... invalid argument`; under `/var/lib` (ext4) it worked.
+
 ---
 
 ## 2. Requirements checklist
@@ -163,13 +178,15 @@ mkdir -p "$L" "$U" "$W" "$M"
 
 # PID 1 must stay in the container's original namespaces, or kubectl exec / exec probes break.
 unshare -Urm sh -c '
-  fuse-overlayfs -o "lowerdir=$1,upperdir=$2,workdir=$3" "$4"
+  fuse-overlayfs -o "lowerdir=$1,upperdir=$2,workdir=$3,squash_to_root" "$4"
   exec unshare -U --map-user=1000 --map-group=1000 sh -c "$5"
 ' sh "$L" "$U" "$W" "$M" "$CODER_INIT_SCRIPT" &
 child=$!
 trap 'kill -TERM "$child"' TERM INT
 wait "$child"
 ```
+
+`squash_to_root` is needed when the lower tree is owned by anyone other than uid 1000 (e.g. the reconciler's root-owned `commits/<sha>/`); see [Lower tree owned by root](#lower-tree-owned-by-root-needs-squash_to_root).
 
 What happens:
 
@@ -181,6 +198,84 @@ What happens:
 Kernel overlay alternative (no `/dev/fuse` needed, subject to Bottlerocket SELinux): replace the `fuse-overlayfs` line with `mount -t overlay overlay -o "lowerdir=$1,upperdir=$2,workdir=$3,userxattr" "$4"`.
 
 The lab seeded the lower dir on first start (`git clone --depth 1 ... "$L"`). In the real design the lower dir is the pinned, materialized Git commit.
+
+### 4b. Moving the base to newer commits and back (`ws-base`)
+
+With the distributed Git storage, the lower is a pinned `commits/<sha>/` materialized by the node reconciler, and new commits keep arriving after the workspace started. `ws-base` lets the user move the workspace onto a newer commit and back again, keeping their upper-layer edits. Full script: [Appendix A](#appendix-a-ws-base). Lab: `ws-base/` (`run.sh`).
+
+**Where it runs.** Only the **outer** nested user namespace (created by `unshare -Urm`) can unmount/mount: it owns the mount namespace. The agent, terminals and code-server run in the inner namespace and get `must be superuser to unmount`, so users cannot touch the mount directly. `ws-base serve` runs in the outer namespace as a small controller; user commands send it requests through a FIFO under `/tmp/ws-base/`.
+
+**Entrypoint** (replaces section 4 when you use `ws-base`):
+
+```sh
+#!/bin/sh
+set -e
+export PATH=/opt/ws:$PATH
+
+# PID 1 must stay in the container's original namespaces, or kubectl exec / exec probes break.
+# The rebase controller lives in the outer nested namespace: it owns the mount namespace.
+unshare -Urm sh -c '
+  ws-base mount
+  ws-base serve &
+  exec unshare -U --map-user=1000 --map-group=1000 sh -c "$1"
+' sh "$CODER_INIT_SCRIPT" &
+child=$!
+trap 'kill -TERM "$child"' TERM INT
+wait "$child"
+```
+
+**Mount the export root, not one commit.** The lower must come from a volume holding the whole reconciler export root (`commits/`, `CURRENT_SHA`, `tags/`), mounted read-only at `WS_GIT_ROOT` (default `/git-backend`). The reconciler materializes into a temp dir and renames it into `commits/<sha>`, so a new commit is just a new directory on an already-mounted filesystem and shows up inside the nested namespace with no mount propagation. Mounting `commits/<sha>` alone (as in `example-workspace-pod.yaml`) makes later commits invisible.
+
+**State** lives on the scratch PVC next to `upper/` and `work/` (`WS_SCRATCH`, default `/data/overlay`), so it survives restarts:
+
+| File | Role |
+| --- | --- |
+| `.base_commit_sha` | current base; `ws-base mount` pins it on first start (`WS_BASE_REF`, default `latest`) and remounts it after a restart. It is also the parent `ws-publish` uses, so it must change with the remount (it does, atomically). |
+| `.base_history` | stack of previous bases; `use` pushes, `back` pops |
+
+**Commands** (from a Coder terminal):
+
+| Command | Effect |
+| --- | --- |
+| `ws-base status` | base, latest (`CURRENT_SHA`), what `back` returns to, number of upper entries |
+| `ws-base list` | materialized commits and tags on this node |
+| `ws-base check <ref>` | dry run: which of your changes would hide an upstream change |
+| `ws-base use latest` / `use <sha-prefix>` / `use tag/<name>` | switch base; refuses if `check` finds conflicts |
+| `ws-base back` | return to the previous base |
+| add `--force` | switch anyway and keep your copies |
+
+**Conflict check.** Moving the upper onto a different lower is not a Git rebase: any file in `upper/` simply shadows the new lower. If upstream changed a file you also edited (or deleted), your copy would silently hide their change, and a later `ws-publish` would revert it. Before switching, `ws-base` walks only `upper/` (cheap, no repo scan) and flags a path when the two bases differ there **and** your version differs from the new one. Convergent changes are not flagged (both deleted, or your edit equals upstream's). The check compares old base vs new base, not your file's original base, so after several switches it can be conservative (see `old.txt` below). Opaque directories stored as xattrs (kernel overlay) are not detected.
+
+**Lab run** (kind, `restricted`, `hostUsers: false`, no added caps; a reconciler container adds commits to a shared volume after the workspace started; the workspace mounts it read-only):
+
+```text
+## start on A; user edits shared.txt, deletes old.txt, adds notes.txt
+## B arrives (changes upstream.txt, adds new-in-b.txt)
+$ ws-base check latest      ->  no conflicts
+$ ws-base use latest        ->  rebased 6dcd4ce23d88 -> ae4f281df5a5
+  VERSION=B, upstream.txt=u2, new-in-b.txt visible, shared.txt = "my edit"
+## C arrives (edits shared.txt, deletes old.txt)
+$ ws-base use latest        ->  refused: ... shared.txt        (old.txt converged: not flagged)
+$ ws-base use latest --force->  rebased ae4f281df5a5 -> 32096c2e0eff, kept your copy of shared.txt
+  .base_commit_sha = C (ws-publish parent)
+$ ws-base back              ->  refused: old.txt, shared.txt
+$ ws-base back --force      ->  B
+$ ws-base back              ->  A
+$ ws-base back              ->  no previous base
+$ ws-base use tag/C --force ->  C
+$ ws-base use ../../etc     ->  bad ref;  use tag/../../etc -> bad tag name
+$ umount -l ~/workspace     ->  must be superuser to unmount
+one fuse-overlayfs left (old ones exit once nothing holds the detached mount)
+```
+
+Things to watch:
+
+- **Retention/GC must respect pins.** The reconciler only materializes `ACTIVE_COMMIT` and tagged commits, and a GC of `commits/<sha>/` is planned. A workspace's `.base_commit_sha` and `.base_history` entries must stay materialized, or the workspace cannot remount after a restart (`pinned base ... is not materialized on this node`) and `back` fails. Same after a reschedule to another git-worker. Options: have workspaces publish their pins (e.g. a ConfigMap/annotation the reconciler materializes and GC skips), or keep commits for N days.
+- **Getting the export root into a restricted pod.** PSA `baseline` and `restricted` forbid `hostPath` volumes in the pod spec. Use a `PersistentVolume` (hostPath or `local`, with node affinity to git-workers) bound to a `ReadOnlyMany` PVC, or a CSI bind (non-FUSE) mode of git-csi. Tested: a hostPath PV + ROX PVC is admitted in `restricted` with `hostUsers: false`.
+- **`squash_to_root` is mandatory** for the reconciler's root-owned tree ([section 1](#lower-tree-owned-by-root-needs-squash_to_root)); `ws-base` sets it.
+- **Open handles keep the old view.** A shell whose cwd was inside the workspace, or an editor with open files, keeps seeing the old base until it re-enters the directory or reloads. Until the detached mount is released, those handles can still write into the same upper dir. Switch when the workspace is quiet.
+- **Only the user's own workspace can request.** The FIFO is mode 0600 in the pod; anything running in the workspace can use it, which is the same trust level as the user. Requests are validated (hex SHA prefix that exists under `commits/`, `latest`, or `tag/<name>` without `..`).
+- **Kernel overlay alternative.** If you use `mount -t overlay ... userxattr` instead of FUSE, keep `redirect_dir`, `metacopy` and `index` off (the defaults in a user namespace): changing the lower under an existing upper is only supported without them.
 
 ---
 
@@ -429,6 +524,10 @@ subjects: [{kind: ServiceAccount, name: coder, namespace: coder}]
 | `cannot list resource "customresourcedefinitions"` at plan | `kubernetes_manifest` schema discovery | CRD `get`/`list` ClusterRole |
 | template fix not picked up | `coder start` keeps the workspace's template version | `coder update <ws>` |
 | `Transport endpoint is not connected` | `fuse-overlayfs` process died | restart the workspace (entrypoint remounts) |
+| editing/deleting base files: `Permission denied` / `Value too large for defined data type`; files show as `nobody` | lower owned by a uid not mapped in the nested namespace (reconciler writes as root) | `fuse-overlayfs -o ...,squash_to_root` |
+| `failed to set MOUNT_ATTR_IDMAP ... invalid argument` at container start | hostPath/PV on a filesystem without idmapped-mount support (`hostUsers: false`) | put the tree on ext4/XFS |
+| `umount: ... must be superuser to unmount` from a terminal | the terminal is in the inner namespace | rebase through `ws-base` (controller in the outer namespace) |
+| `pinned base ... is not materialized on this node` | base commit GC'd, or pod moved to a node without it | materialize pinned commits; exempt them from GC |
 
 ---
 
@@ -473,6 +572,9 @@ You appear as root there (uid 1000 on disk). Joining the agent's inner user name
 | Coder v2.36.5 workspace with wrapper entrypoint, `coder ssh` | overlay visible, `uid=1000(coder)`, writes to upper |
 | code-server app via Coder | HTTP 200 on the workspace folder |
 | `kubectl exec` into the workspace | works, sees empty dir (expected) |
+| root-owned lower (hostPath PV + ROX PVC, `restricted`), no squash | edit `Permission denied`, `rm` EOVERFLOW, new files only |
+| same with `squash_to_root` | edit, `rm`, create all OK; upper uid 1000, `c` 0/0 whiteouts |
+| `ws-base`: commits arriving after start; `use latest`, conflict refusal, `--force`, `back` x3, `use tag/C` | OK; `.base_commit_sha` follows; bad refs rejected; one `fuse-overlayfs` left |
 
 ---
 
@@ -482,3 +584,218 @@ You appear as root there (uid 1000 on disk). Joining the agent's inner user name
 - **Security trade-off**: unprivileged user namespaces + FUSE/overlay widen kernel attack surface (e.g. CVE-2023-0386). `hostUsers: false` limits the blast radius. Keep nodes patched.
 - **Single uid inside**: fine for a file overlay; tools needing many uids (nested Podman) need `newuidmap` and more privilege.
 - **Real Coder web terminal in a browser**: the lab verified via `coder ssh` (same agent session path) and code-server over HTTP; visual browser check is still worth doing on the target cluster.
+
+---
+
+## Appendix A: `ws-base`
+
+Install at `/opt/ws/ws-base` (ConfigMap with `defaultMode: 0755`, or bake into the image). Needs `bash`, `fuse-overlayfs`, `util-linux`, `diffutils`, `findutils`, `coreutils` (all in `debian:bookworm-slim` + `fuse-overlayfs util-linux`).
+
+```bash
+#!/bin/bash
+# ws-base: move the workspace overlay's lower dir between materialized commits.
+#
+#   ws-base mount                            pin (first start) + mount; outer nested namespace
+#   ws-base serve                            rebase controller; outer nested namespace, background
+#   ws-base status | list                    read-only, from any terminal
+#   ws-base check <ref>                      files whose upstream changed under your edits
+#   ws-base use <sha|latest|tag/NAME> [--force]
+#   ws-base back [--force]                   return to the previous base
+#
+# Layout (reconciler export root and ws-publish scratch root):
+#   $WS_GIT_ROOT/commits/<sha>/  CURRENT_SHA  tags/<name> -> ../commits/<sha>
+#   $WS_SCRATCH/upper/  work/  .base_commit_sha  .base_history
+set -uo pipefail
+
+GIT_ROOT=${WS_GIT_ROOT:-/git-backend}
+SCRATCH=${WS_SCRATCH:-/data/overlay}
+MERGED=${WS_MERGED:-/home/coder/workspace}
+CTL=${WS_BASE_CTL:-/tmp/ws-base}
+U=$SCRATCH/upper W=$SCRATCH/work
+BASE_FILE=$SCRATCH/.base_commit_sha HIST=$SCRATCH/.base_history
+
+err() { echo "ws-base: $*" >&2; return 1; }
+
+current_base() { tr -d '[:space:]' < "$BASE_FILE" 2>/dev/null; }
+latest_sha() { tr -d '[:space:]' < "$GIT_ROOT/CURRENT_SHA" 2>/dev/null; }
+
+resolve() {
+  local ref=$1 sha name
+  local -a hits
+  case $ref in
+    latest)
+      sha=$(latest_sha) ;;
+    tag/*)
+      name=${ref#tag/}
+      case $name in ""|*..*|/*|*[!A-Za-z0-9._/-]*) err "bad tag name: $name"; return ;; esac
+      sha=$(readlink "$GIT_ROOT/tags/$name") || { err "no such tag: $name"; return; }
+      sha=${sha##*/} ;;
+    *)
+      case $ref in ""|*[!0-9a-f]*) err "bad ref: $ref"; return ;; esac
+      [ ${#ref} -ge 7 ] || { err "sha prefix too short: $ref"; return; }
+      shopt -s nullglob
+      hits=("$GIT_ROOT/commits/$ref"*)
+      shopt -u nullglob
+      [ ${#hits[@]} -eq 1 ] || { err "$ref matches ${#hits[@]} materialized commits"; return; }
+      sha=${hits[0]##*/} ;;
+  esac
+  case $sha in ""|*[!0-9a-f]*) err "cannot resolve $ref"; return ;; esac
+  [ -d "$GIT_ROOT/commits/$sha" ] || { err "$sha is not materialized on this node"; return; }
+  echo "$sha"
+}
+
+lower_differs() {
+  local a=$1/$3 b=$2/$3
+  if [ -L "$a" ] || [ -L "$b" ]; then
+    [ "$(readlink "$a" 2>/dev/null)" != "$(readlink "$b" 2>/dev/null)" ]
+  elif [ -d "$a" ] || [ -d "$b" ]; then
+    ! diff -rq --no-dereference "$a" "$b" >/dev/null 2>&1
+  elif [ -e "$a" ] || [ -e "$b" ]; then
+    ! cmp -s "$a" "$b"
+  else
+    return 1
+  fi
+}
+
+# Upper entries that shadow a path whose content differs between two bases:
+# after the switch the user's copy (or whiteout) silently hides the upstream change.
+stale_paths() {
+  local old=$GIT_ROOT/commits/$1 new=$GIT_ROOT/commits/$2 p name rel
+  (cd "$U" && find . -mindepth 1 ! -type d -print0) | while IFS= read -r -d '' p; do
+    p=${p#./} name=${p##*/}
+    case $name in
+      .wh..wh..opq) rel=$(dirname "$p") ;;
+      .wh.*) rel=$(dirname "$p")/${name#.wh.}; rel=${rel#./} ;;
+      *) rel=$p ;;
+    esac
+    lower_differs "$old" "$new" "$rel" || continue
+    # Converged with upstream: deleted on both sides, or identical content.
+    if [ -c "$U/$p" ] || [ "$name" != "${name#.wh.}" ]; then
+      [ -e "$new/$rel" ] || [ -L "$new/$rel" ] || continue
+    elif [ -f "$U/$p" ] && [ ! -L "$U/$p" ] && cmp -s "$U/$p" "$new/$rel"; then
+      continue
+    fi
+    printf '%s\n' "$rel"
+  done | sort -u
+}
+
+# squash_to_root: the reconciler's files are owned by host root, which is unmapped in the nested
+# namespace (shows as nobody); without it copy-up fails with EACCES/EOVERFLOW.
+mount_overlay() {
+  fuse-overlayfs -o "lowerdir=$GIT_ROOT/commits/$1,upperdir=$U,workdir=$W,squash_to_root" "$MERGED" 2> >(grep -v lazytime >&2)
+}
+
+write_base() {
+  printf '%s\n' "$1" > "$BASE_FILE.tmp" && mv "$BASE_FILE.tmp" "$BASE_FILE"
+}
+
+do_mount() {
+  local sha
+  mkdir -p "$U" "$W" "$MERGED"
+  if [ -z "$(current_base)" ]; then
+    sha=$(resolve "${WS_BASE_REF:-latest}") || return
+    write_base "$sha"
+  fi
+  sha=$(current_base)
+  [ -d "$GIT_ROOT/commits/$sha" ] || { err "pinned base $sha is not materialized on this node"; return; }
+  mount_overlay "$sha"
+}
+
+switch_to() {
+  local cmd=$1 target=$2 force=$3 cur stale
+  cur=$(current_base)
+  [ "$target" != "$cur" ] || { echo "already on $cur"; return 0; }
+  stale=$(stale_paths "$cur" "$target")
+  if [ -n "$stale" ] && [ "$force" != force ]; then
+    echo "refused: upstream changed these paths between ${cur:0:12} and ${target:0:12},"
+    echo "and your copy would hide that change (re-run with --force to keep yours):"
+    printf '%s\n' "$stale" | sed 's/^/  /'
+    return 0
+  fi
+  if ! umount -l "$MERGED"; then echo "failed: could not unmount $MERGED"; return 0; fi
+  if ! mount_overlay "$target"; then
+    mount_overlay "$cur" && echo "failed: mount on $target; restored $cur" \
+      || echo "failed: mount on $target and restore of $cur; restart the workspace"
+    return 0
+  fi
+  if [ "$cmd" = back ]; then sed -i '$d' "$HIST"; else echo "$cur" >> "$HIST"; fi
+  write_base "$target"
+  echo "rebased ${cur:0:12} -> ${target:0:12}"
+  [ -z "$stale" ] || { echo "kept your copy of:"; printf '%s\n' "$stale" | sed 's/^/  /'; }
+  echo "cd out and back into $MERGED (and reload the editor) to see the new base"
+}
+
+handle() {
+  local cmd=$1 arg=$2 force=$3 target
+  case $cmd in
+    use)  target=$(resolve "$arg" 2>&1) || { echo "$target"; return 0; } ;;
+    back) target=$(tail -n1 "$HIST" 2>/dev/null)
+          [ -n "$target" ] || { echo "no previous base"; return 0; }
+          [ -d "$GIT_ROOT/commits/$target" ] || { echo "previous base $target is no longer materialized"; return 0; } ;;
+    *)    echo "unknown request: $cmd"; return 0 ;;
+  esac
+  switch_to "$cmd" "$target" "$force"
+}
+
+serve() {
+  local id cmd arg force
+  mkdir -p -m 0700 "$CTL"
+  rm -f "$CTL/req"; mkfifo -m 0600 "$CTL/req"
+  exec 3<> "$CTL/req"
+  while read -r id cmd arg force <&3; do
+    case $id in ""|*[!0-9.]*) continue ;; esac
+    handle "$cmd" "$arg" "$force" > "$CTL/res.$id.tmp" 2>&1
+    mv "$CTL/res.$id.tmp" "$CTL/res.$id"
+  done
+}
+
+request() {
+  local id=$$.$RANDOM i
+  [ -p "$CTL/req" ] || err "controller not running ($CTL/req missing)" || return
+  printf '%s %s %s %s\n' "$id" "$1" "${2:--}" "${3:--}" | timeout 5 tee "$CTL/req" >/dev/null \
+    || { err "controller not responding"; return; }
+  for i in $(seq 1 600); do
+    [ -f "$CTL/res.$id" ] && { cat "$CTL/res.$id"; rm -f "$CTL/res.$id"; return 0; }
+    sleep 0.1
+  done
+  err "timed out waiting for the controller"
+}
+
+status() {
+  local cur latest n
+  cur=$(current_base) latest=$(latest_sha)
+  n=$( (cd "$U" && find . -mindepth 1 ! -type d) 2>/dev/null | wc -l)
+  echo "base:    $cur"
+  echo "latest:  $latest$([ "$cur" = "$latest" ] && echo "  (up to date)")"
+  echo "back ->  $(tail -n1 "$HIST" 2>/dev/null || true)"
+  echo "changes: $n entries in upper"
+}
+
+list() {
+  local cur latest d s t
+  cur=$(current_base) latest=$(latest_sha)
+  for d in "$GIT_ROOT"/commits/*/; do
+    s=$(basename "$d")
+    case $s in *[!0-9a-f]*) continue ;; esac
+    printf '%s %s%s\n' "$s" "$([ "$s" = "$cur" ] && echo '[base]')" "$([ "$s" = "$latest" ] && echo '[latest]')"
+  done
+  [ -d "$GIT_ROOT/tags" ] && (cd "$GIT_ROOT/tags" && find . -type l | sed 's|^\./||') | while read -r t; do
+    printf 'tag/%s -> %s\n' "$t" "$(basename "$(readlink "$GIT_ROOT/tags/$t")")"
+  done
+}
+
+force=-
+[ "${3:-}" = --force ] || [ "${2:-}" = --force ] && force=force
+case ${1:-} in
+  mount)  do_mount ;;
+  serve)  serve ;;
+  status) status ;;
+  list)   list ;;
+  check)  t=$(resolve "${2:?ref}") && s=$(stale_paths "$(current_base)" "$t") \
+            && { [ -n "$s" ] && printf '%s\n' "$s" || echo "no conflicts with $t"; } ;;
+  use)    [ -n "${2:-}" ] && [ "$2" != --force ] || { err "usage: ws-base use <sha|latest|tag/NAME> [--force]"; exit 2; }
+          request use "$2" "$force" ;;
+  back)   request back - "$force" ;;
+  *)      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
+```
