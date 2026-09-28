@@ -1,83 +1,314 @@
-# Submenus in JupyterLab (like View → Appearance)
+# Frontend guide: middle endpoints and the bounce
 
-Example in this extension: **Actions → More ▸ → Rebase on main…**, and the same in the file
-browser's **Git actions** dropdown. The command itself (`jupyter-keytab:git-rebase`) does not
-change; only where it is listed.
+Audience: the portal (frontend) developer.
+Companion to [bounce-for-all-coder-apps.md](bounce-for-all-coder-apps.md), which explains the *why*; this page is the *what to call and how*.
+Reference implementation: `spike-middle/portal/public/app.js` (search for `openViaBounce`).
 
-There are two kinds of menu, and each gets its submenu differently:
+## TL;DR
 
-| Menu | Declared in | Submenu |
-| --- | --- | --- |
-| Top menu bar (**Actions**) | `jupyter_keytab/schema/plugin.json` (`jupyter.lab.menus`) | an item with `"type": "submenu"` |
-| File browser toolbar dropdown (**Git actions**) | `jupyter_keytab/src/index.ts` (a Lumino `Menu`) | a second `Menu`, added with `type: 'submenu'` |
+- The portal only ever talks to **middle**, with the IdP JWT as `Authorization: Bearer …`. It never sees or stores a Coder token.
+- Anything that renders a Coder page in the browser (apps like VS Code Browser/Jupyter, forwarded ports, GitLab consent) is opened with **one recipe**:
+  1. open a blank tab **synchronously in the click handler**,
+  2. `POST /v1/bounce/start` → `{bounce_url, code}`,
+  3. **form-POST** `code` to `bounce_url` in that tab.
+- The `code` is single-use, lives 60 s and is bound to user, plane, workspace/app and host. Ask for a new one on **every click**; never cache, retry or reuse it.
+- Stop using: `/coder-app/…`, `/open/…`, `?coder_session_token=` URLs, and the "open then strip the token" trick.
+- Never display tokens. The CLI/SSH copy and VS Code Desktop flows put credentials on the clipboard or in a `vscode://` URI only.
 
-## Top menu: `schema/plugin.json`
+```mermaid
+sequenceDiagram
+  participant U as Browser (portal tab)
+  participant T as New tab
+  participant M as middle
+  participant B as bounce (plane or app host)
+  participant C as Coder
+  U->>T: window.open("about:blank") (in click handler)
+  U->>M: POST /v1/bounce/start (Bearer JWT)
+  M-->>U: {bounce_url, code, expires_in: 60}
+  U->>T: build <form method=POST action=bounce_url> code=… ; submit()
+  T->>B: POST code
+  B->>M: redeem code (server to server)
+  B-->>T: Set-Cookie (host-only) + 302 to the app
+  T->>C: app loads with its cookie
+```
+
+## 1. Authentication
+
+| Item | Value |
+|---|---|
+| Header on every `/v1/*` call | `Authorization: Bearer <IdP JWT>` |
+| Content type for bodies | `application/json` |
+| Errors | non-2xx with a **plain-text** body (not JSON). Show it, don't parse it. |
+| Discovery (no auth) | `GET /v1/config/public` → `{public_url, idp_issuer, email_claim, …}` |
+| Health (no auth) | `GET /healthz` |
+
+Minimal helper (same as `api()` in `app.js`):
+
+```js
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  headers.Authorization = `Bearer ${getIdpToken()}`;
+  if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const res = await fetch(`${MIDDLE_URL}${path}`, { ...opts, headers });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const err = new Error(typeof data === "string" ? data : JSON.stringify(data));
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+```
+
+## 2. Endpoint reference
+
+`plane` is optional everywhere; when omitted, middle uses the default plane. For workspace calls, always pass the `plane_id` you got back in the workspace list.
+
+| Method and path | Body / query | Response | Use it for |
+|---|---|---|---|
+| `GET /v1/me` | | `{email, coder_user}` | Header / who am I |
+| `GET /v1/planes` | | `{planes: [{id, url}], default}` | Plane picker (if you show one) |
+| `GET /v1/templates` | `?plane=` | `{templates: [{id, name, display_name, …}]}` | Create form |
+| `GET /v1/workspaces` | `?plane=` (optional filter) | `{workspaces: [<Coder workspace> + plane_id, plane_url]}` | Workspace list |
+| `POST /v1/workspaces` | `{name, template_id, plane_id}` | `201` Coder workspace + `plane_id` | Create. `name` must match `^[a-zA-Z0-9][a-zA-Z0-9-]{0,31}$` |
+| `DELETE /v1/workspaces/{id}` | `?plane=` | `202 {workspace_id, build}` | Delete (async build) |
+| `GET /v1/workspaces/{id}/access` | `?plane=` | see section 3 | What can the user open, and how |
+| `POST /v1/bounce/start` | see section 4 | `{bounce_url, code, method, expires_in, plane_id}` | Open any Coder page |
+| `GET /v1/external-auth/{provider}` | `?plane=` | `{provider_id, plane_id, authenticated, display_name, login}` | "GitLab: linked (alice)" |
+| `DELETE /v1/external-auth/{provider}` | `?plane=` | `{provider_id, plane_id, authenticated: false}` | Unlink GitLab |
+| `POST /v1/workspaces/{id}/vscode-desktop` | `?plane=`, body `{}` | `{uri, …}` | VS Code Desktop (section 7) |
+| `GET /v1/cli-credentials` | `?plane=` | `{plane_id, coder_url, session_token, username, …}` | "Copy SSH command" (section 7) |
+| `GET /v1/workspaces/{id}/build-logs` | WebSocket, see section 8 | stream | Build progress |
+| `GET /v1/workspaces/{id}/agent-logs` | WebSocket, see section 8 | stream | Startup script progress |
+
+The provider id for GitLab is `primary-gitlab`.
+
+## 3. The access response: deciding what to show
+
+`GET /v1/workspaces/{id}/access` (only meaningful when the workspace is started):
 
 ```json
-"jupyter.lab.menus": {
-  "main": [
-    {
-      "id": "jp-mainmenu-git-actions",
-      "label": "Actions",
-      "rank": 80,
-      "items": [
-        { "command": "jupyter-keytab:git-share" },
-        { "command": "jupyter-keytab:git-promote" },
-        { "type": "separator" },
-        {
-          "type": "submenu",
-          "submenu": {
-            "id": "jp-mainmenu-git-more",
-            "label": "More",
-            "items": [
-              { "command": "jupyter-keytab:git-rebase" }
-            ]
-          }
-        }
-      ]
-    }
+{
+  "workspace_id": "…", "workspace_name": "dev", "username": "alice",
+  "started": true, "startup_ready": true,
+  "agent_id": "…", "agent_name": "main", "agent_directory": "/home/coder",
+  "display_apps": ["vscode", "web_terminal", "ssh_helper", "port_forwarding_helper"],
+  "port_bounce": true,
+  "choices": [
+    { "id": "app:code-server", "kind": "vscode_browser", "label": "VS Code Browser",
+      "slug": "code-server", "subdomain": false, "bounce": true, "available": true },
+    { "id": "app:jupyter", "kind": "app", "label": "Jupyter",
+      "slug": "jupyter", "subdomain": true, "bounce": true, "available": true },
+    { "id": "vscode_desktop", "kind": "vscode_desktop", "label": "VS Code Desktop", "available": true },
+    { "id": "ssh", "kind": "ssh", "label": "SSH", "available": true },
+    { "id": "app:docs", "kind": "external_app", "label": "Docs", "slug": "docs",
+      "available": false, "unavailable_reason": "External app — open from Coder dashboard" }
   ]
 }
 ```
 
-- A submenu's `items` take the same entries as the top level: commands, separators, or another
-  submenu.
-- Give every submenu its own unique `id`. Other extensions, or users in Settings → Main Menu, use
-  that id to add items to it.
-- The label and icon of each entry come from the command (`addCommand` in `index.ts`), not from
-  the JSON.
+Rules:
 
-## Toolbar dropdown: `src/index.ts`
+- Render one button per `choices[]` entry, in order, using `label`.
+- `available: false` → disabled button with `unavailable_reason` as the tooltip (e.g. "starting…", "unhealthy").
+- `subdomain` is informational. The frontend does **not** branch on it; middle picks the right `bounce_url`.
+- `port_bounce: true` → show a "port" input + "Open" button (section 5). If false, hide it.
+- Re-fetch access after start/stop, or when the user expands a card; it is cheap.
 
-```ts
-import { Menu } from '@lumino/widgets';
+What each `kind` does on click:
 
-const moreMenu = new Menu({ commands: app.commands });
-moreMenu.title.label = 'More';
-moreMenu.addItem({ command: GIT_REBASE });
+| `kind` | Condition | Action |
+|---|---|---|
+| `vscode_browser`, `app` | `bounce: true` | `openViaBounce({plane, purpose: "app", workspace_id, slug})` |
+| `web_terminal` | | `openViaBounce({plane, purpose: "terminal", workspace_id})` (to be replaced by a `ttyd` app; see section 9) |
+| `vscode_desktop` | | `POST …/vscode-desktop`, then `location.href = uri` |
+| `ssh` | | `GET /v1/cli-credentials`, copy to clipboard |
+| `external_app` | | disabled |
 
-const gitMenu = new Menu({ commands: app.commands });
-gitMenu.title.label = 'Git actions';
-gitMenu.addItem({ command: GIT_SHARE });
-gitMenu.addItem({ command: GIT_PROMOTE });
-gitMenu.addItem({ type: 'separator' });
-gitMenu.addItem({ type: 'submenu', submenu: moreMenu });
+## 4. The one recipe: `openViaBounce`
+
+Request body for `POST /v1/bounce/start`:
+
+| Field | Required for | Notes |
+|---|---|---|
+| `plane` | all | the workspace's `plane_id` (empty string = default plane) |
+| `purpose` | all | `app`, `port`, `terminal`, `external-auth` |
+| `workspace_id` | `app`, `port`, `terminal` | |
+| `slug` | `app` | from `choices[].slug` |
+| `port` | `port` | integer 1–65535 |
+| `protocol` | `port` (optional) | `http` (default) or `https` |
+| `provider` | `external-auth` | `primary-gitlab` |
+
+Response:
+
+```json
+{ "bounce_url": "https://plane-a.example.com/_portal/bounce",
+  "code": "…opaque…", "method": "POST", "expires_in": 60, "plane_id": "a" }
 ```
 
-The submenu's text is its `title.label`; `moreMenu.title.icon` can set an icon.
+`bounce_url` is either the plane host (`/_portal/bounce`) or the app's own host (subdomain apps and ports). Treat it as opaque.
 
-## See it
+Implementation:
 
-The extension is compiled into the image, so rebuild and reload:
+```js
+/**
+ * Opens a Coder page (app, port, GitLab consent) through the bounce.
+ * Must be called directly from a click handler, before any await, so the
+ * pop-up blocker allows the new tab.
+ */
+async function openViaBounce(body, { sameTab = false } = {}) {
+  const w = sameTab ? window : window.open("about:blank", "_blank");
+  if (!w) throw new Error("Pop-up blocked: allow pop-ups for this site to open workspace apps.");
+  if (!sameTab) w.opener = null;
+  try {
+    const data = await api("/v1/bounce/start", { method: "POST", body: JSON.stringify(body) });
+    const doc = w.document;
+    const form = doc.createElement("form");
+    form.method = "POST";
+    form.action = data.bounce_url;
+    const input = doc.createElement("input");
+    input.type = "hidden";
+    input.name = "code";
+    input.value = data.code;
+    form.appendChild(input);
+    doc.body.appendChild(form);
+    form.submit();
+  } catch (e) {
+    if (!sameTab) w.close();
+    throw e;
+  }
+}
+```
 
-- **Standalone lab** (this folder): `docker compose up -d --build jupyter`, then reload the
-  browser.
-- **Coder lab** (`../coder-jupyter-sso-lab`):
-  1. Rebuild the workspace image:
-     `docker build -f coder-jupyter-sso-lab/workspace/Dockerfile -t coder-jupyter-sso:lab jupyter-keytab-lab`
-     (from `spike-middle/`).
-  2. Stop and start the workspace, so the container is recreated from the new image.
-  3. Hard-reload the page (⇧⌘R).
+Do:
 
-If the top menu does not change, look at Settings → Settings Editor → **Main Menu**: a saved user
-customisation there overrides the extension's defaults.
+- Call `window.open` **before** the `await` (browsers only allow pop-ups during the user gesture).
+- Use a real form POST so the code never appears in a URL, history, or `Referer`.
+- Get a fresh code for every click, including retries.
+
+Don't:
+
+- `fetch()` the `bounce_url` (it needs a top-level navigation to set the cookie; `fetch` fails on CORS and cookies).
+- Put the code in a query string (`?code=` works as a fallback for tests only).
+- Open apps in an `<iframe>` in the portal (third-party cookies and Coder's frame headers will break it).
+- Log `code` or keep it in state.
+
+If the bounce itself fails (code expired, used twice, plane mismatch), the new tab shows a short plain-text error from the bounce. The fix for the user is always "click again".
+
+## 5. Forwarded ports
+
+Shown only when `port_bounce: true`.
+
+```js
+openPortBtn.onclick = async () => {
+  const port = Number(portInput.value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return alert("Enter a port between 1 and 65535");
+  await openViaBounce({ plane: ws.plane_id, purpose: "port", workspace_id: ws.id, port /*, protocol: "https" */ });
+};
+```
+
+Note the validation must happen **before** `openViaBounce` (so you don't open a blank tab for a bad input), but `openViaBounce` itself must still be the first `await` in the handler.
+
+## 6. Connect / disconnect GitLab (external auth)
+
+GitLab consent is a Coder page that needs a cookie, so it goes through the bounce too, but in the **same tab** (the flow ends back on the portal).
+
+```js
+const PROVIDER = "primary-gitlab";
+
+async function refreshGitLab() {
+  const st = await api(`/v1/external-auth/${PROVIDER}`);
+  gitlabBtn.textContent = st.authenticated ? `GitLab: linked${st.login ? ` (${st.login})` : ""}` : "Connect GitLab";
+  gitlabBtn.dataset.linked = st.authenticated ? "1" : "";
+}
+
+gitlabBtn.onclick = async () => {
+  if (gitlabBtn.dataset.linked) {
+    if (confirm("Disconnect GitLab?")) {
+      await api(`/v1/external-auth/${PROVIDER}`, { method: "DELETE" });
+      await refreshGitLab();
+    }
+    return;
+  }
+  await openViaBounce({ plane: "", purpose: "external-auth", provider: PROVIDER }, { sameTab: true });
+};
+
+// Coder → {plane}/_portal/done → back to the portal with ?linked=1
+if (new URLSearchParams(location.search).has("linked")) {
+  history.replaceState(null, "", location.pathname);
+}
+refreshGitLab();
+```
+
+Flow: portal → bounce (plane host) → Coder consent → GitLab → Coder → `/_portal/done` (clears the temporary cookie, revokes the temporary key) → portal `?linked=1`. After landing, just re-read the status; don't trust `?linked=1` as proof.
+
+Because it navigates away in the same tab, make sure the IdP session/JWT survives a full page reload (store it the way you already do for refreshes).
+
+## 7. CLI, SSH and VS Code Desktop
+
+These do not use the bounce; they need a token on the user's machine.
+
+- **Copy SSH command** (`kind: "ssh"`): `GET /v1/cli-credentials?plane=…`, build the text below, put it on the clipboard, and show "Copied". Never render the token in the page.
+
+  ```js
+  const c = await api(`/v1/cli-credentials?plane=${encodeURIComponent(ws.plane_id)}`);
+  await navigator.clipboard.writeText(
+    `export CODER_URL='${c.coder_url}'\nexport CODER_SESSION_TOKEN='${c.session_token}'\ncoder ssh ${ws.name}`
+  );
+  ```
+
+- **VS Code Desktop** (`kind: "vscode_desktop"`): `POST /v1/workspaces/{id}/vscode-desktop?plane=…` with `{}`, then `window.location.href = data.uri` (a `vscode://coder.coder-remote/open?…` link). Ignore the other fields; don't display them.
+
+Backend note (no frontend change): these tokens are being moved to **scoped** tokens (`coder:workspaces.access` + `user:read`, validated with `coder ssh` and VS Code Desktop). The response shapes stay the same.
+
+## 8. Build and startup logs
+
+Browsers can't set `Authorization` on a WebSocket, so logs currently use a short-lived middle ticket:
+
+1. `POST /v1/app-session` with `{}` → `{middle_token}`.
+2. Open `wss://<middle>/v1/workspaces/{id}/build-logs?mt=<middle_token>&after=-1&build=<latest_build.id>` or `…/agent-logs?mt=<middle_token>&after=0`.
+3. Each message is one JSON log line (Coder's format). Close the socket when the build completes or the card collapses.
+
+This is the one place still using `mt`. It will change (the design doc plans to remove `middle_session`/`?mt=`); keep the code isolated in one function so it's easy to swap.
+
+## 9. Deprecated: stop using these
+
+| Old | Replace with |
+|---|---|
+| `GET /v1/workspaces/{id}/coder-app/{slug}` (+ `?format=json`) | `openViaBounce({purpose: "app", slug})` |
+| `GET /v1/workspaces/{id}/open/…` | `openViaBounce` |
+| URLs containing `coder_session_token=`, and the "open then `location.replace` to strip the token" helper | `openViaBounce` (no token in any URL) |
+| `POST /v1/app-session` for opening apps, `middle_session` cookie | Bearer JWT + bounce (still used only for logs, section 8) |
+| `kind: "terminal"` (ttyd via `coder-app`) | an app choice with slug `ttyd` via `purpose: "app"` |
+| `purpose: "terminal"` (Coder web terminal) | will be retired in favour of the `ttyd` app; keep it working until the templates ship `ttyd` |
+| Showing the Coder URL or token anywhere | clipboard / `vscode://` only |
+
+## 10. Errors from `POST /v1/bounce/start` (and friends)
+
+The body is plain text; show it as-is in a toast, then map the status to the user message:
+
+| Status | Meaning | Suggested UI |
+|---|---|---|
+| `400` | bad input (unknown purpose, bad slug, port out of range, bad provider) | "Invalid request" + text (a frontend bug) |
+| `401` | JWT missing/expired | re-login |
+| `403` | not your workspace | "You don't have access to this workspace" |
+| `404` | workspace or app not found | refresh the list |
+| `409` | workspace not running, no agent yet, or app unhealthy (`workspace is stopped`, `app is unhealthy`) | "Workspace is starting, try again in a moment", or offer Start |
+| `501` | bounce not configured on this plane, or subdomain apps not enabled there | "Not available on this plane" (disable the button) |
+| `502` | middle couldn't reach Coder | "Try again" |
+
+A failure on `/v1/bounce/start` closes the blank tab automatically (see the `catch` in `openViaBounce`).
+
+## 11. Checklist for the portal
+
+- [ ] All calls go to middle with `Authorization: Bearer <JWT>`; no Coder URLs are built client-side.
+- [ ] Buttons are driven by `GET …/access` (`choices`, `available`, `unavailable_reason`, `port_bounce`).
+- [ ] Every "open" goes through `openViaBounce`, with `window.open` before the first `await`.
+- [ ] A new code is requested per click; the code is never logged, stored, or put in a URL.
+- [ ] Ports input validated before opening; `protocol` only when the service is HTTPS.
+- [ ] GitLab connect in the same tab; status re-read on return; `?linked=1` removed from the URL.
+- [ ] SSH/CLI and VS Code Desktop never render tokens.
+- [ ] The log WebSocket code is isolated (the `mt` ticket will be replaced).
+- [ ] No calls to the deprecated endpoints in section 9.
