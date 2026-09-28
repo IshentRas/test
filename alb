@@ -1,1101 +1,893 @@
-# Step by step: a JupyterLab "Workspace" menu that runs `ws-publish` and `ws-base`
+# Bounce for every Coder app: path apps, subdomain apps and ports
 
-Follow this top to bottom inside your Coder overlay workspace. Every block is meant to be copied and pasted.
+**Status:** findings measured on Coder v2.36.5 (local lab, September 2026) and confirmed by hand in Chrome. The generalised design below reuses the validated plane-host bounce (`plane-host-cookie-bounce.md`). Its new parts (purpose `app`, the app-only key with rotation, `cookie_path` in the Lambda, ttyd as the terminal) are **implemented and validated on AWS** (September 27, 2026): 40 headless checks plus a manual browser test with VS Code and ttyd (section 3.9). Lab scripts: `spike-middle/aws-apps-bounce-lab/`. **Subdomain apps and ports** (the bounce runs on the app host and sets Coder's own subdomain app cookie) are **implemented and validated in the local lab** (33 headless checks, section 3.10); not yet on AWS. **Scopes for CLI and IDE tokens** measured in a local lab (44 headless checks plus a manual test with VS Code Desktop and interactive `coder ssh`, section 10).
 
-The result is a **Workspace** button in the JupyterLab file browser toolbar (and a **Workspace** top menu). Each item runs a command behind the scene, so users never open a terminal:
+**Related:** [plane-host-cookie-bounce.md](./plane-host-cookie-bounce.md) (the bounce: ALB `/_portal/*` → Lambda → middle redeem), [middle-go-launch-link.md](./middle-go-launch-link.md) (one link `/go/<slug>`; section 7 = bounce hand-off, section 7.4 = keeping users out of the dashboard, section 8 = JSON + token strip), [open-coder-apps-portal-json-strip.md](./open-coder-apps-portal-json-strip.md) (the token strip; works only for users signed in to the dashboard, 1.1).
 
-| Menu item | Runs | What the user sees |
-| --- | --- | --- |
-| Workspace status | `ws-base status` | a dialog with base, latest, number of changes |
-| Share a snapshot… | `ws-publish share` | confirm, then "Share: ok share ref=ws/alice/20260926-181500" |
-| Promote… | `ws-publish promote` or `ws-publish promote -from-tag ws/…` | choose "my current changes" or "an existing share tag" |
-| Update to latest… | `ws-base check latest`, then `ws-base use latest` (`--force` if the user accepts conflicts) | "No conflicts, update?" or the list of conflicting files with an "Update anyway" button |
-| Go back to previous base… | `ws-base back` (`--force` if refused and the user insists) | confirm, then "rebased … -> …" |
+---
 
-How it fits together:
+## TL;DR
 
-```mermaid
-flowchart LR
-  U[Browser: Workspace menu] -->|POST /ws-actions/run/share| S[Jupyter server extension\nws_actions/handlers.py]
-  S -->|ws-publish share| P[ws-publish\nreads /data/overlay/upper + .base_commit_sha\npushes tag to GitLab]
-  S -->|ws-base use latest| B[ws-base client]
-  B -->|FIFO /tmp/ws-base/req| C[ws-base serve\nouter namespace: remounts the overlay]
-```
-
-JupyterLab is started by the Coder agent (through the Coder `jupyterlab` module), so it runs inside the overlay namespace like the terminal does: it sees the merged `/home/coder/workspace`, and `ws-base use` reaches the controller exactly as from a terminal.
-
-Status: written for you to try; not yet run end to end in a Coder overlay workspace. The extension layout, build and packaging are the same as the validated `jupyter_keytab` lab; the new parts are the `ws-publish`/`ws-base` calls and the two dev scripts. Start with the dry run in [step 7.1](#71-first-run-in-dry-run-mode-ui-only-nothing-executed).
-
-The approach for testing: keep the Coder `jupyterlab` module unchanged (it installs JupyterLab with `pipx` at workspace start), then link the extension source into that JupyterLab in "develop" mode. You edit, rebuild, refresh. When you are happy, you build a wheel and bake it into the image ([step 10](#10-when-you-are-happy-build-the-wheel-and-bake-it-into-the-image)).
+- **A token in the URL (`?coder_session_token=`) gives an app only 60 seconds, path or subdomain.** Coder turns the token into a 60-second app cookie and nothing else; it never renews it. After that, a path app gets Coder's login page on the next reload or reconnect, and a subdomain app is sent to the dashboard's auth redirect, which only works for a user signed in to the dashboard (the login page otherwise). So JSON + token strip does not work for users kept out of the dashboard (1.1).
+- **A leftover `coder_session_token` cookie beats the token in the URL.** Coder reads the cookie first; a stale one sends the user to the login page even with a valid token in the URL.
+- **Decision: open every Coder page through the bounce.** The frontend always does the same thing: ask the middle for a one-time code and form-POST it to the `bounce_url` the middle returns (`/_portal/bounce` on the plane host, or on the app's hostname for subdomain apps and ports). The middle decides per target which key, cookie name, domain, path, lifetime and redirect to use. The frontend never has to know whether an app is a path or a subdomain app. The Lambda does the same thing for every purpose; OAuth consent differs from apps only by its one-off `/_portal/done` step (revoke the key and clear the cookie), and apps get an app-only key in a narrowly scoped cookie (section 3.2).
+- **The terminal becomes an ordinary app: ttyd as a path app, Coder's built-in web terminal hidden** (section 3.7). The user's full Coder key then never reaches the browser.
+- **The bounce can also keep users out of the Coder dashboard.** For apps, the cookie holds an app-only key (`application_connect`) and is limited to the workspace's apps path. Validated on AWS with VS Code and ttyd: both work past 60 s and after a reload, websockets included, and the Coder root shows the login page (section 3.9).
+- **Subdomain apps and ports use the same bounce, run on the app's own hostname.** The load balancer also sends `/_portal/*` on the wildcard hostnames to the Lambda. It sets Coder's subdomain app cookie (`coder_subdomain_app_session_token_<hash>`, `Domain=` the wildcard parent, like Coder does) holding the same app-only key. One bounce then covers every subdomain app and port of the user on that plane, and the dashboard ignores the cookie. Validated in the local lab (section 3.10).
+- **CLI and IDE tokens: `coder:workspaces.access` + `user:read`, not the default `coder:all`.** Add `coder:workspaces.operate` if users should start and stop workspaces from the CLI. Without `user:read`, `/users/me` answers 404, so `coder login` and the VS Code Desktop Coder extension reject the token (validated by hand). With it, the token can SSH, port-forward and connect, but cannot mint tokens or create workspaces (section 10).
 
 ---
 
 ## Contents
 
-1. [Add the dev tools to the workspace image](#1-add-the-dev-tools-to-the-workspace-image)
-2. [Add the module and the environment to the template](#2-add-the-module-and-the-environment-to-the-template)
-3. [Check the workspace](#3-check-the-workspace)
-4. [Run the backend commands by hand first](#4-run-the-backend-commands-by-hand-first)
-5. [Create the extension source](#5-create-the-extension-source)
-6. [Create the two helper scripts](#6-create-the-two-helper-scripts)
-7. [Install it into the running JupyterLab](#7-install-it-into-the-running-jupyterlab)
-8. [Try it in the browser](#8-try-it-in-the-browser)
-9. [The edit loop](#9-the-edit-loop)
-10. [When you are happy: build the wheel and bake it into the image](#10-when-you-are-happy-build-the-wheel-and-bake-it-into-the-image)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Things to know about `ws-publish` today](#12-things-to-know-about-ws-publish-today)
-13. [File reference](#13-file-reference)
+1. [What we found](#1-what-we-found)
+2. [Decision](#2-decision)
+3. [General design](#3-general-design)
+4. [Security properties](#4-security-properties)
+5. [Open items](#5-open-items)
+6. [Reproduce the findings](#6-reproduce-the-findings)
+7. [What this changes in the other docs](#7-what-this-changes-in-the-other-docs)
+8. [The middle's skeleton: endpoints and sign-in](#8-the-middles-skeleton-endpoints-and-sign-in)
+9. [Future: an on-premises control plane (Kubernetes, NGINX, projected tokens)](#9-future-an-on-premises-control-plane-kubernetes-nginx-projected-tokens)
+10. [Tokens for the CLI and IDEs: which scopes](#10-tokens-for-the-cli-and-ides-which-scopes)
 
 ---
 
-## 1. Add the dev tools to the workspace image
+## 1. What we found
 
-The overlay image (`debian:bookworm-slim` + `fuse-overlayfs util-linux procps curl ca-certificates git`) needs, for this test only:
+### 1.1 A token in the URL lasts 60 seconds (path and subdomain apps)
 
-- `python3`, `python3-venv`, `pipx`: the Coder `jupyterlab` module installs JupyterLab with `pipx` if it is not already there. (Its other branch, `uv`, needs an existing `~/.venv`; stick to `pipx`.)
-- `node`: compiles the TypeScript half of the extension. `jlpm` (yarn) ships with JupyterLab.
-- `ws-publish` and `ws-base` on the `PATH` (you already have these in `/opt/ws`).
+Opening a path app with `?coder_session_token=<key>` (what JSON + token strip does):
 
-```dockerfile
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      fuse-overlayfs util-linux procps curl ca-certificates git \
-      python3 python3-venv pipx \
- && rm -rf /var/lib/apt/lists/* \
- && useradd -u 1000 -m -s /bin/bash coder
-COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-# ws-publish (Go binary) and ws-base, if not mounted from a ConfigMap
-COPY ws-publish ws-base /opt/ws/
-ENV PATH=/opt/ws:/home/coder/.local/bin:$PATH
-USER 1000
-WORKDIR /home/coder
-```
-
-Network: at workspace start the module runs `pipx install jupyterlab` (PyPI), and step 7 runs `pip install -e` (PyPI, for `hatchling`) and `jlpm install` (npm registry). If the workspace has no internet, point them at your mirrors in the pod env: `PIP_INDEX_URL=https://…`, `YARN_NPM_REGISTRY_SERVER=https://…`.
-
----
-
-## 2. Add the module and the environment to the template
-
-In the overlay template (`main.tf` from `OVERLAY-CODER-GUIDE.md` section 5), add the module next to `coder_agent.main`:
-
-```hcl
-module "jupyterlab" {
-  count     = data.coder_workspace.me.start_count
-  source    = "registry.coder.com/coder/jupyterlab/coder"
-  version   = "<pin a version>"
-  agent_id  = coder_agent.main.id
-  subdomain = false
-  config = jsonencode({
-    ServerApp = {
-      root_dir = "/home/coder/workspace"
-      tornado_settings = {
-        headers = {
-          "Content-Security-Policy" = "frame-ancestors 'self' ${data.coder_workspace.me.access_url}"
-        }
-      }
-    }
-    FileCheckpoints = {
-      root_dir = "/home/coder/.jupyter-checkpoints"
-    }
-  })
-}
-```
-
-- `subdomain = false` makes it a path app: `https://<coder>/@<owner>/<workspace>/apps/jupyterlab/`. The app slug is `jupyterlab`, so the middle's link is `/go/jupyterlab`.
-- `config` is written to `~/.jupyter/jupyter_server_config.json` by the module on **every** start (so don't hand-edit that file, it gets overwritten). `root_dir` opens the file browser on the overlay; `FileCheckpoints.root_dir` keeps `.ipynb_checkpoints` folders out of the overlay (otherwise they land in `upper/` and get published). The `Content-Security-Policy` line is what the module adds by itself when `config` is empty; keep it when you set `config`.
-
-Add the variables `ws-publish` needs to the container `env` list in `local.pod_spec` (the Coder agent and everything it starts, including JupyterLab, inherit them):
-
-```hcl
-data "coder_external_auth" "gitlab" {
-  id = "gitlab"
-}
-
-# in local.pod_spec.containers[0].env, next to CODER_AGENT_TOKEN:
-        { name = "GITLAB_REMOTE", value = "https://gitlab.example.com/group/repo.git" },
-        { name = "WS_USER", value = data.coder_workspace_owner.me.name },
-        { name = "GITLAB_TOKEN", value = data.coder_external_auth.gitlab.access_token },
-        { name = "SCRATCH_ROOT", value = "/data/overlay" },
-```
-
-- `SCRATCH_ROOT`: `ws-publish` defaults to `/scratch`; the overlay keeps `upper/` and `.base_commit_sha` in `/data/overlay`. (The extension also defaults it to `/data/overlay` if unset.)
-- `GITLAB_TOKEN`: here from Coder external auth (the user connects GitLab once). The value is captured when the workspace starts; if your GitLab OAuth tokens are short-lived, restart the workspace to refresh it. A static test PAT in a Kubernetes Secret works too for a first test.
-
-Push the template and move the workspace onto it:
-
-```bash
-coder templates push <template> -d .
-coder update <workspace>
-```
-
----
-
-## 3. Check the workspace
-
-Open a terminal in the workspace (Coder web terminal, or `coder ssh <workspace>`):
-
-```bash
-command -v ws-publish ws-base git node pipx
-cat /data/overlay/.base_commit_sha
-ls /data/overlay/upper | head
-echo "remote=$GITLAB_REMOTE user=$WS_USER token_set=$([ -n "$GITLAB_TOKEN" ] && echo yes || echo NO)"
-
-# the module's JupyterLab: installed by pipx and running
-ls ~/.local/bin/jupyter-lab
-pgrep -af 'jupyter-lab --no-browser'
-tail -5 /tmp/jupyterlab.log
-```
-
-All five commands found, a base SHA, `token_set=yes`, and one `jupyter-lab --no-browser …` process. If JupyterLab is not there yet, the module is still installing it: wait and look at `/tmp/jupyterlab.log`.
-
-Open JupyterLab once from the Coder dashboard (the **JupyterLab** app) to confirm it loads.
-
----
-
-## 4. Run the backend commands by hand first
-
-Before any UI work, make sure the commands behind the menu work from a terminal. The extension runs exactly these:
-
-```bash
-ws-base status
-ws-base check latest
-ws-publish share          # pushes a tag ws/<you>/<time> to GitLab
-ws-publish promote        # pushes a branch ws/<you>/<time>
-```
-
-If `ws-publish share` fails here, fix that first (remote, token, base commit present in GitLab). The menu will show the same error.
-
----
-
-## 5. Create the extension source
-
-The source lives in **`/home/coder/dev/ws_actions`**:
-
-- in `/home/coder`, which is backed by a PVC, so it survives workspace restarts (the module's `pipx` JupyterLab in `~/.local` survives too);
-- **not** inside `/home/coder/workspace`: that is the overlay, anything created there lands in `upper/` and would be published by `ws-publish share`.
-
-Paste each block into the terminal. Each one creates one file.
-
-### 5.1 Folders
-
-```bash
-mkdir -p /home/coder/dev/ws_actions/{ws_actions,src,schema,style,jupyter-config/server-config}
-cd /home/coder/dev/ws_actions
-```
-
-### 5.2 `pyproject.toml` (Python packaging: where each piece lands)
-
-```bash
-cat > /home/coder/dev/ws_actions/pyproject.toml <<'EOF'
-[build-system]
-requires = ["hatchling>=1.5.0"]
-build-backend = "hatchling.build"
-
-[project]
-name = "ws_actions"
-version = "0.1.0"
-description = "JupyterLab Workspace menu: share, promote and rebase the overlay workspace (ws-publish / ws-base)"
-requires-python = ">=3.9"
-dependencies = ["jupyter_server>=2.0.0,<3"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["ws_actions"]
-exclude = ["ws_actions/labextension"]
-
-# Where each piece lands inside the Python environment (sys.prefix):
-[tool.hatch.build.targets.wheel.shared-data]
-"ws_actions/labextension" = "share/jupyter/labextensions/ws-actions"
-"install.json" = "share/jupyter/labextensions/ws-actions/install.json"
-"jupyter-config/server-config" = "etc/jupyter/jupyter_server_config.d"
-EOF
-```
-
-### 5.3 `package.json`, `tsconfig.json`, `.yarnrc.yml` (frontend build)
-
-```bash
-cat > /home/coder/dev/ws_actions/package.json <<'EOF'
-{
-  "name": "ws-actions",
-  "version": "0.1.0",
-  "description": "Workspace menu: share, promote and rebase the overlay workspace (ws-publish / ws-base)",
-  "keywords": ["jupyter", "jupyterlab", "jupyterlab-extension"],
-  "license": "BSD-3-Clause",
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "style": "style/index.css",
-  "files": ["lib/**/*.{d.ts,js}", "style/**/*.css", "schema/*.json"],
-  "scripts": {
-    "build": "jlpm build:lib && jlpm build:labextension:dev",
-    "build:prod": "jlpm build:lib && jlpm build:labextension",
-    "build:lib": "tsc",
-    "build:labextension": "jupyter labextension build .",
-    "build:labextension:dev": "jupyter labextension build --development True ."
-  },
-  "dependencies": {
-    "@jupyterlab/application": "^4.0.0",
-    "@jupyterlab/apputils": "^4.0.0",
-    "@jupyterlab/coreutils": "^6.0.0",
-    "@jupyterlab/filebrowser": "^4.0.0",
-    "@jupyterlab/services": "^7.0.0",
-    "@jupyterlab/ui-components": "^4.0.0",
-    "@lumino/widgets": "^2.0.0"
-  },
-  "devDependencies": {
-    "@jupyterlab/builder": "^4.0.0",
-    "typescript": "~5.5.4"
-  },
-  "jupyterlab": {
-    "extension": true,
-    "outputDir": "ws_actions/labextension",
-    "schemaDir": "schema"
-  }
-}
-EOF
-
-cat > /home/coder/dev/ws_actions/tsconfig.json <<'EOF'
-{
-  "compilerOptions": {
-    "allowSyntheticDefaultImports": true,
-    "declaration": true,
-    "esModuleInterop": true,
-    "jsx": "react",
-    "module": "esnext",
-    "moduleResolution": "node",
-    "noEmitOnError": true,
-    "noImplicitAny": true,
-    "noUnusedLocals": true,
-    "outDir": "lib",
-    "rootDir": "src",
-    "skipLibCheck": true,
-    "strict": true,
-    "target": "ES2018"
-  },
-  "include": ["src/*"]
-}
-EOF
-
-cat > /home/coder/dev/ws_actions/.yarnrc.yml <<'EOF'
-nodeLinker: node-modules
-EOF
-```
-
-### 5.4 `install.json` and the server auto-enable file
-
-```bash
-cat > /home/coder/dev/ws_actions/install.json <<'EOF'
-{
-  "packageManager": "python",
-  "packageName": "ws_actions",
-  "uninstallInstructions": "Use your Python package manager (pip, pipx runpip, ...) to uninstall the package ws_actions"
-}
-EOF
-
-cat > /home/coder/dev/ws_actions/jupyter-config/server-config/ws_actions.json <<'EOF'
-{
-  "ServerApp": {
-    "jpserver_extensions": {
-      "ws_actions": true
-    }
-  }
-}
-EOF
-```
-
-### 5.5 `schema/plugin.json` (where the button and the top menu appear)
-
-```bash
-cat > /home/coder/dev/ws_actions/schema/plugin.json <<'EOF'
-{
-  "title": "Workspace actions",
-  "description": "File browser 'Workspace' dropdown and top menu: status, share, promote, update base, go back.",
-  "jupyter.lab.toolbars": {
-    "FileBrowser": [
-      { "name": "ws-actions", "command": "ws-actions:menu", "rank": 36 }
-    ]
-  },
-  "jupyter.lab.menus": {
-    "main": [
-      {
-        "id": "jp-mainmenu-ws-actions",
-        "label": "Workspace",
-        "rank": 80,
-        "items": [
-          { "command": "ws-actions:status" },
-          { "type": "separator" },
-          { "command": "ws-actions:share" },
-          { "command": "ws-actions:promote" },
-          { "type": "separator" },
-          { "command": "ws-actions:rebase" },
-          { "command": "ws-actions:back" }
-        ]
-      }
-    ]
-  },
-  "type": "object",
-  "properties": {},
-  "additionalProperties": false
-}
-EOF
-```
-
-### 5.6 `style/index.css`
-
-```bash
-cat > /home/coder/dev/ws_actions/style/index.css <<'EOF'
-.jp-WsActions-output {
-  max-height: 50vh;
-  max-width: 70vw;
-  overflow: auto;
-  margin: 0;
-  padding: 8px;
-  font-family: var(--jp-code-font-family);
-  font-size: var(--jp-code-font-size);
-  white-space: pre-wrap;
-  background: var(--jp-layout-color2);
-  border-radius: 4px;
-}
-
-.jp-WsActions-field {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  margin: 4px 0 8px;
-}
-EOF
-```
-
-### 5.7 `ws_actions/__init__.py` (registers both halves with Jupyter)
-
-```bash
-cat > /home/coder/dev/ws_actions/ws_actions/__init__.py <<'EOF'
-from .handlers import setup_handlers
-
-
-def _jupyter_labextension_paths():
-    return [{"src": "labextension", "dest": "ws-actions"}]
-
-
-def _jupyter_server_extension_points():
-    return [{"module": "ws_actions"}]
-
-
-def _load_jupyter_server_extension(server_app):
-    setup_handlers(server_app.web_app)
-    server_app.log.info("ws_actions server extension loaded")
-EOF
-```
-
-### 5.8 `ws_actions/handlers.py` (the server side: runs the commands)
-
-This is where the menu items become commands. Things it takes care of:
-
-- **Fixed commands, no shell.** Each action maps to a fixed argv list; the only user input is the share tag for Promote, checked against `ws/<user>/<yyyymmdd-hhmmss>`.
-- **Token never in argv or output.** `ws-publish` reads `GITLAB_TOKEN` from the environment itself. Its git errors print the push URL with the token inside (`https://oauth2:<token>@…`); the output is redacted before it reaches the browser.
-- **One action at a time.** A second click while one runs gets "another workspace action is still running".
-- **Timeouts.** 10 minutes for `ws-publish` (clone + push), 2 minutes for `ws-base`.
-- **`ws-base` exit codes.** `ws-base use/back` answer `refused: …` or `failed: …` with exit code 0, so success means "output starts with `rebased` or `already on`".
-- **Dry run.** With `WS_ACTIONS_DRY_RUN=1` it only shows the command it would run.
-
-```bash
-cat > /home/coder/dev/ws_actions/ws_actions/handlers.py <<'EOF'
-import asyncio
-import json
-import os
-import re
-from asyncio.subprocess import DEVNULL, PIPE, STDOUT
-
-import tornado
-from jupyter_server.base.handlers import APIHandler
-from jupyter_server.utils import url_path_join
-
-WS_PUBLISH = os.environ.get("WS_PUBLISH_BIN", "ws-publish")
-WS_BASE = os.environ.get("WS_BASE_BIN", "ws-base")
-# Show the command that would run instead of running it (UI testing without the backend).
-DRY_RUN = os.environ.get("WS_ACTIONS_DRY_RUN", "") == "1"
-SHARE_TAG_RE = re.compile(r"^ws/[A-Za-z0-9._-]{1,64}/[0-9]{8}-[0-9]{6}$")
-URL_CREDENTIALS_RE = re.compile(r"(https?://)[^/@\s]+@")
-BASE_SWITCHED_RE = re.compile(r"^(rebased|already on)")
-MAX_OUTPUT = 8000
-
-_lock = asyncio.Lock()
-
-
-def _force(body):
-    return ["--force"] if body.get("force") is True else []
-
-
-def _promote(body):
-    tag = str(body.get("from_tag") or "").strip()
-    if not tag:
-        return [WS_PUBLISH, "promote"]
-    if not SHARE_TAG_RE.match(tag):
-        raise tornado.web.HTTPError(400, "invalid share tag (expected ws/<user>/<yyyymmdd-hhmmss>)")
-    return [WS_PUBLISH, "promote", "-from-tag", tag]
-
-
-# action -> (argv builder, timeout in seconds). ws-publish clones and pushes, so it gets longer.
-ACTIONS = {
-    "status": (lambda b: [WS_BASE, "status"], 30),
-    "share": (lambda b: [WS_PUBLISH, "share"], 600),
-    "promote": (_promote, 600),
-    "check": (lambda b: [WS_BASE, "check", "latest"], 120),
-    "rebase": (lambda b: [WS_BASE, "use", "latest", *_force(b)], 120),
-    "back": (lambda b: [WS_BASE, "back", *_force(b)], 120),
-}
-
-
-def _env():
-    env = os.environ.copy()
-    # ws-publish defaults to /scratch; the overlay workspace keeps upper/ and .base_commit_sha here.
-    env.setdefault("SCRATCH_ROOT", env.get("WS_SCRATCH", "/data/overlay"))
-    return env
-
-
-def _redact(text):
-    token = os.environ.get("GITLAB_TOKEN", "")
-    if token:
-        text = text.replace(token, "***")
-    return URL_CREDENTIALS_RE.sub(r"\1***@", text)
-
-
-async def _run(argv, timeout):
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdin=DEVNULL, stdout=PIPE, stderr=STDOUT, env=_env(), cwd=os.path.expanduser("~")
-        )
-    except FileNotFoundError:
-        return 127, f"{argv[0]}: command not found (set WS_PUBLISH_BIN / WS_BASE_BIN or fix PATH)"
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return 124, f"{argv[0]} timed out after {timeout}s"
-    return proc.returncode, out.decode(errors="replace")
-
-
-class ActionHandler(APIHandler):
-    @tornado.web.authenticated
-    async def post(self, action):
-        build, timeout = ACTIONS[action]
-        argv = build(self.get_json_body() or {})
-        if DRY_RUN:
-            code, output = 0, "(dry run) would run: " + " ".join(argv)
-        else:
-            if _lock.locked():
-                raise tornado.web.HTTPError(409, "another workspace action is still running")
-            async with _lock:
-                code, output = await _run(argv, timeout)
-        output = _redact(output).strip()[-MAX_OUTPUT:]
-        ok = code == 0
-        # ws-base answers "refused: ..." / "failed: ..." with exit code 0.
-        if action in ("rebase", "back") and not DRY_RUN:
-            ok = ok and bool(BASE_SWITCHED_RE.match(output))
-        self.log.info("ws_actions %s exit=%s ok=%s", action, code, ok)
-        self.finish(json.dumps({"ok": ok, "output": output}))
-
-
-def setup_handlers(web_app):
-    base_url = web_app.settings["base_url"]
-    actions = "|".join(ACTIONS)
-    web_app.add_handlers(".*$", [
-        (url_path_join(base_url, "ws-actions", "run", f"({actions})"), ActionHandler),
-    ])
-EOF
-```
-
-To add another action later: add one line to `ACTIONS` (name → argv + timeout), one command in `index.ts`, and one entry in `schema/plugin.json`.
-
-### 5.9 `src/handler.ts` (calls the server with Jupyter's auth and XSRF handling)
-
-```bash
-cat > /home/coder/dev/ws_actions/src/handler.ts <<'EOF'
-import { URLExt } from '@jupyterlab/coreutils';
-import { ServerConnection } from '@jupyterlab/services';
-
-/**
- * Calls this extension's server routes (/ws-actions/<endPoint>) with Jupyter's auth and
- * XSRF handling.
- */
-export async function requestAPI<T>(endPoint = '', init: RequestInit = {}): Promise<T> {
-  const settings = ServerConnection.makeSettings();
-  const requestUrl = URLExt.join(settings.baseUrl, 'ws-actions', endPoint);
-  let response: Response;
-  try {
-    response = await ServerConnection.makeRequest(requestUrl, init, settings);
-  } catch (error) {
-    throw new ServerConnection.NetworkError(error as TypeError);
-  }
-  let data: any = await response.text();
-  if (data.length > 0) {
-    try {
-      data = JSON.parse(data);
-    } catch {
-      // not JSON
-    }
-  }
-  if (!response.ok) {
-    throw new ServerConnection.ResponseError(response, data.message || data);
-  }
-  return data;
-}
-EOF
-```
-
-### 5.10 `src/index.ts` (the button, the menu, the dialogs)
-
-What it does:
-
-- One toolbar button (custom "branches" icon) opens a dropdown; the same commands are in the **Workspace** top menu.
-- Every action shows an in-progress notification that turns into the result, with a **Details** button that opens the full command output.
-- **Update to latest** runs the conflict check first and changes the confirm button to a red **Update anyway** when there are conflicts.
-- **Go back** offers **Go back anyway** if `ws-base` refuses.
-- After a base switch it refreshes the file browser and reminds the user to reload open files and restart kernels (open handles keep the old view, see the overlay guide).
-
-```bash
-cat > /home/coder/dev/ws_actions/src/index.ts <<'EOF'
-import { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
-import { Dialog, Notification, showDialog } from '@jupyterlab/apputils';
-import { IDefaultFileBrowser } from '@jupyterlab/filebrowser';
-import { LabIcon, listIcon, moveUpIcon, refreshIcon, shareIcon, undoIcon } from '@jupyterlab/ui-components';
-import { Menu, Widget } from '@lumino/widgets';
-
-import { requestAPI } from './handler';
-
-const CMD = {
-  menu: 'ws-actions:menu',
-  status: 'ws-actions:status',
-  share: 'ws-actions:share',
-  promote: 'ws-actions:promote',
-  rebase: 'ws-actions:rebase',
-  back: 'ws-actions:back'
-};
-
-const workspaceIcon = new LabIcon({
-  name: 'ws-actions:workspace',
-  svgstr:
-    '<svg xmlns="http://www.w3.org/2000/svg" width="16" viewBox="0 0 24 24"><g fill="none" stroke-width="2">' +
-    '<circle class="jp-icon3" stroke="#616161" cx="6" cy="5" r="2"/>' +
-    '<circle class="jp-icon3" stroke="#616161" cx="6" cy="19" r="2"/>' +
-    '<circle class="jp-icon3" stroke="#616161" cx="18" cy="7" r="2"/>' +
-    '<path class="jp-icon3" stroke="#616161" d="M6 7v10M18 9c0 5-7 4-11 8.5"/></g></svg>'
-});
-
-interface IResult {
-  ok: boolean;
-  output: string;
-}
-
-function outputBody(text: string): Widget {
-  const body = new Widget();
-  const pre = document.createElement('pre');
-  pre.className = 'jp-WsActions-output';
-  pre.textContent = text || '(no output)';
-  body.node.appendChild(pre);
-  return body;
-}
-
-async function showOutput(title: string, text: string): Promise<void> {
-  await showDialog({ title, body: outputBody(text), buttons: [Dialog.okButton({ label: 'Close' })] });
-}
-
-/** The line worth putting in a notification: "ok share ref=..." for ws-publish, else the last line. */
-function summary(output: string): string {
-  const lines = output.split('\n').map(l => l.trim()).filter(Boolean);
-  return lines.find(l => l.startsWith('ok ')) ?? lines[lines.length - 1] ?? '';
-}
-
-/** POST /ws-actions/run/<action>, with an in-progress notification that turns into the result. */
-async function run(action: string, title: string, payload: object = {}): Promise<IResult | null> {
-  const id = Notification.emit(`${title}…`, 'in-progress', { autoClose: false });
-  try {
-    const res = await requestAPI<IResult>(`run/${action}`, {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    });
-    Notification.update({
-      id,
-      message: `${title}: ${summary(res.output) || (res.ok ? 'done' : 'failed')}`,
-      type: res.ok ? 'success' : 'error',
-      autoClose: res.ok ? 6000 : false,
-      actions: [{ label: 'Details', callback: () => void showOutput(title, res.output) }]
-    });
-    return res;
-  } catch (e) {
-    Notification.update({ id, message: `${title} failed: ${(e as Error).message}`, type: 'error', autoClose: 8000 });
-    return null;
-  }
-}
-
-/** Promote from the current changes, or from an existing share tag. */
-class PromoteBody extends Widget {
-  private source = document.createElement('select');
-  private tag = document.createElement('input');
-
-  constructor() {
-    super();
-    const sourceLabel = document.createElement('label');
-    sourceLabel.textContent = 'Promote';
-    this.source.add(new Option('My current changes', 'changes'));
-    this.source.add(new Option('An existing share tag', 'tag'));
-    this.tag.placeholder = 'ws/<user>/<yyyymmdd-hhmmss>';
-    this.tag.disabled = true;
-    this.source.onchange = () => {
-      this.tag.disabled = this.source.value !== 'tag';
-      if (!this.tag.disabled) {
-        this.tag.focus();
-      }
-    };
-    for (const el of [this.source, this.tag]) {
-      el.className = 'jp-mod-styled jp-WsActions-field';
-    }
-    this.node.append(sourceLabel, this.source, this.tag);
-  }
-
-  getValue(): { from_tag?: string } {
-    return this.source.value === 'tag' ? { from_tag: this.tag.value.trim() } : {};
-  }
-}
-
-const plugin: JupyterFrontEndPlugin<void> = {
-  id: 'ws-actions:plugin',
-  description: 'Workspace menu: share, promote and rebase the overlay workspace.',
-  autoStart: true,
-  requires: [IDefaultFileBrowser],
-  activate: (app: JupyterFrontEnd, browser: IDefaultFileBrowser) => {
-    /** After the lower layer changed: refresh the listing and tell the user about open files. */
-    const afterBaseSwitch = async (res: IResult | null) => {
-      if (res?.ok) {
-        await browser.model.refresh();
-        Notification.info('Reload open files and restart kernels to see the new base.', { autoClose: 8000 });
-      }
-    };
-
-    app.commands.addCommand(CMD.status, {
-      label: 'Workspace status',
-      icon: listIcon,
-      execute: async () => {
-        const res = await run('status', 'Workspace status');
-        if (res) {
-          await showOutput('Workspace status', res.output);
-        }
-      }
-    });
-
-    app.commands.addCommand(CMD.share, {
-      label: 'Share a snapshot…',
-      caption: 'Commit all your changes on the current base and push them as a ws/<user>/<time> tag',
-      icon: shareIcon,
-      execute: async () => {
-        const result = await showDialog({
-          title: 'Share a snapshot',
-          body: 'Commit all your changes on top of the current base and push them as a tag ws/<you>/<time>?',
-          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Share' })]
-        });
-        if (result.button.accept) {
-          await run('share', 'Share');
-        }
-      }
-    });
-
-    app.commands.addCommand(CMD.promote, {
-      label: 'Promote…',
-      caption: 'Push your changes (or a share tag) as a ws/<user>/<time> branch for a merge request',
-      icon: moveUpIcon,
-      execute: async () => {
-        const result = await showDialog<{ from_tag?: string }>({
-          title: 'Promote',
-          body: new PromoteBody(),
-          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Promote' })]
-        });
-        if (!result.button.accept || !result.value) {
-          return;
-        }
-        if (result.value.from_tag === '') {
-          Notification.warning('Enter the share tag to promote.', { autoClose: 5000 });
-          return;
-        }
-        await run('promote', 'Promote', result.value);
-      }
-    });
-
-    app.commands.addCommand(CMD.rebase, {
-      label: 'Update to latest…',
-      caption: 'Move your workspace onto the latest commit, keeping your changes',
-      icon: refreshIcon,
-      execute: async () => {
-        const check = await run('check', 'Checking for conflicts');
-        if (!check?.ok) {
-          return;
-        }
-        const clean = check.output.startsWith('no conflicts');
-        const result = await showDialog({
-          title: 'Update to latest',
-          body: clean
-            ? 'No conflicts. Move your workspace onto the latest commit? Your changes are kept.'
-            : outputBody(
-                'Upstream also changed these files. Updating keeps YOUR copy and hides their change:\n\n' +
-                  check.output
-              ),
-          buttons: [
-            Dialog.cancelButton(),
-            clean ? Dialog.okButton({ label: 'Update' }) : Dialog.warnButton({ label: 'Update anyway' })
-          ]
-        });
-        if (result.button.accept) {
-          await afterBaseSwitch(await run('rebase', 'Update to latest', { force: !clean }));
-        }
-      }
-    });
-
-    app.commands.addCommand(CMD.back, {
-      label: 'Go back to previous base…',
-      caption: 'Return to the commit you were on before the last update',
-      icon: undoIcon,
-      execute: async () => {
-        const confirm = await showDialog({
-          title: 'Go back',
-          body: 'Move your workspace back to the previous base commit? Your changes are kept.',
-          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Go back' })]
-        });
-        if (!confirm.button.accept) {
-          return;
-        }
-        let res = await run('back', 'Go back');
-        if (res && !res.ok && res.output.startsWith('refused')) {
-          const force = await showDialog({
-            title: 'Go back anyway?',
-            body: outputBody(res.output),
-            buttons: [Dialog.cancelButton(), Dialog.warnButton({ label: 'Go back anyway' })]
-          });
-          if (!force.button.accept) {
-            return;
-          }
-          res = await run('back', 'Go back', { force: true });
-        }
-        await afterBaseSwitch(res);
-      }
-    });
-
-    const menu = new Menu({ commands: app.commands });
-    menu.title.label = 'Workspace';
-    menu.addItem({ command: CMD.status });
-    menu.addItem({ type: 'separator' });
-    menu.addItem({ command: CMD.share });
-    menu.addItem({ command: CMD.promote });
-    menu.addItem({ type: 'separator' });
-    menu.addItem({ command: CMD.rebase });
-    menu.addItem({ command: CMD.back });
-
-    app.commands.addCommand(CMD.menu, {
-      label: args => (args.toolbar ? '' : 'Workspace actions'),
-      caption: 'Share, promote or update your workspace',
-      icon: workspaceIcon,
-      execute: () => {
-        const button = document.querySelector(`.jp-FileBrowser [data-command="${CMD.menu}"]`);
-        const r = button?.getBoundingClientRect();
-        menu.open(r ? r.left : window.innerWidth / 2, r ? r.bottom : window.innerHeight / 3);
-      }
-    });
-  }
-};
-
-export default plugin;
-EOF
-```
-
----
-
-## 6. Create the two helper scripts
-
-### 6.1 `dev-setup.sh`: link the source into the module's JupyterLab
-
-The module installed JupyterLab with `pipx`, so it lives in its own environment (`~/.local/share/pipx/venvs/jupyterlab` or similar; `pipx environment` tells you). The extension must be installed into **that** environment.
-
-```bash
-mkdir -p /home/coder/dev/scripts
-cat > /home/coder/dev/scripts/dev-setup.sh <<'EOF'
-#!/usr/bin/env bash
-# Link the ws_actions source into the JupyterLab environment the Coder jupyterlab module created
-# with pipx, build the frontend, then restart JupyterLab so the server half loads.
-# Safe to re-run. Survives workspace restarts (/home/coder is on a PVC); re-run only after
-# a pipx upgrade/reinstall of jupyterlab.
-set -euo pipefail
-
-SRC=${WS_ACTIONS_SRC:-/home/coder/dev/ws_actions}
-HERE=$(cd "$(dirname "$0")" && pwd)
-VENV="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab"
-
-[ -x "$VENV/bin/jupyter-lab" ] || { echo "JupyterLab not found in $VENV (has the module finished installing it?)"; exit 1; }
-[ -f "$SRC/pyproject.toml" ] || { echo "extension source not found in $SRC"; exit 1; }
-export PATH="$VENV/bin:$PATH"
-cd "$SRC"
-
-echo "==> editable install into $VENV"
-pipx runpip jupyterlab install -q -e "$SRC"
-
-echo "==> build the frontend"
-jlpm install >/dev/null
-jlpm build
-
-echo "==> link the frontend and enable the server extension"
-jupyter labextension develop . --overwrite
-jupyter server extension enable --sys-prefix ws_actions
-
-jupyter labextension list 2>&1 | grep -i ws-actions || { echo "frontend not registered"; exit 1; }
-jupyter server extension list 2>&1 | grep -i ws_actions || { echo "server extension not registered"; exit 1; }
-
-"$HERE/restart-jupyter.sh"
-EOF
-```
-
-What each step does:
-
-| Step | Effect |
-| --- | --- |
-| `pipx runpip jupyterlab install -e` | Jupyter imports `ws_actions/*.py` straight from `/home/coder/dev/ws_actions` |
-| `jlpm install` / `jlpm build` | compiles `src/*.ts` into `ws_actions/labextension/` |
-| `jupyter labextension develop` | symlinks `ws_actions/labextension/` into the environment, so each rebuild is picked up |
-| `jupyter server extension enable --sys-prefix` | turns the server half on in that environment |
-
-### 6.2 `restart-jupyter.sh`: restart JupyterLab with the module's own arguments
-
-Needed after Python changes. It reuses the arguments of the running JupyterLab, and adds `--ServerApp.root_dir` and `--FileCheckpoints.root_dir` only if they are missing (same values as the module `config` in step 2, as a safety net if you test without that `config`).
-
-```bash
-cat > /home/coder/dev/scripts/restart-jupyter.sh <<'EOF'
-#!/usr/bin/env bash
-# Restart the JupyterLab started by the Coder jupyterlab module, with the same arguments,
-# so Python changes (handlers.py) are picked up. Also points the file browser at the workspace
-# and keeps .ipynb_checkpoints out of the overlay (they would end up in upper/ and get published).
-set -euo pipefail
-
-LOG=${JUPYTER_LOG:-/tmp/jupyterlab.log}
-ROOT=${JUPYTER_ROOT:-$HOME/workspace}
-CHECKPOINTS=${JUPYTER_CHECKPOINTS:-/home/coder/.jupyter-checkpoints}
-PATTERN='jupyter-lab --no-browser'
-
-ARGS=$(pgrep -af "$PATTERN" | head -1 | cut -d' ' -f2-) || true
-[ -n "$ARGS" ] || { echo "JupyterLab is not running (start/restart the workspace first)"; exit 1; }
-
-case "$ARGS" in *--ServerApp.root_dir=*) ;; *) ARGS="$ARGS --ServerApp.root_dir=$ROOT" ;; esac
-case "$ARGS" in *--FileCheckpoints.root_dir=*) ;; *) ARGS="$ARGS --FileCheckpoints.root_dir=$CHECKPOINTS" ;; esac
-mkdir -p "$CHECKPOINTS"
-
-pkill -f "$PATTERN"
-for _ in $(seq 1 30); do pgrep -f "$PATTERN" >/dev/null || break; sleep 0.5; done
-
-# Start from $HOME, not inside the overlay: a cwd inside it would pin the old mount after an update.
-cd "$HOME"
-# shellcheck disable=SC2086  # ARGS is the module's argument list, split on spaces on purpose
-setsid nohup $ARGS >"$LOG" 2>&1 </dev/null &
-
-for _ in $(seq 1 60); do
-  if grep -q 'ws_actions server extension loaded' "$LOG" 2>/dev/null; then
-    echo "JupyterLab restarted; ws_actions loaded (log: $LOG)"
-    exit 0
-  fi
-  sleep 1
-done
-echo "JupyterLab restarted but ws_actions was not seen in $LOG:"
-tail -20 "$LOG"
-exit 1
-EOF
-
-chmod +x /home/coder/dev/scripts/*.sh
-```
-
-Run it from a Coder terminal (or `coder ssh`), not from `kubectl exec`: only processes started under the agent see the overlay.
-
----
-
-## 7. Install it into the running JupyterLab
-
-### 7.1 First run in dry-run mode (UI only, nothing executed)
-
-```bash
-/home/coder/dev/scripts/dev-setup.sh
-WS_ACTIONS_DRY_RUN=1 /home/coder/dev/scripts/restart-jupyter.sh
-```
-
-Expected at the end: a `ws-actions … enabled OK` line (frontend), a `ws_actions … OK` line (server extension), then `JupyterLab restarted; ws_actions loaded (log: /tmp/jupyterlab.log)`.
-
-(`dev-setup.sh` restarts JupyterLab once normally; the second line restarts it again with the dry-run variable. JupyterLab inherits the variable from your terminal.)
-
-Reload the JupyterLab browser tab. Every menu item now answers `(dry run) would run: ws-publish share` etc., which lets you check the buttons, dialogs and wording without touching GitLab or the overlay.
-
-### 7.2 Then for real
-
-```bash
-/home/coder/dev/scripts/restart-jupyter.sh
-```
-
-(Without `WS_ACTIONS_DRY_RUN`, so the commands run.)
-
----
-
-## 8. Try it in the browser
-
-Open JupyterLab from the Coder dashboard (or `/go/jupyterlab` through the middle). In the file browser toolbar, next to the upload/refresh buttons, there is a new "branches" icon; there is also a **Workspace** top menu.
-
-| Try | Expected |
-| --- | --- |
-| Workspace status | dialog with `base:`, `latest:`, `back ->`, `changes:` |
-| Create or edit a file in the workspace, then Share a snapshot… → Share | "Share…" spinner, then "Share: ok share ref=ws/alice/2026…"; **Details** shows the full output |
-| Promote… → My current changes | "Promote: ok promote ref=ws/alice/2026…" (a branch in GitLab) |
-| Promote… → An existing share tag, paste the tag from Share | branch created from that tag |
-| Promote… → share tag `foo` | error "invalid share tag (expected ws/<user>/<yyyymmdd-hhmmss>)" |
-| Update to latest… when nothing changed upstream in your files | "No conflicts…" → Update → "rebased … -> …", file browser refreshes |
-| Update to latest… after upstream changed a file you edited | the file list and a red **Update anyway**; accepting runs `ws-base use latest --force` |
-| Go back to previous base… | "rebased … -> …", or a **Go back anyway** dialog if refused |
-| Click Share twice quickly | second one: "another workspace action is still running" |
-
-Check from the terminal that it did what the menu said:
-
-```bash
-ws-base status
-cat /data/overlay/.base_commit_sha
-grep ws_actions /tmp/jupyterlab.log          # one line per action: name, exit code, ok
-git ls-remote --tags "$GITLAB_REMOTE" 'ws/*' # needs the token in a credential helper, or check GitLab UI
-```
-
----
-
-## 9. The edit loop
-
-Put this in `~/.bashrc` (or run it in each terminal) so `jlpm` and `jupyter` point at the module's environment:
-
-```bash
-export PATH="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab/bin:$PATH"
-```
-
-| You changed | Do |
-| --- | --- |
-| `src/index.ts` (labels, dialogs, icons, menu order) | `cd /home/coder/dev/ws_actions && jlpm build`, then reload the browser tab |
-| `schema/plugin.json` (toolbar position, top menu) | `jlpm build`, reload; if nothing changes, `restart-jupyter.sh` then reload |
-| `ws_actions/handlers.py` (which command runs, validation, timeouts) | `/home/coder/dev/scripts/restart-jupyter.sh`, reload |
-| `style/index.css` | `jlpm build`, reload |
-
-Built-in icons you can use instead of the custom one: `import { <name> } from '@jupyterlab/ui-components'`. Common ones: `shareIcon`, `moveUpIcon`, `refreshIcon`, `undoIcon`, `redoIcon`, `listIcon`, `runIcon`, `saveIcon`, `downloadIcon`, `buildIcon`, `bugIcon`, `settingsIcon`, `checkIcon`, `closeIcon`.
-
-**After a workspace restart** there is nothing to redo. `/home/coder` is on the PVC, so the module finds the `pipx` JupyterLab in `~/.local` (it skips the install, or `pipx` says "already installed"), starts it, and the editable install, the frontend link and the server enable are all still there. Only run `dev-setup.sh` again if you delete `~/.local/share/pipx` or run `pipx upgrade jupyterlab` / `pipx reinstall jupyterlab`.
-
----
-
-## 10. When you are happy: build the wheel and bake it into the image
-
-### 10.1 Build the wheel (in the workspace)
-
-```bash
-cd /home/coder/dev/ws_actions
-export PATH="$(pipx environment --value PIPX_LOCAL_VENVS)/jupyterlab/bin:$PATH"
-jlpm build:prod
-pipx runpip jupyterlab install -q build
-python -m build --wheel --no-isolation --outdir dist
-ls dist/          # ws_actions-0.1.0-py3-none-any.whl
-```
-
-Commit `/home/coder/dev/ws_actions` to your own repo (without `node_modules/`, `lib/`, `ws_actions/labextension/`, `dist/`) so the image build can produce the wheel in CI.
-
-### 10.2 Production image: JupyterLab and the wheel pre-installed
-
-```dockerfile
-# Build the extension wheel. Context: the folder that contains ws_actions/
-FROM python:3.12-bookworm AS build
-COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-RUN pip install --no-cache-dir "jupyterlab>=4.2,<5" build hatchling
-WORKDIR /src
-COPY ws_actions/ ./
-RUN jlpm install && jlpm build:prod && python -m build --wheel --no-isolation --outdir /dist
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      fuse-overlayfs util-linux procps curl ca-certificates git python3 python3-venv \
- && rm -rf /var/lib/apt/lists/* \
- && useradd -u 1000 -m -s /bin/bash coder
-# One environment for JupyterLab and the extension (Debian's system pip refuses installs: PEP 668).
-COPY --from=build /dist/*.whl /tmp/
-RUN python3 -m venv /opt/jupyter \
- && /opt/jupyter/bin/pip install --no-cache-dir "jupyterlab>=4.2,<5" /tmp/*.whl \
- && rm /tmp/*.whl
-COPY ws-publish ws-base /opt/ws/
-ENV PATH=/opt/ws:/opt/jupyter/bin:$PATH
-USER 1000
-WORKDIR /home/coder
-```
-
-No node, no pipx in the final image. The module finds `jupyter-lab` on the `PATH`, skips its install and starts it; the extension is already there (the wheel enables its server half by itself).
-
-Check the image:
-
-```bash
-docker run --rm <image> sh -c 'command -v jupyter-lab; jupyter labextension list; jupyter server extension list'
-# /opt/jupyter/bin/jupyter-lab, "ws-actions ... enabled OK", "ws_actions enabled ... OK"
-```
-
-### 10.3 Template
-
-Keep the `module "jupyterlab"` block (with its `config`) and the `GITLAB_*`, `WS_USER`, `SCRATCH_ROOT` env from [step 2](#2-add-the-module-and-the-environment-to-the-template) unchanged; only the image changes.
-
-Existing workspaces still have the dev JupyterLab in `~/.local/share/pipx/venvs/jupyterlab` on their PVC. It is harmless as long as `/opt/jupyter/bin` comes before `~/.local/bin` on the `PATH` (the production image above does not add `~/.local/bin` at all); to clean up: `pipx uninstall jupyterlab && rm -rf ~/dev`.
-
----
-
-## 11. Troubleshooting
-
-| Symptom | Cause | Fix |
+| What Coder sets | Path | Lifetime |
 | --- | --- | --- |
-| `dev-setup.sh`: "JupyterLab not found in …" | module still installing, or it used `uv` | wait for `/tmp/jupyterlab.log`; make sure `pipx` is in the image |
-| `pipx environment: error: unrecognized arguments: --value` | old pipx | use `pipx environment` and read `PIPX_LOCAL_VENVS`, or `VENV=~/.local/share/pipx/venvs/jupyterlab` (older pipx: `~/.local/pipx/venvs/jupyterlab`) |
-| `pip install -e` / `jlpm install` hang or fail | no access to PyPI / npm | `PIP_INDEX_URL`, `YARN_NPM_REGISTRY_SERVER` to your mirrors |
-| No button after `dev-setup.sh` | browser tab not reloaded, or build failed | reload; `jupyter labextension list` must show `ws-actions … enabled OK` |
-| Button there, every action "404 Not Found" | server half not loaded | `grep ws_actions /tmp/jupyterlab.log`; rerun `restart-jupyter.sh` |
-| "ws-publish: command not found" | not on JupyterLab's `PATH` | set `WS_PUBLISH_BIN=/opt/ws/ws-publish` (and `WS_BASE_BIN`) in the pod env, or fix `PATH` |
-| Share: "read base sha: … /scratch/.base_commit_sha" | `SCRATCH_ROOT` wrong | `SCRATCH_ROOT=/data/overlay` in the pod env |
-| Share: "upperdir empty — nothing to publish" | no changes in the overlay | edit a file in `~/workspace` first |
-| Update: "controller not running (/tmp/ws-base/req missing)" | `ws-base serve` not started by the entrypoint | use the `ws-base` entrypoint from the overlay guide (section 4b) |
-| After Update, an open notebook still shows old content | open handles keep the old mount | reload the file, restart the kernel (the menu reminds the user) |
-| Share output shows `https://***@…` | a git error from `ws-publish` | expected: the token is redacted; read the rest of the message |
-| `.ipynb_checkpoints` in a shared commit | JupyterLab ran without the checkpoint setting | module `config` from step 2 (`FileCheckpoints.root_dir`); delete the folder from `~/workspace` |
-| All actions "(dry run) …" | JupyterLab still has `WS_ACTIONS_DRY_RUN=1` | `restart-jupyter.sh` from a terminal without that variable |
+| `coder_signed_app_token` | the app only: `/@alice/notebook/apps/jupyter/` | **60 s**, not renewed |
+| `csrf_token` | `/` | session |
+| `coder_session_token` | — | **never set** |
+
+Using the app with only those cookies (JupyterLab, probe making a request every 15 s):
+
+| Time after the first request | Result |
+| --- | --- |
+| 0 s (with the token in the URL) | 200 |
+| 15 s, 30 s, 45 s | 200 (cookie not renewed) |
+| 60 s and later | **303 to `/login?message=You are signed out or your session has expired…`** |
+| Idle, one request after 80 s | 303 to `/login` |
+
+Confirmed by hand in Chrome with code-server (VS Code): portal on `localhost`, Coder on `127.0.0.1` (different hostnames, like `portal.example.com` and `coder.example.com`). The frontend code was taken verbatim from `middle-go-launch-link.md` section 8.3. VS Code opens, the token is stripped from the address bar, and a reload after 60 s goes to Coder's login page.
+
+Why this was easy to miss:
+
+- **Open websockets survive.** VS Code and JupyterLab keep working over connections opened in the first minute. The failure shows on a reload, a reconnect (network change, laptop sleep), or anything that needs a new request (saving in JupyterLab, the file browser, a new kernel, a Markdown preview, a download).
+- **The earlier token-strip lab used subdomain apps and did not measure past a minute.** Subdomain apps seemed to keep access. They do only for a user signed in to the dashboard, whose session silently renews access (next paragraph).
+- **The Coder root stays signed out.** That is correct, but only because nothing lasting was set.
+
+**Subdomain apps have the same 60-second limit** (measured later on Coder v2.36.5, local lab). A token in the URL of `code-server--main--ws--alice.coder.example.com` also becomes only a 60-second `coder_signed_app_token`. After that Coder answers 303 to the dashboard's `/api/v2/applications/auth-redirect?redirect_uri=<app URL>`. That endpoint mints an app-only key for the app hostname, but only from a **full** key in the dashboard's `coder_session_token` cookie: an app-only key gets 404, and no cookie sends the user to `/login`. It also refuses a `redirect_uri` outside the wildcard (400). With a dashboard session it 303s back to the app with `?coder_application_connect_api_key_<hex>=`, and the app hostname sets:
+
+| Cookie | Attributes | Holds |
+| --- | --- | --- |
+| `coder_subdomain_app_session_token_<first 32 hex of sha256(wildcard hostname)>` | `Domain=` the wildcard parent, `Path=/`, HttpOnly, `SameSite=Lax`, session cookie | an `application_connect` key that **expires with the dashboard key it came from** and survives that key being revoked |
+
+So for users kept out of the dashboard, a subdomain app opened with a token in the URL dies after a minute, like a path app. What does work (measured): putting **our** app-only key in that cookie. Coder accepts it for subdomain apps and for ports; the dashboard ignores it (401). That is what the bounce does for subdomain apps (3.10).
+
+### 1.2 A leftover cookie beats the token in the URL
+
+Coder reads a `coder_session_token` cookie before `?coder_session_token=`:
+
+| Request to the path app | Result |
+| --- | --- |
+| valid token in the URL, no cookie | 200 |
+| valid token in the URL **plus a stale `coder_session_token` cookie** | **303 to `/login`** |
+| valid token in the URL plus unrelated cookies | 200 |
+
+A stale cookie is easy to get: an expired or revoked key from an earlier bounce, an old Coder login, a middle restart that rotated the user's key. With the token strip the user then gets Coder's login page and no way out. The bounce does not have this problem: it sets the cookie, overwriting a stale one with the same name and path.
+
+### 1.3 An app-only key in a path-limited cookie works
+
+A `coder_session_token` cookie holding an `application_connect` key with `Path=/@alice/notebook/apps/jupyter` (details and screenshots: `middle-go-launch-link.md` section 7.4):
+
+| Check | Result |
+| --- | --- |
+| JupyterLab page, contents API, kernel **websocket**, saving a file | all work, still 100 s after the cookie was set (past the 60 s of 1.1) |
+| Coder root in the same browser | login page (the cookie is not sent there) |
+| The same key in a `Path=/` cookie at the root | "Something went wrong": unusable, but not the login page |
+| The key used directly (as if copied from DevTools) | cannot read the user, open the workspace, stop it, or mint keys (404); workspace and template lists empty |
+| `coder_session_token` visible to page JavaScript | no (HttpOnly) |
+
+`POST /api/v2/users/{user}/keys/tokens` with `"scope": "application_connect"` returns 201; Coder stores it as `scopes: ["coder:application_connect"]`.
 
 ---
 
-## 12. Things to know about `ws-publish` today
+## 2. Decision
 
-`ws-publish` is still a skeleton. Three behaviours matter for the menu:
+**Every Coder page the portal (or a `/go/` link) opens goes through the plane-host bounce.** The browser only ever carries a one-time code in a POST body. The Coder cookie is set by a response from the Coder hostname (the Lambda behind the ALB rule `/_portal/*`).
 
-1. **The token is in the push URL.** It pushes to `https://oauth2:<token>@host/…`, so the token is in `git`'s argv (visible to `ps` inside the workspace) and in error messages. The extension redacts it from what the browser sees; the real fix is a `GIT_ASKPASS` helper in `ws-publish`.
-2. **It never fetches after the first clone.** It clones into `/tmp/ws-publish-git` once and reuses it. After **Update to latest** moves `.base_commit_sha` to a commit that clone has never seen, Share/Promote fail with `checkout base …`. Until `ws-publish` runs `git fetch` before `checkout`, clear the clone: `rm -rf /tmp/ws-publish-git`.
-3. **It publishes everything in `upper/`.** Anything JupyterLab or Python writes inside `~/workspace` (`__pycache__/`, `.ipynb_checkpoints/` without the setting above, `.virtual_documents/`) ends up in the commit. Keep the checkpoint setting, set `PYTHONDONTWRITEBYTECODE=1` in the pod env, or add an ignore list to `ws-publish`.
+| Target | Token in the URL (JSON + strip) | Bounce |
+| --- | --- | --- |
+| Path app (`subdomain = false`) | **dead after 60 s** (1.1); a stale cookie blocks it (1.2) | works; app-only key + path cookie keeps the dashboard closed (1.3) |
+| Subdomain app or port | **dead after 60 s** unless the user is signed in to the dashboard (1.1) | works: bounce on the app hostname, app-only key in Coder's subdomain app cookie (3.10, validated locally) |
+| Terminal: ttyd as a path app (replaces Coder's web terminal, 3.7) | dead after 60 s, like any path app | works like any path app (app-only key + path cookie) |
+| External-auth consent (GitLab) | does not work (cookie-only Coder page) | works (validated on AWS) |
 
-Promote pushes a branch; the merge request API call is still a TODO in `ws-publish` (it prints `MR API not implemented yet`).
+Why the bounce for everything:
+
+- **One mechanism.** Templates can mix path and subdomain apps; the frontend should not care. The middle knows each app's `subdomain` flag and picks the right redirect.
+- **No token in any URL, log, history or frontend JavaScript.**
+- **Stale cookies cannot break it** (it overwrites them).
+- **The same infrastructure** (ALB rule, Lambda, IAM trust) already exists for the web terminal and GitLab consent. Subdomain apps and ports add one ALB rule for the wildcard hostnames (3.10).
+
+**Terminal: ttyd instead of Coder's web terminal.** Coder's web terminal is a page of the dashboard: it needs the user's full key in a `Path=/` cookie, which also opens the dashboard. ttyd, run in the workspace as a normal path app, is opened like VS Code or JupyterLab, so the full key never reaches the browser (3.7).
+
+The token URL is no fallback for users kept out of the dashboard: it lasts 60 s for every kind of app (1.1).
 
 ---
 
-## 13. File reference
+## 3. General design
 
-The same files are in this repo under `spike-middle/ws-actions-lab/`:
+### 3.1 One entry point; the middle decides
 
-```text
-ws-actions-lab/
-├── scripts/
-│   ├── dev-setup.sh           # step 6.1
-│   └── restart-jupyter.sh     # step 6.2
-└── ws_actions/
-    ├── pyproject.toml         # 5.2
-    ├── package.json           # 5.3
-    ├── tsconfig.json          # 5.3
-    ├── .yarnrc.yml            # 5.3
-    ├── install.json           # 5.4
-    ├── jupyter-config/server-config/ws_actions.json   # 5.4
-    ├── schema/plugin.json     # 5.5
-    ├── style/index.css        # 5.6
-    ├── ws_actions/__init__.py # 5.7
-    ├── ws_actions/handlers.py # 5.8
-    ├── src/handler.ts         # 5.9
-    └── src/index.ts           # 5.10
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as Browser (portal or /go/ page)
+  participant M as Middle
+  participant L as Bounce Lambda (coder-a.example.com/_portal/*)
+  participant C as Coder (coder-a.example.com)
+
+  B->>M: POST /v1/bounce/start {plane, purpose, workspace_id?, slug?, provider?}
+  M->>C: read workspace and app (user's full key, server side)
+  M->>M: pick key kind, cookie path, redirect; issue one-time code (60 s)
+  M-->>B: {bounce_url, code}
+  B->>L: form POST code
+  L->>M: POST /internal/bounce/redeem (signed STS proof)
+  M-->>L: {session_token, redirect_path, cookie_name, cookie_domain, cookie_path, max_age}
+  L-->>B: 302 redirect_path + Set-Cookie (HttpOnly, Secure)
+  B->>C: the app / terminal / consent page
 ```
 
-Related docs: `overlay-restricted-lab/OVERLAY-CODER-GUIDE.md` (overlay, `ws-base`), `spike-middle/docs/jupyter-custom-actions-and-coder-sso.md` (extension concepts, Coder SSO through the middle), `adr-001-git-csi-kind-quest/workspace-publish/` (`ws-publish`).
+`bounce_url` is the plane host for path apps, the terminal and consent, and the app's own hostname for subdomain apps and ports (3.10). The Lambda behind it is the same.
+
+The portal already has the frontend half: `openViaBounce(body)` in `portal/public/app.js` asks for a code and form-POSTs it. Nothing changes there. Only the body differs:
+
+```javascript
+openViaBounce({ plane, purpose: "app", workspace_id: wsId, slug: "code-server" }); // new
+openViaBounce({ plane, purpose: "app", workspace_id: wsId, slug: "jupyter" });     // new
+openViaBounce({ plane, purpose: "app", workspace_id: wsId, slug: "ttyd" });        // new: the terminal
+openViaBounce({ plane, purpose: "port", workspace_id: wsId, port: 8000 });         // new: a port (subdomain)
+openViaBounce({ plane, purpose: "external-auth", provider: "primary-gitlab" }, { sameTab: true }); // existing
+```
+
+The `/go/<slug>` link (`middle-go-launch-link.md` section 7) uses the same code issuance through its `Handoff` hook. There the middle renders the form itself, so there is no frontend code at all.
+
+### 3.2 What the middle picks per target
+
+**The Lambda does the same thing for every purpose.** It takes the code, redeems it with the middle, sets the cookie from the reply, and redirects. The differences between OAuth consent and an app are all decided by the middle: which key it mints, its lifetime, the cookie name, domain and path, and the redirect. They reach the Lambda as data in the redeem reply, so the Lambda never branches on the purpose; it only checks them against fixed rules (3.5).
+
+OAuth consent and apps differ in two ways only:
+
+| | OAuth consent (`external-auth`) | Coder app (`app`) |
+| --- | --- | --- |
+| Lifecycle | one-off: after the consent, Coder returns to `/_portal/done`, where the Lambda asks the middle to revoke the key, clears the cookie and sends the browser back to the portal | ongoing: the cookie must stay valid while the app is used. There is no `/done` step, and none is needed, because the key is app-only and cannot open the dashboard |
+| Cookie | dedicated 5-minute key, `Path=/` (the consent pages live under several paths) | reused app-only key, up to 8 h: on the workspace's apps path (path apps), or in Coder's subdomain app cookie (subdomain apps and ports) |
+
+The `/_portal/done` step already exists and was validated on AWS (`plane-host-cookie-bounce.md`). Apps add the cookie name, domain and path to the redeem reply.
+
+Per target:
+
+| Purpose | Key in the cookie | Cookie path | Cookie lifetime | Redirect after the bounce | Afterwards | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `app`, path app | `middle-app-<plane>`: app-only (`application_connect`), cached per user and plane, shared by all apps and workspaces | the workspace's apps prefix, e.g. `/@alice/notebook/apps` (one cookie per workspace) | up to 8 h, never beyond the key's remaining lifetime | `/@alice/notebook/apps/code-server/` | nothing | implemented, validated on AWS (3.9) |
+| `app`, subdomain app; `port` | the same `middle-app-<plane>` key, in Coder's subdomain app cookie `coder_subdomain_app_session_token_<hash>`, `Domain=` the wildcard parent | `/` | up to 8 h, never beyond the key's remaining lifetime | `/` on the app hostname (the bounce runs there) | nothing | implemented, validated locally (3.10) |
+| `terminal` (Coder's web terminal) | the user's full `middle-<plane>` key | `/` | 900 s | `/@alice/notebook.main/terminal` | the dashboard is reachable with it | validated, **retired**: use ttyd as an `app` (3.7) |
+| `external-auth` | `bounce-<plane>`: dedicated, 5 min | `/` | 300 s | `/external-auth/<id>/callback?redirect=/_portal/done` | key revoked and cookie cleared at `/_portal/done` | validated on AWS |
+
+For subdomain apps we first considered going through Coder's own auth redirect (bounce a short-lived key onto `/api/v2/applications/auth-redirect` and let Coder mint the app cookie). The lab ruled it out: that endpoint only accepts a full key (1.1), so the browser would briefly hold a key that opens the dashboard, and the resulting cookie expires with that key. Setting Coder's subdomain cookie directly, with the app-only key, needs neither (3.10).
+
+### 3.3 Middle: `POST /v1/bounce/start`, purpose `app`
+
+A new case in `handleBounceStart` (`go-middle/bounce.go`; implemented as `appBounceTarget`). The redirect and the cookie path are computed from Coder's data, never taken from the request. The implementation also checks that the workspace belongs to the caller (apps are `share = "owner"`), that it is running (409 otherwise), and maps Coder's 403/404 on the workspace to a 404. The sketch:
+
+```go
+	case "app":
+		if !appSlugRe.MatchString(in.Slug) { // ^[a-z0-9][a-z0-9-]{0,63}$
+			http.Error(w, "invalid app slug", http.StatusBadRequest)
+			return
+		}
+		tok, err := s.ensureCoderTokenOnPlane(r.Context(), email, p.ID) // full key, server side only
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		raw, err := p.Client.WorkspaceRaw(r.Context(), tok, in.WorkspaceID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		me, err := p.Client.GetMe(r.Context(), tok)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		app, agent := findApp(raw, in.Slug) // latest build → resources → agents → apps
+		switch {
+		case app == nil:
+			http.Error(w, "no such app in this workspace", http.StatusNotFound)
+			return
+		case app.Health != "healthy" && app.Health != "disabled":
+			http.Error(w, "app is starting", http.StatusConflict)
+			return
+		case app.Subdomain:
+			return s.subdomainTarget(p, app.SubdomainName) // bounce on the app host, 3.10
+		}
+		name, _ := raw["name"].(string)
+		wsPart := url.PathEscape(name)
+		if agentCount(raw) > 1 {
+			wsPart += "." + url.PathEscape(agent) // multi-agent workspaces: /@user/ws.agent/apps/slug/
+		}
+		appsPrefix := fmt.Sprintf("/@%s/%s/apps", url.PathEscape(me.Username), wsPart)
+		redirect = appsPrefix + "/" + url.PathEscape(in.Slug) + "/"
+		cookiePath = appsPrefix // one cookie covers every app of this workspace (same app-only key)
+```
+
+The request body gets `slug` (and `port`, `protocol` for purpose `port`). The code record carries the whole target, including the one host allowed to redeem it:
+
+```go
+type bounceCode struct {
+	Email, Plane, Purpose string
+	Host                  string // the only host allowed to redeem (plane host, or the app host)
+	Target                bounceTarget
+	Exp                   time.Time
+}
+
+type bounceTarget struct {
+	Origin       string // scheme://host[:port] serving the bounce
+	Redirect     string // relative, on Origin
+	CookieName   string // "" = coder_session_token
+	CookieDomain string // "" = host-only
+	CookiePath   string // "" = "/"
+}
+```
+
+### 3.4 Middle: redeem
+
+In `handleBounceRedeem`, `app` and `port` get the app-only key, and the reply carries the cookie attributes from the code's target (`cookie_name`, `cookie_domain`, `cookie_path`; simplified below to the path). The request's `Host` must equal the code's `Host`: a code issued for one app host cannot set a cookie from another app host or from the plane host (validated, 3.10).
+
+```go
+	cookiePath := ""
+	switch rec.Purpose {
+	case "external-auth":
+		maxAge = bounceConsentTTLSeconds
+		tok, err = s.mintBounceToken(r.Context(), rec.Email, p, time.Duration(maxAge)*time.Second)
+	case "app", "port":
+		var left time.Duration
+		tok, left, err = s.ensureAppTokenOnPlane(r.Context(), rec.Email, p)
+		maxAge = min(s.Config.Bounce.AppCookieMaxAgeSeconds, int(left.Seconds()))
+		cookiePath = rec.Target.CookiePath
+	default: // terminal (Coder's web terminal; retired in favour of ttyd as an app, 3.7)
+		tok, err = s.ensureCoderTokenOnPlane(r.Context(), rec.Email, p.ID)
+	}
+	// ...
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_token": tok,
+		"redirect_path": rec.Redirect,
+		"cookie_path":   cookiePath,
+		"max_age":       maxAge,
+	})
+```
+
+`ensureAppTokenOnPlane` keeps one current app-only key per user and plane, cached with its expiry. Each key gets a unique name, so a new one never has to replace the old one:
+
+```go
+	body := map[string]any{
+		"token_name": fmt.Sprintf("middle-app-%s-%s", p.ID, time.Now().UTC().Format("060102150405")), // unique per mint
+		"lifetime":   int64(24 * time.Hour), // app_key_lifetime_seconds
+		"scope":      "application_connect", // stored as scopes ["coder:application_connect"]
+	}
+```
+
+On a cache hit the middle also checks, with the owner token, that the key still exists in Coder. If an admin deleted it, the bounce mints a new one instead of handing out a dead cookie.
+
+**Rotation without deleting.**
+
+| Key's remaining lifetime | What the bounce does | Cookie `Max-Age` |
+| --- | --- | --- |
+| more than `app_cookie_max_age_seconds` (8 h) | reuse the cached key | 8 h |
+| less than that | mint a new key (new name) and cache it; **leave the old one alone** | 8 h (the new key has 24 h) |
+
+A cookie therefore never outlives its key. Tabs still holding an older cookie keep working until that cookie ends, because its key is still valid. Deleting the old key on rotation (the delete-then-create pattern the main key uses) would log those tabs out. Minting on every launch would pile up keys for nothing.
+
+**Coder cleans up expired keys itself.** `coderd` purges keys that have been expired for longer than `CODER_API_KEYS_RETENTION` (default `7d`; `0` disables purging). The job runs every 10 minutes and never touches valid keys ([Data retention](https://coder.com/docs/admin/setup/data-retention)). The middle never deletes app keys. Per user and plane there are at most two valid app keys (current and previous) plus the expired ones from the last 7 days waiting for the purge.
+
+Keep the name short, because Coder validates token names. With a short plane ID, `middle-app-a-260927204629` is 25 characters.
+
+**Where the cache lives.** In memory, a middle restart forgets the key, and the next bounce mints a new one. That is harmless now that nothing is deleted, but it adds keys. With several middle replicas, each one would mint its own key. For production, use a shared store (Redis) with a time-to-live equal to the key's remaining lifetime, and encrypt the value, since it is a credential.
+
+Config (`BounceConfig`): `app_cookie_max_age_seconds`, default `28800` (8 h), and `app_key_lifetime_seconds`, default `86400` (24 h). The middle refuses to start unless the key lifetime is longer than the cookie lifetime; keep it well above, so a rotated key still covers the cookies issued just before the rotation.
+
+### 3.5 Lambda: cookie name, domain and path
+
+The Lambda (`bounce-lambda/bounce/handler.go`) takes the cookie attributes from the middle but only within fixed rules:
+
+| Attribute | Accepted |
+| --- | --- |
+| `cookie_name` | empty or `coder_session_token`, or `coder_subdomain_app_session_token_` + 32 lowercase hex (`safeCookieName`) |
+| `cookie_domain` | empty (host-only), or a **strict parent of the host the request came in on**, and **never** for `coder_session_token` (`safeCookieDomain`). So the dashboard's session cookie always stays host-only |
+| `cookie_path` | a safe prefix of the redirect (`safeCookiePath`, below) |
+| `redirect_path` | a relative path (`/…`, not `//…`), as before; subdomain apps redirect to `/` on the app host the bounce runs on |
+
+The path check:
+
+```go
+	var out struct {
+		SessionToken string `json:"session_token"`
+		RedirectPath string `json:"redirect_path"`
+		CookieName   string `json:"cookie_name"`
+		CookieDomain string `json:"cookie_domain"`
+		CookiePath   string `json:"cookie_path"`
+		MaxAge       int    `json:"max_age"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || out.SessionToken == "" ||
+		!strings.HasPrefix(out.RedirectPath, "/") || strings.HasPrefix(out.RedirectPath, "//") {
+		return page(http.StatusBadGateway, "Unexpected middle response."), nil
+	}
+	cookiePath := "/"
+	if out.CookiePath != "" {
+		if !strings.HasPrefix(out.CookiePath, "/") || strings.HasPrefix(out.CookiePath, "//") ||
+			strings.ContainsAny(out.CookiePath, ";, \t\r\n") ||
+			!(strings.HasPrefix(out.RedirectPath, out.CookiePath+"/") || strings.HasPrefix(out.RedirectPath, out.CookiePath+"?")) {
+			return page(http.StatusBadGateway, "Unexpected middle response."), nil
+		}
+		cookiePath = out.CookiePath
+	}
+	cookieName, ok := safeCookieName(out.CookieName)                   // allowlist, table above
+	cookieDomain, ok2 := safeCookieDomain(out.CookieDomain, host, cookieName) // strict parent of this host
+	if !ok || !ok2 {
+		return page(http.StatusBadGateway, "Unexpected middle response."), nil
+	}
+	cookie := (&http.Cookie{
+		Name:     cookieName,
+		Value:    out.SessionToken,
+		Domain:   cookieDomain,
+		Path:     cookiePath,
+		MaxAge:   out.MaxAge,
+		HttpOnly: true,
+		Secure:   h.CookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	}).String()
+```
+
+(The `?` case covers a redirect with a query string on the cookie path itself.)
+
+A cookie path without a trailing slash, `/@alice/notebook/apps`, is sent for every app of that workspace and everything under them, but not for `/@alice/notebook/apps-old` or another workspace (standard browser path matching).
+
+### 3.6 Frontend
+
+Nothing new: `openViaBounce` (3.1). Every launch is the same call with a different `purpose`. The response is always `{bounce_url, code}`; the frontend never sees a Coder token or builds a Coder URL.
+
+To know which buttons to open that way, the portal reads `GET /v1/workspaces/{id}/access`: the middle marks each path app with `"bounce": true` when the plane has a bounce configured, and each subdomain app too when the plane also has `bounce.subdomain_apps: true` and a `wildcard_url`. The portal then calls `openViaBounce({ plane, purpose: "app", workspace_id, slug })` (`runChoice` in `portal/public/app.js`), whatever the kind of app. With `"port_bounce": true` in the same response, the portal shows a port field and an "Open port" button, which calls `openViaBounce({ plane, purpose: "port", workspace_id, port })`.
+
+### 3.7 Terminal: ttyd as a path app
+
+Coder's built-in web terminal cannot be opened with an app-only key. It is a page of the Coder dashboard, served at `/@alice/notebook.main/terminal`, and it calls `/api/v2/workspaceagents/<id>/pty`. So its cookie has to hold the user's full key with `Path=/`, and that cookie also opens the dashboard. Instead, the workspace runs **ttyd** as an ordinary path app, and the built-in terminal is hidden:
+
+```hcl
+resource "coder_agent" "main" {
+  # ...
+  display_apps {
+    web_terminal = false # hide Coder's built-in terminal; ttyd below replaces it
+    vscode       = false
+    # ...
+  }
+
+  startup_script = <<-EOT
+    # ... other apps ...
+    if [ ! -x "$HOME/bin/ttyd" ]; then
+      mkdir -p "$HOME/bin"
+      case "$(uname -m)" in
+        aarch64|arm64) arch=aarch64 ;;
+        *)             arch=x86_64 ;;
+      esac
+      curl -fsSL -o "$HOME/bin/ttyd" "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.$arch"
+      chmod +x "$HOME/bin/ttyd"
+    fi
+    # -W: writable; 127.0.0.1: only Coder's agent reaches it. Coder authenticates every request.
+    nohup "$HOME/bin/ttyd" -i 127.0.0.1 -p 7681 -W bash >/tmp/ttyd.log 2>&1 &
+  EOT
+}
+
+resource "coder_app" "ttyd" {
+  agent_id     = coder_agent.main.id
+  slug         = "ttyd"
+  display_name = "Terminal"
+  url          = "http://127.0.0.1:7681"
+  icon         = "/icon/terminal.svg"
+  subdomain    = false
+  share        = "owner"
+
+  healthcheck {
+    url       = "http://127.0.0.1:7681/"
+    interval  = 5
+    threshold = 30
+  }
+}
+```
+
+In production, bake the ttyd binary into the workspace image instead of downloading it at start (pinned version, no outbound download needed).
+
+The portal opens it like any other app: `openViaBounce({ plane, purpose: "app", workspace_id, slug: "ttyd" })`. The middle's `terminal` purpose and the portal's `openWebTerminal` are then no longer needed.
+
+What changes:
+
+| | Coder's web terminal (before) | ttyd as a path app |
+| --- | --- | --- |
+| Cookie | full key, `Path=/`, 900 s | app-only key, the workspace's apps prefix `/@alice/notebook/apps`, up to 8 h |
+| Dashboard reachable with the cookie | yes | no |
+| Opened by | purpose `terminal` | purpose `app`, slug `ttyd` |
+| Hidden in the Coder UI | — | `display_apps { web_terminal = false }` |
+
+Hiding the built-in terminal only removes the button. Its URL still works for someone who holds a full key, but with this design the browser never gets one.
+
+**One key per user, one cookie per workspace (the default).** A cookie has one `Path`; the browser keeps cookies with the same name but different paths as separate cookies. The middle therefore sets the cookie on the workspace's apps prefix, `/@alice/notebook/apps` (or `/@alice/notebook.main/apps` for multi-agent workspaces). The first app opened sets it, and it covers ttyd, VS Code, JupyterLab and any app added to the template later. Another workspace gets its own cookie, holding the same `middle-app-<plane>` key. There is no key per app or per workspace, and the prefix still passes the Lambda's check that the cookie path is a prefix of the redirect.
+
+A cookie per app (`/@alice/notebook/apps/code-server`) also works, but only adds cookies. A cookie per user (`Path=/@alice`) would be safe too, because the key is app-only and the dashboard's API lives under `/api/v2`, where the cookie is not sent. The per-workspace prefix is the middle ground: it reaches no more than it needs to, and the middle knows the workspace anyway when it issues the code.
+
+### 3.8 Always bounce on "open"; nobody tracks the cookie
+
+Neither the middle nor the portal can tell whether the cookie is already set. It is HttpOnly and lives on the Coder hostname, so the middle (another hostname) never receives it, and page JavaScript cannot read it. Tracking it in the middle ("issued at 10:02 for 8 h") would be unreliable: the user may clear cookies, switch browser or device, or the key may have been rotated since.
+
+So **every "open" from the portal goes through the bounce**, whether or not a cookie exists:
+
+- **Cheap:** the app-only key is cached, so the redeem mints nothing; the Lambda sets the same cookie again. The cost is one redirect plus the middle's checks.
+- **Self-healing:** a missing, expired or stale cookie is replaced (1.2 shows what a stale one does otherwise).
+- **It extends the session:** each open resets the cookie's `Max-Age`.
+
+Inside the app nothing bounces: requests, websockets and reloads use the cookie already set. The one case the bounce does not cover is a tab left open longer than the cookie lifetime (`app_cookie_max_age_seconds`, 8 h by default). Its next request gets Coder's login page, and the user opens the app again from the portal. Setting the cookie lifetime close to the key's (for example 20 h for a 24 h key) makes this rarer.
+
+### 3.9 Validated on AWS (September 27, 2026)
+
+Setup (`spike-middle/aws-apps-bounce-lab/up.sh`): Coder v2.36.5 on one EC2 instance behind an ALB on `ishentras.click`. The ALB rule `coder.ishentras.click` + `/_portal/*` goes to the bounce Lambda (in the VPC, own IAM role, multi-value headers on). The middle allowlists that role (name and role ID). The workspace template is `templates/apps-bounce-aws`: code-server and ttyd as path apps with health checks, and Coder's web terminal hidden.
+
+**Headless checks (`e2e.sh`): 40 passed, 0 failed.**
+
+| Area | Result |
+| --- | --- |
+| Bounce | 302 to `/@alice/apps/apps/code-server/` and `/@alice/apps/apps/ttyd/`; no token in any redirect |
+| Cookie | `coder_session_token`, `Path=/@alice/apps/apps`, HttpOnly, Secure, `SameSite=Lax`, no `Domain=`, `Max-Age` set |
+| One cookie, one key | opening VS Code, then ttyd, leaves one cookie on the workspace's apps path, holding the same key |
+| Apps | VS Code opens; the ttyd page opens and its websocket upgrades (101) |
+| After 60 s | VS Code, ttyd and a **new** ttyd websocket still work at 75 s (the query-token way dies at 60 s, 1.1) |
+| Dashboard closed | Coder API with the browser's cookies: 401 (cookie not sent). With the key itself: `/users/me`, the workspace and a stop request all 404 |
+| Key | stored with scope `coder:application_connect` |
+| Refused | replayed code (403); Bob opening Alice's workspace (404); invalid slug (400); unknown app (404); redeem without the Lambda's IAM proof (403); `/_portal/*` on app wildcard hostnames does not reach the Lambda (that setup had no wildcard rule yet; subdomain apps need one, 3.10) |
+| Stale cookies | on their own they send you to Coder's login page (1.2). The bounce overwrites the one on the same path, and the app then opens **even with a stale `Path=/` cookie still present** (the longer path is sent first) |
+| Rotation without deleting (cookie 90 s, key 180 s for the test) | t = 80 s: key reused, `Max-Age` 90. t = 95 s: new key minted, old key **not** deleted. The tab from t = 80 s (old key) and the one from t = 95 s (new key) both work |
+
+Coder hides expired keys from the token list right away (a 3-minute test key was gone from the list after it expired); the rows are removed later by the purge (3.4).
+
+**Browser test (Chrome, incognito):** portal → alice → workspace `apps` shows VS Code and Terminal, and no "Web Terminal (Coder)". Both opened in a new tab with no token in the URL. Saving in VS Code and typing in ttyd kept working past 60 s and after a reload. The Coder root in the same window showed the login page.
+
+Cookies the browser holds on the Coder hostname:
+
+| Cookie | Set by | Path | What it is |
+| --- | --- | --- | --- |
+| `coder_session_token` | the bounce | `/@alice/apps/apps` | the app-only key, 8 h; the only credential the portal gives the browser |
+| `coder_signed_app_token` | Coder | the app, e.g. `/@alice/apps/apps/ttyd/` | Coder's own signed ticket for one app, about 1 minute. Coder re-issues it from `coder_session_token` when it expires, which is why the apps keep working (with the token in the URL there is nothing to re-issue it from) |
+| `csrf_token` | Coder | `/` | CSRF protection for state-changing requests; not a credential |
+
+### 3.10 Subdomain apps and ports (validated in the local lab, September 27, 2026)
+
+**Where the bounce runs.** Coder serves a subdomain app on its own hostname, for example `code-server--ws--alice.apps.coder.example.com` (Coder leaves the agent out for single-agent workspaces), and a port on `8000--main--ws--alice.apps.coder.example.com` (the agent is required; add `s` after the port for HTTPS, `8443s--…`). A browser only accepts a cookie `Domain` equal to the responding host or a parent of it. So a response from `coder.example.com` could only set `Domain=coder.example.com`, which also reaches the dashboard, and could never narrow it to `apps.coder.example.com`. The bounce therefore runs **on the app hostname itself**: the portal POSTs the code to `https://<app host>/_portal/bounce`, and the Lambda sets the cookie from there.
+
+**Infrastructure.** Everything below except the ALB rule is already needed for Coder's subdomain apps:
+
+| Piece | Setting |
+| --- | --- |
+| ALB rule | host `*.apps.coder.example.com` + path `/_portal/*` → the same bounce Lambda target group, next to the existing plane-host rule. All other requests on those hosts still go to Coder |
+| DNS | `*.apps.coder.example.com` → the ALB |
+| Certificate | a SAN for `*.apps.coder.example.com` (a `*.coder.example.com` certificate covers one level only) |
+| Middle | `bounce.subdomain_apps: true`, and the plane's `wildcard_url` (e.g. `https://*.apps.coder.example.com`). Optional `subdomain_cookie_name` per plane, in case Coder's cookie name ever differs from the derived one |
+
+The wildcard does not have to sit under the plane hostname, because the cookie is set from the app hostname. The one side effect: a subdomain app can no longer serve its own `/_portal/*` paths, since the ALB sends them to the Lambda.
+
+**What the middle does** (`subdomainTarget` and `portBounceTarget` in `go-middle/bounce.go`):
+
+- The same checks as for path apps: the workspace is the caller's own and running, and the app is healthy. For ports: 1–65535, `http` or `https`, on the workspace's main (or first) agent.
+- The hostname label comes from Coder's `subdomain_name` for the app (built as `{port}[s]--{agent}--{ws}--{user}` for ports). It must be a single DNS label of at most 63 characters; a longer one is refused with 400 rather than producing a URL that cannot resolve.
+- Cookie name: `coder_subdomain_app_session_token_` plus the first 32 hex characters of sha256 of the wildcard hostname without the port (`*.apps.coder.example.com`). This is the name Coder v2.36.5 uses; Coder accepting the cookie in the lab confirms it.
+- `Domain=` the wildcard parent (`apps.coder.example.com`), `Path=/`, the same app-only key and the same 8 h maximum as path apps.
+- The code is bound to that app hostname. It cannot be redeemed on another app host or on the plane host.
+
+**Headless checks (`local-subdomain-lab/test-subdomain-bounce.sh`): 33 passed, 0 failed**, plus the two 75-second checks in the first run. Lab: Coder v2.36.5, `--wildcard-access-url '*.coder.127.0.0.1.sslip.io'`, the ALB emulator sending `/_portal/*` on the plane host and on the wildcard hosts to the bounce handler, and the real IAM proof (the lab role `coder-bounce-plane-a`). Template `templates/subdomain-ab`: code-server as a subdomain app, and a web server on port 8000.
+
+| Area | Result |
+| --- | --- |
+| Access list | code-server marked subdomain and `bounce: true`; `port_bounce: true` |
+| Bounce | `bounce_url` on `code-server--sub--alice.coder.127.0.0.1.sslip.io`; 302 to `/`; no token in the redirect |
+| Cookie | `coder_subdomain_app_session_token_378c…`, `Domain=coder.127.0.0.1.sslip.io`, `Path=/`, HttpOnly, `SameSite=Lax`, `Max-Age` 28800; no `coder_session_token` set |
+| App | VS Code opens with the cookie; without it Coder sends the browser to its auth redirect |
+| Ports | port 8000 opens with the cookie from the **VS Code** bounce (the `Domain` covers every app hostname); a bounce on `8000--main--sub--alice…` works too, with the same key |
+| After 60 s | VS Code and port 8000 still open at 75 s |
+| Dashboard | in this lab the cookie also reaches the dashboard host (the wildcard parent is the plane host), and Coder ignores it there (401). The key itself: `/api/v2/users/me` 404, port-share API 404 |
+| Refused | replayed code (403); an app code redeemed on the port's hostname (403, no cookie set); a port code redeemed on the plane host (403, no cookie set); Bob opening Alice's port (404); port 0 (400); protocol `ftp` (400) |
+
+With a wildcard like `*.apps.coder.example.com` the cookie does not reach the dashboard host at all.
+
+**Cookie scope, path apps against subdomain apps.** Same key, different cookie:
+
+| | Path apps | Subdomain apps and ports |
+| --- | --- | --- |
+| Bounce on | `coder.example.com/_portal/bounce` | `<app>.apps.coder.example.com/_portal/bounce` |
+| Cookie | `coder_session_token`, host-only | `coder_subdomain_app_session_token_<hash>`, `Domain=apps.coder.example.com` |
+| Path | `/@user/workspace/apps` | `/` |
+| Sent to | that workspace's path apps | every host under the wildcard: all the user's subdomain apps and ports, and other users' apps and ports |
+
+Sending it to other users' app hosts gives nothing away: Coder checks on each request whether the key's owner may open that app (sharing level), and every app host is a separate origin whose JavaScript cannot read the HttpOnly cookie. This is how Coder scopes its own subdomain cookie.
+
+**Sharing** (measured with curl in an earlier run of the local subdomain lab, keys placed in the cookie by hand):
+
+| Port `share_level` | Bob, with his own app-only key in the cookie |
+| --- | --- |
+| `owner` (default) | 404 |
+| `authenticated` | 200 |
+| `public` | 200, no cookie needed |
+
+The app-only key cannot change sharing (the port-share API answers 404). The owner shares from Coder's UI or CLI, or the middle does it with the owner's full key (`POST`/`DELETE /api/v2/workspaces/{id}/port-share` with `{"agent_name","port","share_level","protocol"}`). Because the cookie covers every app hostname, a link to Alice's `authenticated` port works for Bob as soon as he has bounced once on that plane (today: by opening an app or port of his own workspace; see section 5).
+
+**Reproduce:** `local-subdomain-lab/lab-iam.sh up`, then `DEFAULT_TEMPLATE=subdomain-ab ./bring-up-bounce-lab.sh`, then `./test-subdomain-bounce.sh`; `./lab-iam.sh down` removes the IAM role and user.
+
+---
+
+## 4. Security properties
+
+- **No Coder token in any URL, history entry, Referer, access log or frontend JavaScript.** The browser carries a one-time code (60 s, single use) in a POST body. The code is bound to the user, the plane, the redirect, the cookie attributes and one hostname (the plane host, or the app host for subdomain apps and ports), and only the plane's Lambda role can redeem it.
+- **Cookies are HttpOnly, `Secure`, `SameSite=Lax`.** `coder_session_token` is always host-only: the Lambda refuses a `Domain=` for it. Only Coder's subdomain app cookie gets a `Domain`, the wildcard parent, as Coder itself sets it (3.10). It holds the app-only key.
+- **Apps: the dashboard stays closed.** The key can only connect to apps the user may open (1.3). The path-app cookie is only sent to the workspace's apps path; the subdomain cookie is sent to app hostnames, and the dashboard ignores it even where it reaches it (3.10).
+- **Stale cookies are overwritten** by the bounce (same name and path). An older `Path=/` cookie can coexist with a new app-path cookie; the longer path is sent first, so Coder reads the new one (validated, 3.9).
+- **Redirects are computed by the middle** from the user's own Coder username, workspace and a validated slug, and the Lambda only accepts same-origin paths. No open redirect.
+- **The user's full Coder key never reaches the browser for apps.** Apps (including the terminal, as ttyd) get the app-only key; OAuth consent gets a 5-minute key revoked at `/_portal/done`. Coder's own web terminal, which would need the full key in a `Path=/` cookie, is hidden and not opened by the portal (3.7).
+
+What this design does **not** give, compared with Coder's own recommendations ([wildcard access URL](https://coder.com/docs/admin/networking/wildcard-access-url)):
+
+- **Path apps share one origin with the dashboard.** A cookie path limits where the browser sends the cookie; it does not isolate JavaScript. A script running in one path app (say, untrusted content in a notebook) can call the user's other path apps on the same origin. With the app-only key it cannot use the dashboard API, but it can drive the user's other apps and workspaces. Subdomain apps each get their own origin, which is why Coder recommends them for anything that serves untrusted content.
+- **The consent window.** Purpose `external-auth` puts a 5-minute key that can use the dashboard in a `Path=/` cookie until `/_portal/done` revokes it.
+- **The CLI key.** As long as the portal hands out a full key for the CLI (`/v1/cli-credentials` returns `middle-<plane>` today), keeping users out of the dashboard is a convenience, not a hard boundary. A scoped CLI and IDE token (`coder:workspaces.access` + `user:read`, section 10) narrows this: it cannot mint keys, create workspaces or read the deployment config, but it can still read the user's own workspaces and templates through the API.
+- Keep `share = "owner"` on path apps, and do not enable `--dangerous-allow-path-app-sharing` or `--dangerous-allow-path-app-site-owner-access`.
+
+---
+
+## 5. Open items
+
+| Item | What to do |
+| --- | --- |
+| Subdomain apps and ports on AWS | add the ALB rule (wildcard host + `/_portal/*` → the bounce Lambda) and the wildcard certificate to `aws-apps-bounce-lab`, and run `test-subdomain-bounce.sh`-style checks there, plus a browser test. Not covered by the local run: a websocket on a subdomain app (VS Code), the `Secure` attribute (the lab is plain HTTP), and the real ALB's multi-value headers on app hostnames |
+| Shared ports for users without their own workspace | a purpose that bounces onto another user's shared app or port, after the middle checks its share level with the owner token. Today a user gets the subdomain cookie only by opening an app or port of their own workspace |
+| Host-only subdomain cookie | if `Domain=` the wildcard parent is too broad, the middle can send no `cookie_domain` (the Lambda supports it): one cookie per app hostname, one bounce per app or port |
+| Port picker | list listening ports (`/api/v2/workspaceagents/{id}/listening-ports`) in the portal instead of typing a port number |
+| App key cache for several middle replicas | shared, encrypted cache (Redis) with a TTL; today it is in memory, so each replica or restart mints its own key (harmless, since nothing is deleted). Leave `CODER_API_KEYS_RETENTION` on (default 7 d) |
+| Retire purpose `terminal` | remove `openWebTerminal` from the portal and the `terminal` case from the middle once every template uses ttyd |
+| `/go/<slug>` link | `golaunch.go` still sets the user's full key with `Path=/` in its same-host mode; switch it to the `Handoff` (bounce) path with purpose `app` |
+| Multi-agent workspaces | app path is `/@user/ws.agent/apps/slug/`; check against a template with two agents |
+| Scoped CLI and IDE tokens in the middle | `/v1/cli-credentials`, `/cli-auth/mint` and `vscode-desktop` should mint a dedicated token per client with `scopes: ["coder:workspaces.access","user:read"]` (plus `coder:workspaces.operate` if wanted) and a lifetime of 8–24 h, instead of returning `middle-<plane>` (section 10) |
+| JetBrains | repeat the section 10 check with JetBrains Toolbox or Gateway. It is expected to behave like the VS Code extension (which was validated), since it also signs in through `/users/me` |
+| Token per workspace | `--allow workspace:<uuid>` (`allow_list` in the API) could bind a token to one workspace; not tested |
+| Coder login page | disable sign-in methods users should not have (e.g. `CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE=false`); middle-created users have a random password they never learn |
+
+---
+
+## 6. Reproduce the findings
+
+Against any Coder with a running workspace that has a path app. Use a test user; the key is deleted at the end. Needs `curl` and `jq`.
+
+```bash
+CODER=https://coder.example.com
+USERNAME=alice
+APP="/@alice/notebook/apps/code-server/"
+read -rs OWNER_TOKEN   # paste an owner token; not echoed, not in shell history
+
+KEY_JSON=$(curl -s -X POST -H "Coder-Session-Token: $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"token_name":"probe-60s","lifetime":3600000000000}' "$CODER/api/v2/users/$USERNAME/keys/tokens")
+KEY=$(jq -r .key <<<"$KEY_JSON"); KEY_ID=$(jq -r .id <<<"$KEY_JSON")
+JAR=$(mktemp)
+
+# 1.1: token in the URL once, then cookies only
+curl -s -o /dev/null -c "$JAR" -w 'first load:  %{http_code}\n' "$CODER$APP?coder_session_token=$KEY"
+awk '$6 ~ /coder_/ {print "cookie:", $6, "path:", $3, "expires:", strftime("%T", $5)}' "$JAR"
+sleep 30; curl -s -o /dev/null -b "$JAR" -w 'after 30 s:  %{http_code}\n' "$CODER$APP"
+sleep 40; curl -s -o /dev/null -b "$JAR" -w 'after 70 s:  %{http_code} %{redirect_url}\n' "$CODER$APP"
+
+# 1.2: a stale cookie beats a valid token in the URL
+curl -s -o /dev/null -H 'Cookie: coder_session_token=AbCdEfGhIj-0123456789abcdefghijklm' \
+  -w 'stale cookie + valid URL token: %{http_code} %{redirect_url}\n' "$CODER$APP?coder_session_token=$KEY"
+
+curl -s -X DELETE -H "Coder-Session-Token: $OWNER_TOKEN" "$CODER/api/v2/users/$USERNAME/keys/$KEY_ID"
+rm -f "$JAR"; unset OWNER_TOKEN KEY KEY_JSON
+```
+
+Expected: `first load: 200`; only `coder_signed_app_token` with the app path, expiring 60 s later; `after 30 s: 200`; `after 70 s: 303 …/login?…`; `stale cookie + valid URL token: 303 …/login?…`.
+
+(`curl -b` does not send expired cookies, like a browser. `strftime` needs gawk; drop it to see the raw epoch.)
+
+---
+
+## 7. What this changes in the other docs
+
+- **`middle-go-launch-link.md`:** section 7 (the `/go/` hand-off to the bounce) is the recommended way when the middle has its own hostname, and section 7.4 is the app-only key and cookie path described here. Section 8 (JSON + token strip) carries the 60-second and stale-cookie warnings; it only works for users who are signed in to the dashboard (1.1).
+- **`open-coder-apps-portal-json-strip.md`:** its subdomain results relied on a dashboard session; its caveat points here for both kinds of app.
+- **`plane-host-cookie-bounce.md`:** gains purpose `app` (sections 3.3–3.5 here, implemented and validated on AWS) next to `external-auth`; its `terminal` purpose (Coder's web terminal) is replaced by ttyd as an app.
+
+---
+
+## 8. The middle's skeleton: endpoints and sign-in
+
+With the bounce for every app, the middle comes down to about 20 endpoints and **one way of authenticating users: it validates the IdP's JWT**. It has no login form and no session of its own. It drives only two short OIDC redirect flows itself (the `/go/` link and the CLI), and nobody ever signs in to Coder: the middle creates Coder users and keys with the owner token.
+
+### 8.1 Who calls the middle, and how they prove it
+
+| Caller | Credential | Checked by |
+| --- | --- | --- |
+| Portal (browser JavaScript) | IdP access token, `Authorization: Bearer`. The portal does the OIDC login itself | `requireAuth`: signature against the IdP's JWKS, issuer, audience, email claim |
+| `/go/<slug>` link (no portal) | the middle runs OIDC code + PKCE, then hands off to the bounce | `/go/{slug}` → IdP → `/go/callback` |
+| CLI and IDEs | the middle runs OIDC code + PKCE (or the portal asks with its Bearer JWT), then returns the Coder URL and a scoped token (section 10). The CLI and IDEs then talk to Coder directly; the middle proxies nothing | `/cli-auth/*`, `/v1/cli-credentials` |
+| Bounce (Lambda) | signed `sts:GetCallerIdentity`, bound to this middle, the action and the code | `verifyBounceCaller`: IAM role allowlist per plane (on-premises: a projected service-account token, section 9) |
+| Coder (called by the middle) | owner token per plane, server side only | the middle maps email → Coder user (created if missing) and keeps two keys per user and plane: `middle-<plane>` (full, never sent to the browser for apps) and `middle-app-<plane>` (app-only), and mints short-lived scoped tokens for the CLI and IDEs on request (section 10) |
+
+```mermaid
+flowchart LR
+  U[User] -->|OIDC login| IdP
+  U -->|Bearer JWT| M[Middle]
+  M -->|owner token: create user, mint keys| C[Coder]
+  M -->|one-time code| U
+  U -->|form POST code| L[Bounce]
+  L -->|caller proof + code| M
+  M -->|app-only key + cookie attributes| L
+  L -->|Set-Cookie + 302| U
+  U -->|cookie| C
+```
+
+### 8.2 Endpoints to keep
+
+| Group | Endpoints | Auth |
+| --- | --- | --- |
+| Identity and catalogue | `GET /v1/me`, `GET /v1/planes`, `GET /v1/templates` | Bearer JWT |
+| Workspaces | `GET`/`POST /v1/workspaces`, `DELETE /v1/workspaces/{id}`, `GET /v1/workspaces/{id}/access` | Bearer JWT |
+| Logs | `GET /v1/workspaces/{id}/build-logs`, `…/agent-logs` (server-sent events) | JWT, checked in the handler |
+| **Open anything in the browser** | `POST /v1/bounce/start`, purposes `app`, `port`, `external-auth` | Bearer JWT |
+| GitLab link | `GET`/`DELETE /v1/external-auth/{id}` | Bearer JWT |
+| Desktop and CLI (scoped tokens, section 10) | `POST /v1/workspaces/{id}/vscode-desktop`, `GET /v1/cli-credentials` | Bearer JWT |
+| Middle-driven sign-in | `GET /go/{slug}`, `GET /go/callback`; `/cli-auth`, `/cli-auth/start`, `/cli-auth/callback`, `POST /cli-auth/mint` | OIDC redirect + PKCE |
+| Called by the bounce only | `POST /internal/bounce/redeem`, `POST /internal/bounce/done` | caller proof (IAM today) |
+| Operations | `GET /healthz`, `GET /v1/config/public` | none |
+
+Put `/internal/*` on a separate listener or port that only the bounce can reach (security group, or a NetworkPolicy on Kubernetes), even though each call carries its own proof.
+
+### 8.3 What the bounce makes unnecessary
+
+| To remove | Why |
+| --- | --- |
+| `GET /v1/workspaces/{id}/coder-app/{slug}`, `/open/{slug}` | open apps with a token in the URL: 60 s (1.1) |
+| `POST /v1/app-session`, `handleOpenApp` | older ways of setting an app cookie from the middle's hostname |
+| the `middle_session` cookie, `?mt=`, `POST /v1/logout` | the middle's own session; with Bearer only, `resolveAppAuth` shrinks to one case |
+| bounce purpose `terminal`, portal `openWebTerminal` | replaced by ttyd as an app (3.7) |
+| `/go/` same-host mode | sets the full key with `Path=/`; use the bounce hand-off instead |
+| `/v1/tasks/*` | a separate feature with its own task token; keep only if used |
+
+So: **one login** (the IdP), **one token check** in the middle, **one entry point** for opening apps, ports and consent (`/v1/bounce/start`), and **two internal calls** from the bounce.
+
+---
+
+## 9. Future: an on-premises control plane (Kubernetes, NGINX, projected tokens)
+
+**Not implemented or tested; a design direction.** If a Coder control plane moves on-premises onto Kubernetes (Rancher/RKE2, OpenShift), the bounce keeps working with two substitutions. Nothing changes for the browser, the portal, the cookies or Coder.
+
+| AWS today | On-premises |
+| --- | --- |
+| ALB rule `/_portal/*` on the plane host and the wildcard hosts | an ingress rule with the same two hostnames and path |
+| Bounce as a Lambda (ALB event) | the same Go handler as a small Deployment (plain HTTP) |
+| Caller proof: signed `sts:GetCallerIdentity` for the Lambda's IAM role | a **projected service-account token** for the bounce pod, with the middle as audience |
+| IAM role allowlist per plane | allowlist of (service-account issuer, namespace, service account) per plane |
+
+```mermaid
+flowchart LR
+  B[Browser] --> I[Ingress / Gateway<br/>coder.example.com, *.apps.coder.example.com]
+  I -->|/_portal/*| BP[bounce Deployment<br/>projected SA token]
+  I -->|everything else| CD[coderd Service]
+  BP -->|redeem + SA token| M[Middle]
+  M -->|verify via cluster JWKS| M
+```
+
+### 9.1 Ingress
+
+The rule is the same as on the ALB: on `coder.example.com` and `*.apps.coder.example.com`, path prefix `/_portal/` goes to the bounce Service, everything else to coderd, with the `Host` header preserved (the default for ingress controllers; the bounce and the middle's host check depend on it).
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coder
+  namespace: coder
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [coder.example.com, "*.apps.coder.example.com"]
+      secretName: coder-tls            # wildcard certificate (cert-manager: DNS-01)
+  rules:
+    - host: coder.example.com
+      http: &paths
+        paths:
+          - path: /_portal/
+            pathType: Prefix
+            backend: { service: { name: bounce, port: { number: 8080 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: coder, port: { number: 80 } } }
+    - host: "*.apps.coder.example.com"
+      http: *paths
+```
+
+Notes on the controller:
+
+- **Which NGINX.** The community `ingress-nginx` controller was announced for retirement (end of maintenance March 2026). Use a maintained controller: F5's NGINX Ingress Controller, or a Gateway API implementation (NGINX Gateway Fabric, Envoy Gateway). With Gateway API the same thing is one `HTTPRoute` with both `hostnames` and a `/_portal/` path match; it is the more portable choice between Rancher and OpenShift.
+- **OpenShift.** Its default router is HAProxy, not NGINX. Wildcard hosts need `routeAdmission.wildcardPolicy: WildcardsAllowed` on the IngressController and `wildcardPolicy: Subdomain` on the Route; check that a path-based route on a wildcard host behaves as expected on your router version. Alternatively run an NGINX or Gateway API controller next to it for the Coder hostnames.
+- **Websockets** go through unchanged (Coder apps, terminals); make sure proxy read timeouts are long enough (e.g. an hour) for idle editor connections.
+- The ALB's multi-value header quirk (3.9) does not exist here; the bounce gets normal HTTP headers.
+
+### 9.2 The bounce as a Deployment
+
+The handler in `bounce-lambda/bounce` is already transport-independent apart from the ALB event types, and `cmd/alb-emulator` shows the plain-HTTP wrapping. An on-premises build is that wrapper without the proxy part: a `cmd/bounce-server` that serves `/_portal/bounce` and `/_portal/done`. The one real change is the caller proof, behind a small interface:
+
+```go
+// Prover produces the caller proof sent with /internal/bounce/redeem and /done.
+type Prover interface {
+	Proof(ctx context.Context, action, value string) (map[string]any, error)
+}
+// stsProver:     today's signed sts:GetCallerIdentity (Lambda, IAM role)
+// k8sSATokenProver: reads the projected token file on each call (kubelet rotates it)
+```
+
+The pod mounts a token issued for the middle only:
+
+```yaml
+spec:
+  serviceAccountName: bounce
+  automountServiceAccountToken: false     # no API-server token; only the one below
+  containers:
+    - name: bounce
+      image: registry.example.com/coder/bounce:1
+      env:
+        - { name: MIDDLE_URL, value: "https://middle.example.com" }
+        - { name: MIDDLE_TOKEN_FILE, value: /var/run/secrets/middle/token }
+      volumeMounts:
+        - { name: middle-token, mountPath: /var/run/secrets/middle, readOnly: true }
+  volumes:
+    - name: middle-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: middle-onprem      # = the middle's bounce.server_id
+              expirationSeconds: 600
+              path: token
+```
+
+The token is a JWT signed by the cluster: `iss` = the cluster's service-account issuer, `aud` = `middle-onprem`, `sub` = `system:serviceaccount:coder:bounce`, bound to the pod, valid 10 minutes, and rotated by the kubelet before it expires. The bounce has no long-lived secret at all, as with the Lambda role.
+
+### 9.3 The middle: a second kind of caller
+
+`verifyBounceCaller` gets a second verifier, chosen per allowlist entry:
+
+```yaml
+bounce:
+  server_id: middle-onprem
+  callers:
+    - plane: a                       # AWS plane, as today
+      kind: aws_iam
+      account_id: "209561498705"
+      role_name: coder-bounce-plane-a
+    - plane: onprem
+      kind: k8s_sa
+      issuer: https://oidc.rke2.example.com          # the cluster's --service-account-issuer
+      jwks_url: https://oidc.rke2.example.com/openid/v1/jwks
+      subject: system:serviceaccount:coder:bounce
+```
+
+Two ways to verify the token:
+
+| | Offline (JWKS) | TokenReview |
+| --- | --- | --- |
+| How | check the signature against the cluster's published JWKS, then `iss`, `aud` = `server_id`, `exp`, `sub` | the middle asks the cluster's API server (`POST /apis/authentication.k8s.io/v1/tokenreviews`, needs `system:auth-delegator`) |
+| Middle needs | the issuer's JWKS (reachable, or copied into config) | network access and credentials to every cluster's API server |
+| Catches a deleted pod | no (only the 10-minute expiry) | yes (bound tokens die with the pod) |
+| Fits | a middle outside the cluster, several clusters | a middle inside the same cluster |
+
+**Recommendation: offline JWKS verification.** It works whether the middle stays in AWS or moves next to the plane, and it handles several clusters without giving the middle API access to any of them. The short expiry covers the deleted-pod case well enough.
+
+### 9.4 What changes in the security model
+
+- **The proof is a bearer token, not a per-request signature.** The STS proof is bound to one action and one code (`sha256(action + "\n" + code)` is signed), so a stolen proof cannot redeem another code. A projected token is valid for any redeem during its 10 minutes. Someone who steals it still needs a live one-time code, and codes only travel in the user's own browser POST and are bound to that user and host. Close the remaining gap with transport controls:
+  - TLS from the bounce to the middle (the token must never cross the network in clear);
+  - a NetworkPolicy so only bounce pods reach the middle's `/internal/*` listener;
+  - optionally mTLS (service mesh, or cert-manager certificates) between bounce and middle, which binds the call to the pod's certificate as well.
+- **Everything else stays**: one-time codes bound to user, plane and hostname; the Lambda's (now the Deployment's) cookie rules; the app-only key; the middle computing every redirect.
+
+### 9.5 What it would take
+
+| Piece | Work |
+| --- | --- |
+| `bounce` package | split the ALB event handling from the core (redeem → cookie + redirect); add `cmd/bounce-server` and the `Prover` interface with an SA-token implementation |
+| Middle | `kind: k8s_sa` callers: JWKS fetch and cache, JWT checks, allowlist by issuer and subject |
+| Manifests | bounce Deployment, Service, ServiceAccount, NetworkPolicy; the ingress or `HTTPRoute`; wildcard certificate |
+| Lab | a local kind or k3d cluster with an NGINX (or Gateway API) controller in front of the existing local Coder: same `test-subdomain-bounce.sh`, with the IAM proof replaced |
+
+The AWS path does not change, and both kinds of plane can be served by one middle at the same time (one allowlist entry per plane).
+
+---
+
+## 10. Tokens for the CLI and IDEs: which scopes
+
+**Measured on Coder v2.36.5, local lab, September 27, 2026 (44 headless checks, plus VS Code Desktop and interactive `coder ssh` by hand).** The portal hands the user a Coder URL and a token. The CLI (`coder ssh`, `config-ssh`, `port-forward`) and the IDE plugins (the Coder extension for VS Code Desktop, JetBrains Toolbox or Gateway) then talk to Coder directly, so the middle proxies nothing. `/cli-auth` is only there to force the IdP login. The question: does that token need a specific scope, or should it be the user's full token?
+
+**Answer: a scoped token.**
+
+| Use | Scopes |
+| --- | --- |
+| CLI and IDEs | `coder:workspaces.access` + `user:read` |
+| Also start and stop from the CLI | add `coder:workspaces.operate` |
+
+Mint one token per client (`portal-cli`, `portal-vscode`, `portal-jetbrains`) with a lifetime of 8–24 h. Don't hand out `coder:all`, the default for `coder tokens create`, and don't hand out the middle's `middle-<plane>` key.
+
+### 10.1 Results
+
+Each profile is one token for user `alice`, minted by the owner. Each token was tested against alice's workspace `dev`.
+
+| Check | `coder:all` | `access` only | `access` + `user:read` | `access` + `operate` + `user:read` |
+| --- | --- | --- | --- | --- |
+| `GET /api/v2/users/me` | 200 | **404** | 200 | 200 |
+| `coder login` (token pasted) | ok | **"not a valid token"** | ok | ok |
+| `coder list`, `ssh`, `config-ssh`, `port-forward` | ok | ok | ok | ok |
+| interactive `coder ssh` (token from the environment, by hand) | not tried | ok | ok | not tried |
+| VS Code Desktop, Coder extension (by hand) | not tried | **rejects the token** | connects to `alice/dev` | not tried |
+| read templates (API) | ok | ok | ok | ok |
+| read deployment config (API) | 403 | 403 | 403 | 403 |
+| mint another token with it | **ok** | refused | refused | refused |
+| `coder create` another workspace | **ok** | refused | refused | refused |
+| `coder stop` / `coder start` | (not run) | refused | refused | ok |
+
+- **Why `user:read` is needed.** `coder login` validates a token by fetching `/api/v2/users/me`, which answers 404 to a token with only `coder:workspaces.access`. The VS Code Desktop Coder extension signs in the same way: it rejected the `access`-only token and connected with `access` + `user:read` (validated by hand). `coder start` also fails without it (`get owning member`, 404), even with `coder:workspaces.operate`. `user:read_personal` fixes neither.
+- **`coder ssh` works without `user:read`**, interactively too, if the token comes from `CODER_URL` + `CODER_SESSION_TOKEN` rather than `coder login`. That is too fragile to rely on, because `coder login` and the IDE extension break.
+- **`user:read` reveals nothing new.** `GET /api/v2/users` lists only the users alice can already see. The owner's profile answers 404, exactly as it does for alice's full token.
+- **Template reads are included.** `coder:workspaces.access` already contains `template:read`, so a scoped token can read templates through the API.
+- **No escalation.** Minting a token with a scoped token is refused. Coder returns 500 with `insert API key: unauthorized: rbac: forbidden`. Creating a workspace is refused too.
+
+### 10.2 Minting
+
+```bash
+# lifetime is in nanoseconds (8 h here); token names must be unique per user
+curl -s -X POST -H "Coder-Session-Token: $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"token_name":"portal-cli-1790000000","lifetime":28800000000000,
+       "scopes":["coder:workspaces.access","user:read"]}' \
+  "$CODER/api/v2/users/$USERNAME/keys/tokens"      # → {"key":"..."}
+
+# the same with the CLI, as an owner
+coder tokens create -u alice -n portal-cli-1790000000 --lifetime 8h \
+  --scope coder:workspaces.access --scope user:read
+```
+
+The old single `scope` field is deprecated in favour of `scopes`. `GET /api/v2/auth/scopes` lists every scope the deployment accepts.
+
+### 10.3 Things to know
+
+- **Token names are unique per user.** Creating a token under a name that already exists fails, so add a timestamp or a random suffix.
+- **`coder login` refuses to run while `CODER_SESSION_TOKEN` is set**, whatever it holds. Users either run `coder login <url>` and paste the token, or set `CODER_URL` and `CODER_SESSION_TOKEN` and skip `coder login`.
+- **The VS Code extension remembers one token per deployment URL.** It can be opened with `vscode://coder.coder-remote/open?owner=…&workspace=…&url=…&token=…`. To switch tokens, run "Coder: Logout" first.
+- **Users created through the API start dormant**, and Coder refuses the agent of a dormant user's workspace (401). The middle already activates the users it creates (`PUT /api/v2/users/{id}/status/activate`).
+
+### 10.4 Reproduce
+
+The lab script is `spike-middle/local-subdomain-lab/token-scope-lab.sh`, with the template in `spike-middle/templates/cli-token-test/`. It runs Coder on `:3000` with one workspace, `alice/dev`, and mints one token per profile. Tokens are stored in files with 0600 permissions and passed through the environment or stdin, never printed.
+
+```bash
+./token-scope-lab.sh up
+./token-scope-lab.sh test            # the table above
+./token-scope-lab.sh ssh ide         # interactive coder ssh with access + user:read
+./token-scope-lab.sh vscode ide      # open VS Code Desktop on alice/dev with that token
+./token-scope-lab.sh down
+```
