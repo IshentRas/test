@@ -1,6 +1,6 @@
 # Bounce for every Coder app: path apps, subdomain apps and ports
 
-**Status:** findings measured on Coder v2.36.5 (local lab, September 2026) and confirmed by hand in Chrome. The generalised design below reuses the validated plane-host bounce (`plane-host-cookie-bounce.md`). Its new parts (purpose `app`, the app-only key with rotation, `cookie_path` in the Lambda, ttyd as the terminal) are **implemented and validated on AWS** (September 27, 2026): 40 headless checks plus a manual browser test with VS Code and ttyd (section 3.9). Lab scripts: `spike-middle/aws-apps-bounce-lab/`. **Subdomain apps and ports** (the bounce runs on the app host and sets Coder's own subdomain app cookie) are **implemented and validated in the local lab** (33 headless checks, section 3.10); not yet on AWS. **Scopes for CLI and IDE tokens** measured in a local lab (44 headless checks plus a manual test with VS Code Desktop and interactive `coder ssh`, section 10).
+**Status:** findings measured on Coder v2.36.5 (local lab, September 2026) and confirmed by hand in Chrome. The generalised design below reuses the validated plane-host bounce (`plane-host-cookie-bounce.md`). Its new parts (purpose `app`, the app-only key with rotation, `cookie_path` in the Lambda, ttyd as the terminal) are **implemented and validated on AWS** (September 27, 2026): 40 headless checks plus a manual browser test with VS Code and ttyd (section 3.9). Lab scripts: `spike-middle/aws-apps-bounce-lab/`. **Subdomain apps and ports** (the bounce runs on the app host and sets Coder's own subdomain app cookie) are **implemented and validated in the local lab** (33 headless checks, section 3.10); not yet on AWS. **The bounce as a Go microservice** (a Deployment proving itself with a projected service-account token, instead of a Lambda): the bouncer is built and unit-tested, and the middle's side is tested sample code (section 9). **Scopes for CLI and IDE tokens** measured in a local lab (44 headless checks plus a manual test with VS Code Desktop and interactive `coder ssh`, section 10).
 
 **Related:** [plane-host-cookie-bounce.md](./plane-host-cookie-bounce.md) (the bounce: ALB `/_portal/*` → Lambda → middle redeem), [middle-go-launch-link.md](./middle-go-launch-link.md) (one link `/go/<slug>`; section 7 = bounce hand-off, section 7.4 = keeping users out of the dashboard, section 8 = JSON + token strip), [open-coder-apps-portal-json-strip.md](./open-coder-apps-portal-json-strip.md) (the token strip; works only for users signed in to the dashboard, 1.1).
 
@@ -14,6 +14,7 @@
 - **The terminal becomes an ordinary app: ttyd as a path app, Coder's built-in web terminal hidden** (section 3.7). The user's full Coder key then never reaches the browser.
 - **The bounce can also keep users out of the Coder dashboard.** For apps, the cookie holds an app-only key (`application_connect`) and is limited to the workspace's apps path. Validated on AWS with VS Code and ttyd: both work past 60 s and after a reload, websockets included, and the Coder root shows the login page (section 3.9).
 - **Subdomain apps and ports use the same bounce, run on the app's own hostname.** The load balancer also sends `/_portal/*` on the wildcard hostnames to the Lambda. It sets Coder's subdomain app cookie (`coder_subdomain_app_session_token_<hash>`, `Domain=` the wildcard parent, like Coder does) holding the same app-only key. One bounce then covers every subdomain app and port of the user on that plane, and the dashboard ignores the cookie. Validated in the local lab (section 3.10).
+- **The bounce does not have to be a Lambda.** The same Go code runs as a small Deployment next to Coder (`cmd/bounce-server`). The ALB on EKS, or NGINX or the router on OpenShift, sends `/_portal/*` to it. It proves itself to the middle with a projected service-account token, which the middle verifies offline through the EKS cluster's public OIDC discovery and JWKS (section 9).
 - **CLI and IDE tokens: `coder:workspaces.access` + `user:read`, not the default `coder:all`.** Add `coder:workspaces.operate` if users should start and stop workspaces from the CLI. Without `user:read`, `/users/me` answers 404, so `coder login` and the VS Code Desktop Coder extension reject the token (validated by hand). With it, the token can SSH, port-forward and connect, but cannot mint tokens or create workspaces (section 10).
 
 ---
@@ -28,7 +29,7 @@
 6. [Reproduce the findings](#6-reproduce-the-findings)
 7. [What this changes in the other docs](#7-what-this-changes-in-the-other-docs)
 8. [The middle's skeleton: endpoints and sign-in](#8-the-middles-skeleton-endpoints-and-sign-in)
-9. [Future: an on-premises control plane (Kubernetes, NGINX, projected tokens)](#9-future-an-on-premises-control-plane-kubernetes-nginx-projected-tokens)
+9. [The bounce as a Go microservice (EKS now, OpenShift later)](#9-the-bounce-as-a-go-microservice-eks-now-openshift-later)
 10. [Tokens for the CLI and IDEs: which scopes](#10-tokens-for-the-cli-and-ides-which-scopes)
 
 ---
@@ -628,7 +629,7 @@ With the bounce for every app, the middle comes down to about 20 endpoints and *
 | Portal (browser JavaScript) | IdP access token, `Authorization: Bearer`. The portal does the OIDC login itself | `requireAuth`: signature against the IdP's JWKS, issuer, audience, email claim |
 | `/go/<slug>` link (no portal) | the middle runs OIDC code + PKCE, then hands off to the bounce | `/go/{slug}` → IdP → `/go/callback` |
 | CLI and IDEs | the middle runs OIDC code + PKCE (or the portal asks with its Bearer JWT), then returns the Coder URL and a scoped token (section 10). The CLI and IDEs then talk to Coder directly; the middle proxies nothing | `/cli-auth/*`, `/v1/cli-credentials` |
-| Bounce (Lambda) | signed `sts:GetCallerIdentity`, bound to this middle, the action and the code | `verifyBounceCaller`: IAM role allowlist per plane (on-premises: a projected service-account token, section 9) |
+| Bounce (Lambda, or the `bounce-server` microservice) | Lambda: signed `sts:GetCallerIdentity`, bound to this middle, the action and the code. Microservice: projected service-account token, audience = this middle (section 9) | `verifyBounceCaller`: IAM role allowlist per plane; `kind: k8s_sa` entries: issuer + service account, verified via OIDC discovery (section 9.4) |
 | Coder (called by the middle) | owner token per plane, server side only | the middle maps email → Coder user (created if missing) and keeps two keys per user and plane: `middle-<plane>` (full, never sent to the browser for apps) and `middle-app-<plane>` (app-only), and mints short-lived scoped tokens for the CLI and IDEs on request (section 10) |
 
 ```mermaid
@@ -655,7 +656,7 @@ flowchart LR
 | GitLab link | `GET`/`DELETE /v1/external-auth/{id}` | Bearer JWT |
 | Desktop and CLI (scoped tokens, section 10) | `POST /v1/workspaces/{id}/vscode-desktop`, `GET /v1/cli-credentials` | Bearer JWT |
 | Middle-driven sign-in | `GET /go/{slug}`, `GET /go/callback`; `/cli-auth`, `/cli-auth/start`, `/cli-auth/callback`, `POST /cli-auth/mint` | OIDC redirect + PKCE |
-| Called by the bounce only | `POST /internal/bounce/redeem`, `POST /internal/bounce/done` | caller proof (IAM today) |
+| Called by the bounce only | `POST /internal/bounce/redeem`, `POST /internal/bounce/done` | caller proof (`iam` or `sa_token`) |
 | Operations | `GET /healthz`, `GET /v1/config/public` | none |
 
 Put `/internal/*` on a separate listener or port that only the bounce can reach (security group, or a NetworkPolicy on Kubernetes), even though each call carries its own proof.
@@ -675,29 +676,66 @@ So: **one login** (the IdP), **one token check** in the middle, **one entry poin
 
 ---
 
-## 9. Future: an on-premises control plane (Kubernetes, NGINX, projected tokens)
+## 9. The bounce as a Go microservice (EKS now, OpenShift later)
 
-**Not implemented or tested; a design direction.** If a Coder control plane moves on-premises onto Kubernetes (Rancher/RKE2, OpenShift), the bounce keeps working with two substitutions. Nothing changes for the browser, the portal, the cookies or Coder.
+**Status (September 28, 2026).**
+- **Built and tested:** the bouncer, in `spike-middle/bounce-lambda`. It builds, its unit tests pass, the container image builds (`Dockerfile`, 19 MB, distroless, non-root), and it passed a container smoke test.
+- **Not yet run end to end** on a cluster.
+- **The middle's side (`kind: k8s_sa`) is a design** with tested sample code (9.4); it isn't wired in yet.
 
-| AWS today | On-premises |
-| --- | --- |
-| ALB rule `/_portal/*` on the plane host and the wildcard hosts | an ingress rule with the same two hostnames and path |
-| Bounce as a Lambda (ALB event) | the same Go handler as a small Deployment (plain HTTP) |
-| Caller proof: signed `sts:GetCallerIdentity` for the Lambda's IAM role | a **projected service-account token** for the bounce pod, with the middle as audience |
-| IAM role allowlist per plane | allowlist of (service-account issuer, namespace, service account) per plane |
+The organisation does not want a Lambda in the path. The bounce becomes a small Go service, a Deployment in the cluster that runs Coder. It proves who it is to the middle with a **projected service-account token** instead of IAM. It works the same way on EKS today and on OpenShift later; only what sits in front of it changes. Nothing changes for the browser, the portal, the cookies, Coder, or the middle's redeem logic. Wherever earlier sections say "the Lambda", read "the bounce".
+
+| | Lambda (sections 3–8) | Microservice on EKS | Microservice on OpenShift or on-premises |
+| --- | --- | --- | --- |
+| Front | ALB rule `/_portal/*` → Lambda target group | the same ALB (AWS Load Balancer Controller `Ingress`): `/_portal/*` → the bounce `Service`, target type `ip` | NGINX ingress, Gateway API `HTTPRoute` or OpenShift `Route`: `/_portal/*` → the bounce `Service` |
+| Runtime | Lambda (ALB event) | Deployment `bounce-server` (plain HTTP) | the same image |
+| Proof sent to the middle | signed `sts:GetCallerIdentity` | projected SA token, `aud` = the middle's `server_id` | the same |
+| The middle verifies with | STS replay + IAM role allowlist | the **EKS cluster's public OIDC discovery** → JWKS; checks `iss`, `aud`, `sub`, `exp`, pod binding | the cluster's issuer: discovery if the middle can reach it, else a published JWKS (`discovery_url`) |
+| Allowlist per plane | account + role name | issuer + service account (`system:serviceaccount:<ns>:<name>`) | the same |
 
 ```mermaid
 flowchart LR
-  B[Browser] --> I[Ingress / Gateway<br/>coder.example.com, *.apps.coder.example.com]
-  I -->|/_portal/*| BP[bounce Deployment<br/>projected SA token]
+  B[Browser] --> I[ALB on EKS / NGINX or router on OpenShift<br/>coder.example.com, *.apps.coder.example.com]
+  I -->|/_portal/*| BP[bounce-server Deployment<br/>projected SA token]
   I -->|everything else| CD[coderd Service]
   BP -->|redeem + SA token| M[Middle]
-  M -->|verify via cluster JWKS| M
+  M -.->|OIDC discovery + JWKS, cached| OIDC[Cluster issuer<br/>oidc.eks.region.amazonaws.com/id/...]
 ```
 
-### 9.1 Ingress
+### 9.1 The front: one rule for two hostnames
 
-The rule is the same as on the ALB: on `coder.example.com` and `*.apps.coder.example.com`, path prefix `/_portal/` goes to the bounce Service, everything else to coderd, with the `Host` header preserved (the default for ingress controllers; the bounce and the middle's host check depend on it).
+The rule is the same everywhere. On `coder.example.com` and `*.apps.coder.example.com`, path prefix `/_portal` goes to the bounce `Service` and everything else goes to coderd. The `Host` header must be preserved, which is the default for the ALB, NGINX and the OpenShift router: the bounce and the middle's host check depend on it.
+
+**EKS (AWS Load Balancer Controller).** Join the ALB that already serves Coder with `group.name`, and give the bounce rules a lower `group.order` so they are evaluated before Coder's catch-all rule.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coder-bounce
+  namespace: coder
+  annotations:
+    alb.ingress.kubernetes.io/group.name: coder            # the same ALB as Coder's Ingress
+    alb.ingress.kubernetes.io/group.order: "-10"           # before Coder's "/" rule
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+spec:
+  ingressClassName: alb
+  rules:
+    - host: coder.example.com
+      http: &bounce
+        paths:
+          - path: /_portal
+            pathType: Prefix
+            backend: { service: { name: bounce, port: { number: 8080 } } }
+    - host: "*.apps.coder.example.com"
+      http: *bounce
+```
+
+If the ALB is managed outside Kubernetes (Terraform), keep today's listener rules and point them at a target group of type `ip` that a `TargetGroupBinding` fills with the bounce pods.
+
+**OpenShift or on-premises (NGINX).** One `Ingress` for both Coder and the bounce:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -714,7 +752,7 @@ spec:
     - host: coder.example.com
       http: &paths
         paths:
-          - path: /_portal/
+          - path: /_portal
             pathType: Prefix
             backend: { service: { name: bounce, port: { number: 8080 } } }
           - path: /
@@ -729,95 +767,342 @@ Notes on the controller:
 - **Which NGINX.** The community `ingress-nginx` controller was announced for retirement (end of maintenance March 2026). Use a maintained controller: F5's NGINX Ingress Controller, or a Gateway API implementation (NGINX Gateway Fabric, Envoy Gateway). With Gateway API the same thing is one `HTTPRoute` with both `hostnames` and a `/_portal/` path match; it is the more portable choice between Rancher and OpenShift.
 - **OpenShift.** Its default router is HAProxy, not NGINX. Wildcard hosts need `routeAdmission.wildcardPolicy: WildcardsAllowed` on the IngressController and `wildcardPolicy: Subdomain` on the Route; check that a path-based route on a wildcard host behaves as expected on your router version. Alternatively run an NGINX or Gateway API controller next to it for the Coder hostnames.
 - **Websockets** go through unchanged (Coder apps, terminals); make sure proxy read timeouts are long enough (e.g. an hour) for idle editor connections.
-- The ALB's multi-value header quirk (3.9) does not exist here; the bounce gets normal HTTP headers.
+- The ALB's multi-value header quirk (3.9) only affects Lambda targets. The microservice gets normal HTTP headers, on EKS as well.
 
-### 9.2 The bounce as a Deployment
+### 9.2 The Deployment and its projected token
 
-The handler in `bounce-lambda/bounce` is already transport-independent apart from the ALB event types, and `cmd/alb-emulator` shows the plain-HTTP wrapping. An on-premises build is that wrapper without the proxy part: a `cmd/bounce-server` that serves `/_portal/bounce` and `/_portal/done`. The one real change is the caller proof, behind a small interface:
-
-```go
-// Prover produces the caller proof sent with /internal/bounce/redeem and /done.
-type Prover interface {
-	Proof(ctx context.Context, action, value string) (map[string]any, error)
-}
-// stsProver:     today's signed sts:GetCallerIdentity (Lambda, IAM role)
-// k8sSATokenProver: reads the projected token file on each call (kubelet rotates it)
-```
-
-The pod mounts a token issued for the middle only:
+The pod mounts one token, issued for the middle only, and no Kubernetes API token:
 
 ```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: bounce, namespace: coder }
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bounce, namespace: coder }
 spec:
-  serviceAccountName: bounce
-  automountServiceAccountToken: false     # no API-server token; only the one below
-  containers:
-    - name: bounce
-      image: registry.example.com/coder/bounce:1
-      env:
-        - { name: MIDDLE_URL, value: "https://middle.example.com" }
-        - { name: MIDDLE_TOKEN_FILE, value: /var/run/secrets/middle/token }
-      volumeMounts:
-        - { name: middle-token, mountPath: /var/run/secrets/middle, readOnly: true }
-  volumes:
-    - name: middle-token
-      projected:
-        sources:
-          - serviceAccountToken:
-              audience: middle-onprem      # = the middle's bounce.server_id
-              expirationSeconds: 600
-              path: token
+  replicas: 2
+  selector: { matchLabels: { app: bounce } }
+  template:
+    metadata: { labels: { app: bounce } }
+    spec:
+      serviceAccountName: bounce
+      automountServiceAccountToken: false           # no API-server token; only the one below
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: bounce
+          image: registry.example.com/coder/bounce:1   # docker build spike-middle/bounce-lambda
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: MIDDLE_URL, value: "https://middle.example.com" }
+            - { name: BOUNCE_PROOF, value: sa-token }
+            - { name: SA_TOKEN_FILE, value: /var/run/secrets/middle/token }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 64Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: middle-token, mountPath: /var/run/secrets/middle, readOnly: true }
+      volumes:
+        - name: middle-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: middle-prod           # = the middle's bounce.server_id
+                  expirationSeconds: 600
+                  path: token
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bounce, namespace: coder }
+spec:
+  selector: { app: bounce }
+  ports: [{ port: 8080, targetPort: 8080 }]
 ```
 
-The token is a JWT signed by the cluster: `iss` = the cluster's service-account issuer, `aud` = `middle-onprem`, `sub` = `system:serviceaccount:coder:bounce`, bound to the pod, valid 10 minutes, and rotated by the kubelet before it expires. The bounce has no long-lived secret at all, as with the Lambda role.
+The token is a JWT signed by the cluster:
+- `iss`: the cluster's issuer. On EKS that's `https://oidc.eks.<region>.amazonaws.com/id/<id>`.
+- `aud`: `middle-prod`.
+- `sub`: `system:serviceaccount:coder:bounce`.
+- It is bound to the pod (claim `kubernetes.io.pod`), valid for 10 minutes, and rotated by the kubelet before it expires.
 
-### 9.3 The middle: a second kind of caller
+As with the Lambda role, the bounce holds no long-lived secret.
 
-`verifyBounceCaller` gets a second verifier, chosen per allowlist entry:
+### 9.3 Go: the bouncer
+
+The code lives in `spike-middle/bounce-lambda` (module `bouncelambda`). The core has no transport and no AWS dependency, and each way of running it is a thin adapter:
+
+| File | Role |
+| --- | --- |
+| `bounce/handler.go` | the core: `Serve(Request) Response`; redeem at the middle, cookie rules (`safeCookieName`, `safeCookieDomain`, `safeCookiePath`), `/done` |
+| `bounce/http.go` | `ServeHTTP`: the microservice adapter (form POST, `Host`, joined `Cookie` headers) |
+| `bounce/satoken.go` | `SATokenProver`: reads the projected token on every call |
+| `bounce/iamproof/` | the signed `sts:GetCallerIdentity` proof (Lambda, or the microservice with IRSA or Pod Identity) |
+| `bounce/alb/` | the ALB → Lambda adapter (kept for existing planes) |
+| `cmd/bounce-server/` | the microservice's `main` |
+| `Dockerfile` | the multi-stage build to `distroless/static:nonroot` |
+
+The heart of it, shortened from the files above:
+
+```go
+package bounce
+
+// Prover returns the JSON field and value the middle checks before it trusts this caller.
+type Prover interface {
+	Proof(ctx context.Context, action, value string) (field string, proof any, err error)
+}
+
+// SATokenProver sends the pod's projected service-account token (audience = middle server_id).
+// The kubelet rotates the file, so it is read on every call.
+type SATokenProver struct{ Path string }
+
+func (p SATokenProver) Proof(context.Context, string, string) (string, any, error) {
+	raw, err := os.ReadFile(p.Path)
+	if err != nil {
+		return "", nil, err
+	}
+	return "sa_token", strings.TrimSpace(string(raw)), nil
+}
+
+type Handler struct {
+	MiddleURL    string
+	CookieSecure bool
+	Prover       Prover
+	HTTP         *http.Client
+}
+
+// ServeHTTP: the ingress routes /_portal/* on the plane host and the wildcard app hosts here.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	req := Request{Method: r.Method, Path: r.URL.Path, Host: r.Host,
+		Cookie: strings.Join(r.Header.Values("Cookie"), "; ")}
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		if r.ParseForm() == nil {
+			req.Code = r.PostForm.Get("code")
+		}
+	}
+	res := h.Serve(r.Context(), req) // "/done" → done(), otherwise bounce()
+	for k, v := range res.Headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(res.Status)
+	io.WriteString(w, res.Body)
+}
+
+func (h *Handler) bounce(ctx context.Context, req Request) Response {
+	field, proof, err := h.Prover.Proof(ctx, "redeem", req.Code)
+	if err != nil {
+		return page(http.StatusInternalServerError, "Bounce misconfigured.")
+	}
+	body, _ := json.Marshal(map[string]any{"code": req.Code, "host": req.Host, field: proof})
+	res, err := h.HTTP.Post(h.MiddleURL+"/internal/bounce/redeem", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return page(http.StatusBadGateway, "Middle unreachable, retry from the portal.")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return page(http.StatusForbidden, "This link expired or was already used. Retry from the portal.")
+	}
+	var out struct {
+		SessionToken string `json:"session_token"`
+		RedirectPath string `json:"redirect_path"`
+		CookieName   string `json:"cookie_name"`
+		CookieDomain string `json:"cookie_domain"`
+		CookiePath   string `json:"cookie_path"`
+		MaxAge       int    `json:"max_age"`
+	}
+	// ... decode; redirect must be a same-origin path; then the three cookie checks:
+	//     name  ∈ {coder_session_token, coder_subdomain_app_session_token_<32 hex>}
+	//     domain only for the subdomain cookie, and only a strict parent of req.Host
+	//     path   must cover the redirect
+	cookie := (&http.Cookie{Name: name, Value: out.SessionToken, Domain: domain, Path: path,
+		MaxAge: out.MaxAge, HttpOnly: true, Secure: h.CookieSecure, SameSite: http.SameSiteLaxMode}).String()
+	return Response{Status: http.StatusFound, Headers: map[string]string{
+		"Location": out.RedirectPath, "Set-Cookie": cookie,
+		"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}}
+}
+```
+
+And the service (`cmd/bounce-server/main.go`, shortened):
+
+```go
+func main() {
+	prover := bounce.SATokenProver{Path: env("SA_TOKEN_FILE", "/var/run/secrets/middle/token")}
+	if _, _, err := prover.Proof(context.Background(), "", ""); err != nil {
+		log.Fatalf("bounce-server: %v", err) // fail fast without a token
+	}
+	h, err := bounce.FromEnv(prover) // MIDDLE_URL, COOKIE_SECURE
+	if err != nil {
+		log.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	mux.Handle("POST /_portal/bounce", h)
+	mux.Handle("GET /_portal/done", h)
+	srv := &http.Server{Addr: ":8080", Handler: accessLog(mux), // method, path, host, status; no query, body or cookies
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second,
+		MaxHeaderBytes: 32 << 10}
+	// SIGTERM → srv.Shutdown (graceful, for rolling updates)
+	log.Fatal(srv.ListenAndServe())
+}
+```
+
+Checked so far: the unit tests (the cookie rules, plus a form POST through `ServeHTTP` against a fake middle that checks the `sa_token` sent and the cookie returned), and a container smoke test. `/healthz` returns 200, a missing code 400, other paths 404, an unreachable middle 502. Without its token file the service refuses to start. The logs contain no code and no cookie.
+
+### 9.4 Go: the middle verifies the token
+
+The allowlist gets a second kind of caller, chosen per entry:
 
 ```yaml
 bounce:
-  server_id: middle-onprem
+  server_id: middle-prod                   # = the projected token's audience
   callers:
-    - plane: a                       # AWS plane, as today
-      kind: aws_iam
+    - plane: a                             # a plane still on the Lambda
+      kind: aws_iam                        # (default)
       account_id: "209561498705"
       role_name: coder-bounce-plane-a
-    - plane: onprem
+    - plane: b                             # a plane on EKS with bounce-server
       kind: k8s_sa
-      issuer: https://oidc.rke2.example.com          # the cluster's --service-account-issuer
-      jwks_url: https://oidc.rke2.example.com/openid/v1/jwks
+      issuer: https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE
       subject: system:serviceaccount:coder:bounce
+      # discovery_url: optional, default <issuer>/.well-known/openid-configuration
 ```
 
-Two ways to verify the token:
+**On EKS** the issuer is `aws eks describe-cluster --name <cluster> --query cluster.identity.oidc.issuer`. Its discovery document and JWKS are public, so the middle only needs outbound HTTPS to fetch them. It does not need an IAM OIDC provider (that is for IRSA), AWS credentials, or access to the cluster's API.
 
-| | Offline (JWKS) | TokenReview |
+**On OpenShift or on-premises**, the API server serves the same two documents (`/.well-known/openid-configuration`, `/openid/v1/jwks`). The middle either reaches them, which means allowing unauthenticated discovery (`system:service-account-issuer-discovery`) and trusting the cluster CA, or you publish them somewhere it can reach and set `discovery_url`.
+
+The redeem and done handlers accept `sa_token` next to `iam`. The verifier (compiled and tested: it accepts a valid token and rejects a wrong audience, wrong issuer, another service account, an expired token, one not bound to a pod, a long-lived one, and one with no `exp`):
+
+```go
+// saVerifier checks projected service-account tokens from one cluster issuer.
+type saVerifier struct {
+	issuer   string
+	audience string // the middle's bounce.server_id
+	kf       keyfunc.Keyfunc
+}
+
+// newSAVerifier follows the issuer's OIDC discovery document to its JWKS. keyfunc caches the
+// keys and refetches them when a token arrives with an unknown kid (key rotation).
+func newSAVerifier(ctx context.Context, issuer, discoveryURL, audience string) (*saVerifier, error) {
+	if discoveryURL == "" {
+		discoveryURL = strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("oidc discovery: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("oidc discovery: %s", res.Status)
+	}
+	var doc struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("oidc discovery: %w", err)
+	}
+	if doc.Issuer != issuer {
+		return nil, fmt.Errorf("oidc discovery: issuer %q, want %q", doc.Issuer, issuer)
+	}
+	if !strings.HasPrefix(doc.JWKSURI, "https://") {
+		return nil, fmt.Errorf("oidc discovery: jwks_uri %q is not https", doc.JWKSURI)
+	}
+	kf, err := keyfunc.NewDefaultCtx(context.Background(), []string{doc.JWKSURI})
+	if err != nil {
+		return nil, fmt.Errorf("jwks: %w", err)
+	}
+	return &saVerifier{issuer: issuer, audience: audience, kf: kf}, nil
+}
+
+type saClaims struct {
+	jwt.RegisteredClaims
+	K8s struct {
+		Namespace string `json:"namespace"`
+		Pod       *struct {
+			Name string `json:"name"`
+			UID  string `json:"uid"`
+		} `json:"pod"`
+		ServiceAccount struct {
+			Name string `json:"name"`
+			UID  string `json:"uid"`
+		} `json:"serviceaccount"`
+	} `json:"kubernetes.io"`
+}
+
+const maxSATokenLifetime = time.Hour
+
+// verify checks signature, iss, aud (= server_id), exp/iat, the service account, that the token
+// is bound to a pod, and that it is short-lived.
+func (v *saVerifier) verify(raw, subject string) (*saClaims, error) {
+	var c saClaims
+	_, err := jwt.ParseWithClaims(raw, &c, v.kf.Keyfunc,
+		jwt.WithValidMethods([]string{"RS256", "ES256"}),
+		jwt.WithIssuer(v.issuer),
+		jwt.WithAudience(v.audience),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(30*time.Second),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if c.Subject != subject {
+		return nil, fmt.Errorf("subject %q not allowed", c.Subject)
+	}
+	if c.K8s.Pod == nil {
+		return nil, errors.New("token is not bound to a pod")
+	}
+	if c.IssuedAt == nil || c.ExpiresAt.Sub(c.IssuedAt.Time) > maxSATokenLifetime {
+		return nil, errors.New("token lifetime too long")
+	}
+	return &c, nil
+}
+```
+
+Wiring it into the handlers:
+- Build one `saVerifier` per `k8s_sa` entry, lazily, and keep it (keyfunc refreshes the keys).
+- In `handleBounceRedeem` and `handleBounceDone`, decode ``SAToken string `json:"sa_token"` ``. If it is set, read `iss` without verifying it (`jwt.NewParser().ParseUnverified`) to pick the entries with that issuer, and call `verify` with each entry's `subject`. The first match gives the plane.
+- Otherwise fall back to today's IAM check, which only looks at `aws_iam` entries.
+- Everything after that is unchanged: consuming the code, the plane match, the host binding.
+
+Two ways to verify the token; the sample above is the offline one:
+
+| | Offline (OIDC discovery + JWKS) | TokenReview |
 | --- | --- | --- |
 | How | check the signature against the cluster's published JWKS, then `iss`, `aud` = `server_id`, `exp`, `sub` | the middle asks the cluster's API server (`POST /apis/authentication.k8s.io/v1/tokenreviews`, needs `system:auth-delegator`) |
 | Middle needs | the issuer's JWKS (reachable, or copied into config) | network access and credentials to every cluster's API server |
 | Catches a deleted pod | no (only the 10-minute expiry) | yes (bound tokens die with the pod) |
 | Fits | a middle outside the cluster, several clusters | a middle inside the same cluster |
 
-**Recommendation: offline JWKS verification.** It works whether the middle stays in AWS or moves next to the plane, and it handles several clusters without giving the middle API access to any of them. The short expiry covers the deleted-pod case well enough.
+**Recommendation: offline verification through OIDC discovery.** On EKS it needs nothing but outbound HTTPS from the middle, whereas TokenReview would need an IAM identity and an EKS access entry per cluster. It works the same way for OpenShift, whether the middle stays in AWS or moves next to the plane, and it handles several clusters without giving the middle API access to any of them. The short expiry covers the deleted-pod case well enough.
 
-### 9.4 What changes in the security model
+### 9.5 What changes in the security model
 
 - **The proof is a bearer token, not a per-request signature.** The STS proof is bound to one action and one code (`sha256(action + "\n" + code)` is signed), so a stolen proof cannot redeem another code. A projected token is valid for any redeem during its 10 minutes. Someone who steals it still needs a live one-time code, and codes only travel in the user's own browser POST and are bound to that user and host. Close the remaining gap with transport controls:
-  - TLS from the bounce to the middle (the token must never cross the network in clear);
-  - a NetworkPolicy so only bounce pods reach the middle's `/internal/*` listener;
-  - optionally mTLS (service mesh, or cert-manager certificates) between bounce and middle, which binds the call to the pod's certificate as well.
-- **Everything else stays**: one-time codes bound to user, plane and hostname; the Lambda's (now the Deployment's) cookie rules; the app-only key; the middle computing every redirect.
+  - TLS from the bounce to the middle, so the token never crosses the network in clear;
+  - only the bounce reaches the middle's `/internal/*` listener: a NetworkPolicy if the middle runs in the same cluster, otherwise a security group or firewall that admits only the cluster's egress, plus a NetworkPolicy that limits the bounce's own egress to the middle;
+  - optionally mTLS between bounce and middle (a service mesh, or cert-manager certificates), which also binds the call to the pod's certificate.
+- **Who can obtain a token for `coder/bounce`.** Anyone who can create pods, or `serviceaccounts/token`, in the bounce's namespace can get a token that the middle accepts. Restrict both with RBAC in that namespace. The pod-binding check rejects tokens from a plain `kubectl create token` (no bound pod), but not tokens bound to an existing pod.
+- **Everything else stays**: one-time codes bound to user, plane and hostname; the bounce's cookie rules; the app-only key; the middle computing every redirect.
 
-### 9.5 What it would take
+### 9.6 Status and what is left
 
-| Piece | Work |
+| Piece | State |
 | --- | --- |
-| `bounce` package | split the ALB event handling from the core (redeem → cookie + redirect); add `cmd/bounce-server` and the `Prover` interface with an SA-token implementation |
-| Middle | `kind: k8s_sa` callers: JWKS fetch and cache, JWT checks, allowlist by issuer and subject |
-| Manifests | bounce Deployment, Service, ServiceAccount, NetworkPolicy; the ingress or `HTTPRoute`; wildcard certificate |
-| Lab | a local kind or k3d cluster with an NGINX (or Gateway API) controller in front of the existing local Coder: same `test-subdomain-bounce.sh`, with the IAM proof replaced |
+| Bouncer: core, `ServeHTTP`, `SATokenProver`, `cmd/bounce-server`, `Dockerfile` | **done**: unit tests, image, container smoke test (9.3) |
+| Lambda path (`bounce/alb`, `bounce/iamproof`, `cmd/lambda`, `cmd/alb-emulator`) | refactored onto the same core; builds, same behaviour. Not re-run against AWS since the refactor |
+| Middle: `kind: k8s_sa` callers | sample code tested (9.4); to wire in (config, redeem and done handlers, config validation) |
+| Manifests | samples in 9.1 and 9.2; add a NetworkPolicy and a PodDisruptionBudget |
+| End-to-end on EKS | deploy `bounce-server` next to Coder, point the ALB's `/_portal/*` rules at it, run `test-subdomain-bounce.sh`-style checks and a browser test |
+| OpenShift front | router or NGINX with the wildcard rule; how the middle reaches the issuer's discovery document |
 
-The AWS path does not change, and both kinds of plane can be served by one middle at the same time (one allowlist entry per plane).
+The Lambda path does not change, and one middle can serve both kinds of plane at the same time (one allowlist entry per plane).
 
 ---
 
