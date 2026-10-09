@@ -1,0 +1,456 @@
+# ADR-042: Tactical Dynamic Active Directory Account Broker for Ephemeral Pipeline Workloads
+
+| Field | Value |
+| --- | --- |
+| **Status** | Proposed |
+| **Date** | October 9, 2026 |
+| **Target Audience** | IAM Engineering, Directory Services (AD) Team, Information Security / SOC, Enterprise Architecture |
+| **Owners** | Platform Engineering |
+| **Acceptance gates** | AD team signs ACE design + group-onboarding process; IAM signs allowlist + UAR scope shift; Security signs threat model |
+
+---
+
+## 1. Context & Problem Statement
+
+### 1.1. What users experience
+
+Engineers develop jobs locally using their **interactive AD user accounts** and the AD group memberships those accounts already hold. Locally, access works.
+
+When the same job is moved to automation (CI/CD runners, scheduled workers, container workloads), it can no longer run as a person. Corporate policy requires a **system (non-human) account**, and that account’s credentials must live in an **approved safe**—HashiCorp Vault or CyberArk.
+
+### 1.2. Why self-service stops
+
+Both Vault and CyberArk operational models in our enterprise assume an **application-linked** ownership chain: a registered application, an approved safe, CI/operational processes tied to that application, and clear account stewardship.
+
+Many of these workloads are **platform-adjacent or pre-application**: prototypes, internal data workflows, shared pipeline patterns, or teams that do not yet (and may never) own a formal application identity in the IAM/PAM inventory. They therefore:
+
+* Cannot open or operate their own approved safe under current mandates.
+* Cannot provision compliant system accounts into a safe they own.
+* Still need the same AD group entitlements their interactive user had locally.
+
+**Non-issue:** Password lifecycle for accounts already in an approved safe is solved. Corporate safes rotate on a **90-day** cadence (or lower if configured). Rotation mechanics are not why this ADR exists.
+
+### 1.3. The real burden today (Platform as human broker)
+
+Platform Engineering has absorbed the gap:
+
+1. **Create** static AD system accounts on behalf of requesting teams.
+2. **Enroll** those accounts in the **platform-owned** approved safe (because the requester has no application-linked safe).
+3. **Map** each account into the **relevant AD groups** the workload needs.
+4. **Own** the standing relationship—who asked, which job still needs it, group membership over time, and annual UAR/recertification when teams or pipelines drift or disappear.
+
+This is not a complaint about Vault/CyberArk rotation. It is **policy-compliant automation access without an application-owned safe**, currently delivered as manual platform brokerage (account farming + group mapping under the platform safe).
+
+### 1.4. Why that pattern does not scale
+
+| Pressure | Effect |
+| --- | --- |
+| No app-linked safe for the caller | Every request lands on Platform to create and hold the account |
+| Static account proliferation | One (or more) permanent system accounts per team/workflow under the platform safe |
+| AD group mapping brokerage | Platform grants and maintains group membership for workloads it does not run |
+| UAR / standing privilege | Annual reviews of system accounts whose real owning team is unclear or gone |
+| Permanent directory principals | Accounts persist for as long as someone remembers to keep them; access is not tied to a single job run |
+
+Enterprise Vault **dynamic LDAP** roles (or equivalent CyberArk just-in-time patterns) would address much of this, but are not enabled or not available to this class of caller today. Foundational platform requests that would unlock cleaner PAM paths also face long backlogs.
+
+### 1.5. What we need
+
+A **tactical, policy-aligned** way for authenticated automation identities to obtain **short-lived AD system principals** already placed in required groups—without Platform manually creating static accounts in the platform safe for every team—while preserving a path to native Vault (or CyberArk) dynamic issuance when those capabilities are available to these workloads.
+
+---
+
+## 2. Decision
+
+We will replace the **Platform-as-human-broker** pattern (static system accounts in the platform safe + manual AD group mapping) with a **request-scoped** Go microservice—the **AD Dynamic Account Broker**—compiled as a statically linked binary and packaged in a `scratch` container (non-root UID `10001`).
+
+The broker is the controlled issuance path for workloads that need AD group entitlements in automation but **do not own an application-linked Vault/CyberArk safe**. Account creation and group assignment run in the API path. **Cleanup (reaper) is scheduled separately from request handling**—preferred implementation is an **Airflow DAG** (platform-familiar ops path); alternatives are a Kubernetes CronJob or an in-process Go reaper under strict single-worker rules (§7).
+
+Policy alignment: the broker’s own bind credentials remain in an **approved platform safe**; ephemeral accounts are minted just-in-time, short-lived, and not enrolled as standing system accounts in that safe.
+
+The broker:
+
+* Authenticates and authorizes callers via cryptographic workload identity.
+* Vends **non-pooled** ephemeral AD accounts (one distinct account per successful request).
+* Applies a **default TTL of 4 hours**, requestable downward, with a **hard maximum of 24 hours** via `accountExpires`.
+* Creates accounts only in quarantine OU `OU=DynamicAccounts`.
+* Performs **atomic delta** group updates (`MODIFY_ADD` / `MODIFY_DELETE` only).
+* Does not cache or reuse credentials across requests.
+* Emits OpenTelemetry audit records and Prometheus metrics to **Observe (Snowflake)**.
+* Relies on a scheduled **reaper** (Airflow DAG preferred) to purge expired objects from the quarantine OU.
+
+### 2.1. Flow diagrams
+
+#### Problem flow (today)
+
+```mermaid
+flowchart TD
+  A[Engineer develops job locally] --> B[Uses interactive AD user + group memberships]
+  B --> C{Move job to automation / CI?}
+  C -->|Yes| D[Cannot run as a person]
+  D --> E[Policy: need system account in approved safe<br/>Vault or CyberArk]
+  E --> F{Caller has application-linked safe?}
+  F -->|No| G[Ticket to Platform Engineering]
+  G --> H[Platform creates static AD system account]
+  H --> I[Enroll account in platform-owned safe]
+  I --> J[Map account into required AD groups]
+  J --> K[Standing account: UAR + ownership on Platform]
+  F -->|Yes| L[Use app-owned Vault / CyberArk path<br/>out of scope for this broker]
+```
+
+#### Target flow (tactical broker)
+
+**Starts at the pipeline** (step 1). `MODIFY_ADD` is step 7 inside AD—not the entry point. Reaper is a separate scheduled flow below.
+
+```mermaid
+flowchart TD
+  Start([START: Pipeline / workload needs AD access]) --> W[1. Pipeline runner]
+  W -->|2. POST /v1/credentials<br/>mTLS or OIDC workload identity| B[3. AD Dynamic Account Broker]
+  B --> A1{4. Caller allowlisted<br/>and group allowed?}
+  A1 -->|No| R([END: 401 / 403])
+  A1 -->|Yes| V[5. Fetch svc-ad-broker bind creds<br/>from Vault / CSM]
+  V --> C1[6. LDAPS: Create dyn-svc-XXXXXXXX<br/>in OU=DynamicAccounts<br/>accountExpires = now + TTL]
+  C1 --> C2[7. LDAPS: MODIFY_ADD member<br/>pre-approved AD group]
+  C2 --> K[8. Derive keytab from password]
+  K --> RESP[9. HTTP 201:<br/>username, password,<br/>principal, keytab_base64]
+  RESP --> EndMint([END: Pipeline uses creds until TTL])
+  B -.->|OTel + Prometheus| O[Observe / Snowflake]
+
+  subgraph reaper [Separate flow: Reaper — does not start at the pipeline]
+    AF([START: Airflow schedule ~15m]) --> Cred[Fetch bind creds from Vault / CSM]
+    Cred --> Q[Search expired users in quarantine OU]
+    Q --> DEL[LDAP DelRequest]
+    DEL --> EndReap([END: expired objects removed])
+  end
+```
+
+#### Strategic cutover (when Vault dynamic LDAP is enabled)
+
+```mermaid
+flowchart LR
+  P[Pipeline] --> B[AD Broker<br/>tactical]
+  B --> AD[(Active Directory)]
+  P -.->|migrate| V[Vault /ldap/creds/:role<br/>strategic]
+  V -.-> AD
+```
+
+---
+
+## 3. Inbound Authentication & Authorization
+
+Anonymous requests are rejected. Callers must present verifiable workload identity (mTLS, SPIFFE SVID, or platform OIDC such as Kubernetes ServiceAccount tokens).
+
+```
+Client Identity (e.g. spiffe://corp.internal/ns/analytics/sa/etl-worker)
+                    │
+                    ▼
+            [ Broker AuthN ]
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+ [Caller allowlisted?]   [Group allowed for caller?]
+   NO ──► 401/403           NO ──► 403 Forbidden
+   YES ──► continue         YES ──► mint account
+```
+
+### 3.1. Request contract
+
+Callers may supply only:
+
+* `target_ad_group` — logical group alias (mapped server-side to a DN)
+* `ttl_seconds` (optional) — must be ≤ configured max (86400); default 14400 (4h)
+
+Callers **cannot** supply usernames, target OUs, passwords, or arbitrary LDAP attributes.
+
+### 3.2. Caller → group allowlist (standing privilege)
+
+Authorization is a **caller identity → allowed group aliases** matrix, versioned under `/internal/allowlist/*`.
+
+* Changes require joint approval (Platform Engineering + Security) via `CODEOWNERS` and signed commits.
+* Allowlist validation **denies Tier-0 / privileged groups** by name/DN pattern even if ACEs were misconfigured (defense in depth).
+* Emergency revoke paths (documented in runbooks):
+  1. Ship empty/deny-all allowlist
+  2. Disable `svc-ad-broker` bind account in AD
+  3. Remove Create User ACE on the quarantine OU (freeze minting)
+
+**UAR implication:** Pipeline static accounts leave annual review. The allowlist, bind-account ACEs, and caller→group mappings **remain in UAR / standing-privilege review**.
+
+### 3.3. AD group target onboarding (still required)
+
+The broker does **not** discover or invent AD groups at runtime. Target groups are a **static, pre-approved list**.
+
+Before any `target_ad_group` alias can be used in production:
+
+1. **Request** — Platform (with the consuming team) proposes the logical alias → group DN and which callers may request it.
+2. **Security / IAM review** — Confirm the group is appropriate for JIT automation (no Tier-0 / privileged groups).
+3. **Share the list with the AD team** — AD must grant `svc-ad-broker` **Write Members** ACE **only** on those specific group objects (and update ACEs when groups are added or removed).
+4. **Broker allowlist change** — Merge the alias into `/internal/allowlist/*` only after the ACE is in place (or coordinate so minting cannot succeed against a group without both controls).
+5. **Recertify** — The static group list and per-group ACEs remain standing privilege; revisit on UAR cadence or when a group is retired.
+
+| Control | Owner | Static? |
+| --- | --- | --- |
+| Logical alias → DN map + caller→group matrix | Platform + Security (CODEOWNERS) | Yes — code/config change |
+| Write Members ACE on each target group | **AD team** | Yes — directory ACL change |
+| Create/Delete User on quarantine OU | AD team (one-time / rare change) | Yes |
+
+**Implication:** Onboarding a *new* AD group for automation is still a deliberate ticketed process with AD. The broker removes per-pipeline **account** farming; it does not remove **group entitlement** onboarding.
+
+---
+
+## 4. Outbound AD Bind & Directory Guardrails
+
+### 4.1. Broker → AD authentication
+
+* No bind credentials on disk or in env vars.
+* Bind account `svc-ad-broker` credentials are fetched from Vault (AppRole or workload identity) and rotated by Vault on schedule.
+* Compromise of the bind account is treated as: **ability to mint identities into every allowlisted group** until revoke paths above are exercised.
+
+### 4.2. Group membership: delta-only
+
+LDAP group wiping occurs when a client issues `MODIFY_REPLACE` on multi-valued `member`.
+
+* Broker code constructs Modify requests using **only** `Add("member", …)` and `Delete("member", …)`.
+* `Replace` on `member` is barred by CI lint / static analysis.
+
+### 4.3. Active Directory ACEs (least privilege)
+
+| Scope | Rights |
+| --- | --- |
+| `OU=DynamicAccounts,OU=AppServices,DC=corp,DC=example,DC=com` | Create/Delete User objects only |
+| Explicit pre-approved security groups (static onboarded list — §3.3) | Write Members (`BF9679C0-0DE6-11D0-A285-00AA003049E2`) only |
+| Domain root, parent OUs, Tier-0 / AdminSDHolder | **No** rights |
+
+ACEs are **not** managed by the broker. Any expansion of the target group list requires an AD change request so Write Members can be applied (or removed) on the new objects. Broker allowlist and AD ACEs must stay in lockstep.
+
+---
+
+## 5. Lifecycle, TTL & Credential Handling
+
+| Property | Policy |
+| --- | --- |
+| Pooling | **None.** Every successful request creates `dyn-svc-[a-z0-9]{8}` (retry on collision). |
+| “Single-use” | **Not claimed.** Accounts are non-pooled; the password remains valid for Kerberos/NTLM until `accountExpires` (and residual tickets may last until ticket end—see §8). |
+| Default TTL | **4 hours** |
+| Max TTL | **24 hours** (hard cap) |
+| Password generation | `crypto/rand`, ≥32 chars, mixed classes; UTF-16LE quoted for `unicodePwd` over LDAPS |
+| Keytab | Built in-process from the same password + principal (`{sAMAccountName}@{REALM}`); returned as **standard binary keytab, Base64-encoded** in JSON (`keytab_base64`). Prefer AES enctypes (e.g. `aes256-cts-hmac-sha1-96`); include RC4 only if domain policy still requires it. |
+| Persistence | Password and keytab material exist in process memory only until the HTTP 201 body is written. **Never** written to DB, cache, KV, logs, traces, or metric labels. |
+| Response shape | Always returns `username` + `password` (Vault `/ldap/creds`–shaped) **plus** `keytab_base64` and `principal` for Kerberos clients. Keytab is an extension beyond stock Vault LDAP responses—clients that only need password may ignore it. |
+
+Example `201` body:
+
+```json
+{
+  "username": "dyn-svc-7e2a1b9c",
+  "password": "…",
+  "principal": "dyn-svc-7e2a1b9c@CORP.EXAMPLE.COM",
+  "keytab_base64": "BQIAAAB…",
+  "lease_duration": 14400,
+  "account_expires_utc": "2026-10-09T15:13:00Z"
+}
+```
+
+Clients decode once to a file mode `0600` (e.g. `kinit -kt` / Spark `--keytab`). Treat `keytab_base64` as **equivalent secret material to the password** (same keys).
+
+Optional hardening (preferred where the platform supports it): **response wrapping** or a one-shot retrieval token so the long-lived pipeline log stream never holds the raw password or keytab.
+
+---
+
+## 6. Create Saga, Retries & Multi-Replica Behavior
+
+### 6.1. Create saga (compensating actions)
+
+Order of operations for `POST /v1/credentials`:
+
+1. AuthN / AuthZ (caller + group + TTL clamp)
+2. Generate `sAMAccountName` + password
+3. LDAP **Add** user in quarantine OU with `accountExpires`
+4. LDAP **MODIFY_ADD** member on target group
+5. Derive Kerberos keytab from password + principal; Base64-encode
+6. Return `201` with `username`, `password`, `principal`, `keytab_base64`, TTL metadata
+
+| Failure point | Compensation |
+| --- | --- |
+| Step 3 fails (incl. name collision) | Retry with new name (bounded); no orphan |
+| Step 4 fails after step 3 | **Best-effort `DelRequest`** on the new user DN; if delete fails, object remains until reaper (expired or prematurely expired by setting `accountExpires=now`) |
+| Step 5 fails (keytab derivation) | Same as step 4 failure—delete or force-expire the user; do not return a partial password-only success unless explicitly configured |
+| Step 6 fails (client disconnect / timeout after AD success) | Account exists; client retry mints a **new** account (non-idempotent by design). Prior account lives until TTL + reaper. Quotas (§7) bound blast radius. |
+
+Clients should treat the API as **non-idempotent**: retry only with backoff and expect a fresh account each success.
+
+### 6.2. Multi-replica API
+
+* API pods are horizontally scalable and hold **no shared create state**.
+* LDAP connection pooling is per-process; bind credentials refreshed from Vault on a schedule / on auth failure.
+* Rolling deploys may interrupt in-flight creates; saga compensation applies.
+* Sweep deletes run in **exactly one** scheduled reaper path at a time (Airflow task, CronJob, or elected goroutine)—not on every API replica.
+
+---
+
+## 7. Reaper (Cleanup of Expired Dynamic Accounts)
+
+### 7.1. Job semantics (same regardless of runner)
+
+1. **Schedule:** every 15 minutes (tunable).
+2. **Bind credentials:** retrieve `svc-ad-broker` (or a delete-scoped bind identity, if later split) from the **approved Vault / CSM safe**—same policy path as other platform system accounts. No password in DAG code, env literals, or Airflow Variables plaintext.
+3. **Scope:** quarantine OU only:
+   ```
+   (&(objectClass=user)(accountExpires<=<CurrentWindowsFileTime>)(accountExpires>=1))
+   ```
+4. **Delete:** LDAP `DelRequest` on user DN. AD referential integrity removes `member` / `memberOf` links; no manual group cleanup.
+5. **Emit** reap audit events + metrics (`ad_broker_accounts_reaped_total`, active-accounts gauge).
+
+### 7.2. Runner options
+
+| Option | When to use | Notes |
+| --- | --- | --- |
+| **A. Airflow DAG (preferred)** | Default for this platform—team already operates Airflow | DAG task: Vault/CSM → LDAPS search → delete. Retries, alerting, and run history come for free. Use a single DAG schedule (avoid duplicate DAG runs overlapping deletes; Airflow `max_active_runs=1` + task concurrency 1). |
+| **B. Kubernetes CronJob** | If Airflow is unavailable for this path | Same Go binary with `-mode=reaper` (or a tiny sibling binary). One CronJob; no multi-replica sweep. |
+| **C. Go goroutine inside the broker** | Acceptable for early MVP or single-replica deploys | Run only with **one active reaper**: either run API at `replicas: 1`, or use leader election / a `REAPER_ENABLED=true` on a single pod. **Do not** enable the goroutine on every replica—racing `DelRequest`s and duplicate metrics follow. |
+
+**Decision bias:** choose **Airflow** for production ops familiarity and visibility; keep the LDAP delete logic small and identical (shared library or `reaper` mode of the Go binary invoked from Airflow’s KubernetesPodOperator / similar) so the DAG is orchestration, not a second AD client reimplemented in Python—unless the team explicitly prefers a thin Python LDAP client with the same query/delete contract.
+
+### 7.3. Non-negotiables
+
+* Exactly **one** active sweeper schedule.
+* Bind secret **only** from Vault/CSM.
+* Deletes confined to `OU=DynamicAccounts`.
+* Failure of the reaper must page/alert before quarantine bloat breaches the active-accounts SLO (§11).
+
+---
+
+## 8. Security Posture & Threat Model
+
+### 8.1. Hardening summary
+
+| Control | Mechanism |
+| --- | --- |
+| Container surface | Static Go binary on `scratch`, UID `10001`; no shell or package manager. **Mounted CA bundle + reliable time source** required for TLS verify and `accountExpires`. |
+| Source integrity | Protected branches; `CODEOWNERS` on allowlist; signed commits |
+| Directory containment | Creates limited to quarantine OU |
+| Group integrity | `MODIFY_ADD`/`DELETE` only; CI bans `Replace` on `member` |
+| Transport | TLS 1.3 to clients; LDAPS (TLS 1.2+, 636) with internal root CA verify to DCs |
+| Abuse controls | Per-identity **rate limits and concurrency quotas**; global create circuit breaker on AD error rate |
+
+### 8.2. Threat model (summary)
+
+| Compromise | Blast radius | Primary detection / response |
+| --- | --- | --- |
+| Pipeline secret (returned password **or** keytab) | That principal + its groups until TTL / ticket end; keytab ≡ password for Kerberos | Short TTL; audit join of caller→account; revoke via disable/delete user; never log `keytab_base64` |
+| Broker process / code exec | Mint into all allowlisted groups while bind cred works | Scratch + non-root; spike alerts on `creations_total`; emergency revoke paths |
+| Bind credential (`svc-ad-broker`) | Same as broker compromise within ACE scope | Vault rotation; disable bind account; strip OU Create ACE |
+| Malicious allowlist PR | Expands who can get which groups | Dual approval; Tier-0 deny list; ACE still limits Write Members |
+
+### 8.3. Residual authentication after expiry
+
+`accountExpires` prevents **new** authentications after the stamp. **Existing Kerberos tickets may remain valid until their own end time.** Expectation for consumers: treat residual ticket lifetime as part of the exposure window; prefer shorter TTLs. If AD policy allows, constrain max ticket lifetime for these principals.
+
+---
+
+## 9. Observability & Audit (Observe / Snowflake)
+
+All mint and reap operations emit structured OTel signals (and Prometheus metrics) into Observe / Snowflake for SOC and internal audit.
+
+**Golden signals (ADR-required):**
+
+* `ad_broker_account_creations_total{status, target_group}`
+* `ad_broker_accounts_reaped_total`
+* `ad_broker_active_accounts_gauge`
+* `ad_broker_auth_rejections_total{reason}`
+* `ad_broker_operation_duration_seconds{operation}` (create | bind | modify | delete)
+
+Additional metrics belong in the runbook, not this ADR.
+
+### 9.1. Audit event (immutable record of who got what)
+
+Passwords and keytab material **must never** appear in this payload or in trace attributes.
+
+```json
+{
+  "timestamp": "2026-10-09T11:13:00Z",
+  "event_type": "DYNAMIC_ACCOUNT_CREATED",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "caller": {
+    "identity": "spiffe://corp.internal/ns/data-platform/sa/spark-runner",
+    "ip_address": "10.240.12.84"
+  },
+  "directory_record": {
+    "sam_account_name": "dyn-svc-7e2a1b9c",
+    "distinguished_name": "CN=dyn-svc-7e2a1b9c,OU=DynamicAccounts,OU=AppServices,DC=corp,DC=example,DC=com",
+    "assigned_group": "CN=DataLake-ReadAccess,OU=AppGroups,DC=corp,DC=example,DC=com",
+    "ttl_seconds": 14400,
+    "account_expires_utc": "2026-10-09T15:13:00Z"
+  }
+}
+```
+
+Compliance note: confirm Observe/Snowflake retention and access controls meet audit requirements for standing evidence. This path is operationally strong; if policy requires WORM/append-only audit devices, document the gap vs Vault audit devices in the acceptance review.
+
+---
+
+## 10. Strategic Migration Path (Vault / CyberArk)
+
+**Intent:** This broker is **tactical**. If/when our internal HashiCorp Vault enables **dynamic LDAP roles** (or CyberArk offers an equivalent JIT path usable by these workloads), we will **happily migrate** callers to that platform capability and wind down the broker for those flows. We are not competing with Vault; we are bridging until Vault can do this job.
+
+```
+Today (pain):     Human ──► Platform tickets ──► static account in platform safe ──► AD groups
+Tactical (now):   Pipeline ──► AD Broker ──► ephemeral AD account + group add (+ keytab)
+Strategic (goal): Pipeline ──► Vault /ldap/creds/:role (or CyberArk JIT) ──► AD
+```
+
+* **Commit to migrate:** When Vault dynamic LDAP is enabled and approved for this caller class, Platform will cut over credential URLs to Vault and deprecate broker minting for migrated roles.
+* **Credential body parity:** `username` / `password` / TTL aligned with Vault dynamic LDAP where practical so cutover is mostly config. `keytab_base64` + `principal` are a **broker extension**; on Vault cutover, keep a small keytab helper only if Vault does not emit keytabs.
+* **Why we are not writing Vault LDIFs in this ADR:** Vault’s dynamic roles use `creation_ldif` / `deletion_ldif` templates. Authoring those is the **migration work at enablement time**, not a deliverable of the tactical broker. The Go create/expire/group-add logic is designed so it *can* map to those templates later—we deliberately do not duplicate a full Vault role definition here while dynamic LDAP is still off.
+* **Client impact:** **minimal, not zero.** Endpoint URL and **authentication** change. Lease renew/revoke appear with Vault. Pipelines should isolate credential URL and auth material behind config.
+* **Non-goal:** do not route application-owned workloads through the broker to avoid standing up their own safe.
+
+---
+
+## 11. Operational SLOs
+
+| SLO | Target (initial) |
+| --- | --- |
+| Reaper lag | Expired objects deleted within **30 minutes** of expiry (2× 15m schedule) |
+| Quarantine population | Alert if live objects in OU exceed agreed ceiling (capacity + abuse) |
+| Create latency (p95) | LDAP create+modify path within agreed budget (tune with AD team) |
+| AD error budget | Circuit-break minting when DC bind/modify failure rate exceeds threshold |
+
+---
+
+## 12. Consequences
+
+### Positive
+
+* Removes Platform from per-team static account creation, platform-safe enrollment, and manual AD group mapping for this class of workload.
+* Stops growth of permanent pipeline system accounts under the platform safe and the UAR/ownership burden that follows.
+* Shrinks each credential’s standing lifetime from “until someone deprovisions the account” to TTL (+ residual ticket)—without implying that 90-day safe rotation was the failure mode.
+* Quarantine OU isolates automation churn from human and Tier-0 trees.
+* Delta-only group updates remove accidental membership wipe as a failure mode.
+* Caller → account → group correlation in Observe supports SOC investigation.
+* API shape eases a later move to Vault dynamic LDAP (or an equivalent approved PAM JIT path).
+
+### Negative / trade-offs
+
+* Platform still owns a privileged issuance path (the broker + bind account in the platform safe)—toil shifts from ticket-driven account farming to product ownership.
+* Higher create/delete churn on DCs in the quarantine OU; reaper and quotas must stay healthy.
+* Standing privilege shifts to allowlists and bind ACEs; those still require review (UAR does not disappear).
+* **AD group target onboarding remains:** new groups need a static allowlist entry **and** AD team ACE updates—JIT accounts do not mean JIT arbitrary groups.
+* Non-idempotent minting means client retries create additional short-lived accounts (bounded by quotas).
+* Teams that *do* own an application-linked safe should keep using Vault/CyberArk directly; this broker is for the gap, not a bypass of app-owned PAM.
+
+---
+
+## 13. Out of Scope / Deferred
+
+* **Vault LDIF role templates now** — Writing production `creation_ldif` / `deletion_ldif` for Vault dynamic LDAP is **deferred until Vault enables that feature**. That is migration work (§10), not a rejection of Vault. Strategic direction remains: migrate to Vault dynamic roles when available.
+* Exhaustive Prometheus label catalogs (runbook).
+* Picking a single reaper runner beyond the options in §7 (Airflow preferred; CronJob and single-worker Go goroutine allowed).
+* True cryptographic single-use credentials (not native to AD password auth).
+
+---
+
+## 14. References
+
+* HashiCorp Vault LDAP secrets engine (dynamic roles)
+* AD `unicodePwd` / LDAPS requirements
+* SPIFFE / platform workload identity issuance
+* Observe OTLP + Prometheus ingestion
