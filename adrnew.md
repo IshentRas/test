@@ -1,144 +1,410 @@
-ODS (Octopus Deployment System) - Managed Octopus Deploy Service
+# SPIKE: PostgreSQL bytea → FUSE → fuse-overlayfs (Kind, no host SYS_ADMIN)
 
-In modern DevOps pipelines, hardcoding secrets is a risk we can’t afford. Enter JWT-based authentication between Octopus Deploy and HashiCorp Vault — a clean solution to the Secret Zero Problem.
+**Status:** Proven in Kind  
+**Goal:** Present PostgreSQL `bytea` rows as a real Linux filesystem via a Go FUSE daemon, plus a writable union via `fuse-overlayfs`, runnable in a non-privileged pod.
 
-🔐 What is the Secret Zero Problem?
-The “Secret Zero Problem” refers to the bootstrapping challenge: how does your system safely authenticate to a secrets manager without already needing a secret? If your CI/CD tool requires a Vault token or API key to retrieve secrets, you’ve just shifted the risk, not solved it.
+---
 
-❌ Problem:
-Hardcoded secrets in pipelines
-Static tokens with long lifespans
-Rotation and revocation nightmares
-✅ Solution: Use JWT as Identity
-Octopus Cloud acts as a trusted identity provider.
-It generates short-lived JWT tokens with contextual claims (e.g., project, space).
-Vault verifies the JWT and issues a Vault token dynamically.
-👷 Scenario: Secure Deployment with No Hardcoded Secrets
-Let’s walk through how a pipeline in Octopus Cloud can:
+## 1. Problem statement
 
-Authenticate to Vault using a JWT.
-Retrieve secrets scoped to that project.
-Use them securely in a deployment.
+Global workspace files live in PostgreSQL as `bytea` rows. This SPIKE asks:
 
-This repository documents the architecture and engineering standards for ODS, a centralized managed deployment service powered by Octopus Deploy.
+1. Can a **Go FUSE** daemon present those rows as a **real Linux filesystem**?
+2. Can **local edits** stay local (CoW) without writing back to Postgres?
+3. Can this run in **Kubernetes (Kind)** with:
+   - Postgres in **another pod**
+   - Workspace **`privileged: false`**
+   - **No host `CAP_SYS_ADMIN`**
+4. Can **two containers** independently mount the same lower and see the same tree, with lower **read-only**?
 
-1. Introduction
+---
 
-ODS is a multi-tenant Platform-as-a-Service (PaaS) designed to provide standardized, secure, and automated deployment capabilities across the enterprise. It bridges the gap between GitLab CI and various infrastructure targets (OpenShift, Cloud, and On-Prem VMs) while maintaining a Zero-Trust security posture.
+## 2. Architecture (what we shipped)
 
-2. Architectural Decision Records (ADR)
+```
+┌─────────────────────┐         SQL / pgx          ┌──────────────────────────────────────┐
+│  postgres pod       │◄──────────────────────────│  workspace pod (×2 replicas)          │
+│  workspace_files     │                            │  privileged: false                    │
+│  (path, bytea, …)   │                            │  no host SYS_ADMIN                    │
+└─────────────────────┘                            │  resources: devic.es/fuse: 1          │
+                                                   │                                      │
+                                                   │  fuseboot (Go CLI)                   │
+                                                   │    └─ unshare --user --map-root-user │
+                                                   │         --mount --propagation private│
+                                                   │         ├─ fusemount --direct-mount  │
+                                                   │         │    → /mnt/lower  (ro)   │
+                                                   │         └─ fuse-overlayfs            │
+                                                   │              → /workspace (merged)   │
+                                                   │         upper: /mnt/overlay/upper    │
+                                                   └──────────────────────────────────────┘
+```
 
-ADR 001: Consolidated Worker Strategy
+| Path | Role |
+|------|------|
+| `/mnt/lower` | Go FUSE **lower** — Postgres `bytea`, kernel mount `ro` |
+| `/mnt/overlay/upper` | Local **upper** — CoW edits / whiteouts (emptyDir) |
+| `/mnt/overlay/work` | fuse-overlayfs workdir |
+| `/workspace` | **Merged** writable view |
 
-Status: Accepted
+### Why this split
 
-Context: We need to support both cloud-native (OpenShift) and legacy on-prem infrastructure without compromising security or creating firewall complexity.
+| Concern | Choice | Why |
+|---------|--------|-----|
+| Postgres → files | Go `fusemount` | Novel part of the SPIKE |
+| Writable union | `fuse-overlayfs` | Correct OverlayFS semantics without reimplementing CoW/whiteouts |
+| Kernel `mount -t overlay` | Avoided | Needs host `SYS_ADMIN`; upper cannot sit on overlay roots |
+| Bidirectional sidecar | Avoided | Privilege-heavy; one process owns both mounts instead |
+| Host `SYS_ADMIN` | Avoided | User+mount namespace gives mount capability **inside** the userns only |
 
-Decision: We will use a consolidated Polling Tentacle (Active) model for all workers.
+---
 
-Dynamic Fleet: Ephemeral workers running on OpenShift clusters.
+## 3. Privilege model (lessons learned)
 
-On-Prem/Legacy: Dedicated workers on client-owned infrastructure.
+### 3.1 What failed
 
-Consequence: All workers initiate outbound-only connections to the ODS Server, eliminating the need for inbound firewall rules at the deployment target.
+| Attempt | Result |
+|---------|--------|
+| `hostPath /dev/fuse` only | `open(/dev/fuse): Operation not permitted` — **devices cgroup** |
+| `capabilities.drop: [ALL]` | CapBnd cleared → setuid `fusermount3` cannot gain mount caps |
+| `RuntimeDefault` seccomp | **Fails** — `unshare: Operation not permitted` (confirmed Kind) |
+| `allowPrivilegeEscalation: false` | **Works** with Localhost seccomp + DirectMount (confirmed Kind) |
+| Expecting other containers to see FUSE mounts | Mounts are **per mount-namespace**; no magic sharing |
 
-ADR 002: Attestation-Based Bootstrap Workflow
+### 3.2 What worked
 
-Status: Accepted
+1. **Device plugin** (squat `generic-device-plugin`) allocating `devic.es/fuse: "1"`  
+   → injects `/dev/fuse` into the pod devices cgroup  
+2. **User + mount namespace at startup** via `unshare --user --map-root-user --mount`  
+   → `uid_map`: `0 1000 1` (mapped root)  
+   → CapEff full **inside** userns; host credential remains uid 1000 with **no** `SYS_ADMIN` in the pod securityContext  
+3. **`DirectMount`** for go-fuse inside the userns (no setuid fusermount needed once mapped root)  
+4. **Localhost seccomp** `deploy/seccomp/fuse-mount.json` — Docker-default based, with ungated allow for `unshare` / `mount` / `umount2`  
+   (`RuntimeDefault` is **not** enough — still need this profile)  
+5. **`allowPrivilegeEscalation: false`** — works with DirectMount; no_new_privs does not block userns creation here  
 
-Context: Manual generation of API keys for machine registration is a security risk and an operational bottleneck.
+### 3.3 Pod securityContext (workspace)
 
-Decision: Implement an ODS Intermediary Service to broker worker registration.
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop: ["ALL"]
+    add: []          # no host SYS_ADMIN
+  seccompProfile:
+    type: Localhost
+    localhostProfile: fuse-mount.json
+resources:
+  limits:
+    devic.es/fuse: "1"
+```
 
-Identity Provider: A local VM service generates a short-lived JWT (30s window) containing VM identity claims (UUID, Hostname) verified against ServiceNow/CMDB.
+---
 
-Verification: The ODS Intermediary Service validates the JWT signature using a JKS Public Key and reconciles claims against CMDB records.
+## 4. PostgreSQL schema and seed
 
-Bootstrap: Upon verification, the service generates a temporary, short-lived Octopus API key and returns it to the agent wrapper for one-time registration.
+### Schema (`sql/schema.sql`)
 
-Consequence: Zero-human-touch registration with cryptographic proof of identity.
+```sql
+CREATE TABLE IF NOT EXISTS workspace_files (
+    id SERIAL PRIMARY KEY,
+    path VARCHAR(1000) NOT NULL,
+    content BYTEA,
+    is_directory BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (path)
+);
+```
 
-ADR 003: Zero-Trust Secret Management
+### Seed tree (nested paths)
 
-Status: Accepted
+Example rows used in the SPIKE:
 
-Context: Secrets must not be stored statically in Octopus or on deployment targets.
+```
+/
+├── README.md
+├── LICENSE
+├── notebooks/
+│   ├── demo.ipynb
+│   └── analysis/
+│       ├── explore.ipynb
+│       └── notes.md
+├── data/
+│   ├── sample.csv
+│   ├── raw/
+│   │   ├── events.jsonl
+│   │   └── nested/
+│   │       └── deep.txt
+│   └── processed/
+│       └── summary.csv
+├── src/
+│   ├── app/
+│   │   ├── main.py
+│   │   └── config.toml
+│   └── lib/
+│       └── util.py
+└── etc/
+    └── project.env
+```
 
-Decision: Integrate HashiCorp Vault using OIDC/JWT authentication.
+---
 
-Flow: The ODS Worker (Tentacle) authenticates to Vault via OIDC using a JWT issued by the ODS Server.
+## 5. Go logic
 
-Guardrails: Vault policies are mapped to JWT claims (ProjectID, SpaceID).
+### 5.1 Package layout
 
-Secret Engine: GitLab runners retrieve Octopus API keys from a custom Vault secret engine using GitLab's JWT identity.
+```
+cmd/fuseboot/          # startup orchestrator (userns + mounts + validate)
+cmd/fusemount/         # read-only Postgres FUSE server
+internal/store/        # pgx queries (Getattr, ReadDir, Read)
+internal/fusefs/       # go-fuse inode ops → store
+internal/overlay/      # optional in-process union (not used on Kind path)
+```
 
-Consequence: Secrets are fetched at runtime and never persisted in the deployment tool.
+Libraries: `github.com/hanwen/go-fuse/v2`, `github.com/jackc/pgx/v5`.
 
-ADR 004: Pragmatic Config-as-Code (CaC)
+---
 
-Status: Accepted
+### 5.2 `fuseboot` — namespace + mount lifecycle
 
-Context: Enable both UI speed for Day 1 and Git-driven governance for Day 2.
+**File:** `cmd/fuseboot/main.go`
 
-Decision: Implement a Hybrid Configuration model using OCL (Octopus Configuration Language).
+**Outer process** (uid 1000, host userns): re-execes itself under `unshare`.
 
-Shared Logic: Common steps (e.g., Vault retrieval) are managed as Git-sourced Step Templates owned by the Platform Team.
+```go
+const innerEnv = "FUSEBOOT_INNER"
 
-Project Logic: Clients manage their .ocl files in GitLab. Octopus performs bidirectional sync, committing UI changes back to Git automatically.
+func main() {
+	if os.Getenv(innerEnv) != "1" {
+		reexecInUserns()
+		return
+	}
+	runInner()
+}
 
-Consequence: Full version control of deployment logic with the option for manual UI intervention when necessary.
+func reexecInUserns() {
+	self, _ := os.Executable()
+	args := append([]string{
+		"--user", "--map-root-user",
+		"--mount", "--propagation", "private",
+		self,
+	}, os.Args[1:]...)
+	cmd := exec.Command("unshare", args...)
+	cmd.Env = append(os.Environ(),
+		innerEnv+"=1",
+		"FUSE_DIRECT_MOUNT=1",
+	)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil { /* exit */ }
+}
+```
 
-3. The Registration Handshake
+**Inner process** (mapped root, private mount ns):
 
-sequenceDiagram
-    participant VM as Client VM (Wrapper)
-    participant LS as Local Identity Service
-    participant ODS as ODS Intermediary Service
-    participant SN as ServiceNow (CMDB)
-    participant OCT as Octopus Server
+1. Refuse to continue if still host-identity userns (`uid_map` `0 0 …`)
+2. Wait for Postgres (`psql SELECT 1`)
+3. Start `fusemount --direct-mount --mount=/mnt/lower`
+4. Wait until `/mnt/lower/README.md` exists
+5. Run `fuse-overlayfs -o lowerdir=…,upperdir=…,workdir=… /workspace`
+6. Write readiness file `/tmp/fuse-ready`
+7. Optionally run `container-validate.sh` → `/tmp/spike-validate.{log,ok}`
+8. Block until SIGTERM (cleanup unmounts)
 
-    VM->>LS: Request Identity Token
-    LS->>SN: Verify Metadata
-    SN-->>LS: Return Verified Identity
-    LS-->>VM: Return Signed JWT (30s expiry)
-    VM->>ODS: POST /register (JWT + Claims)
-    ODS->>ODS: Verify JWT Signature (JKS)
-    ODS->>OCT: Request Temporary API Key
-    OCT-->>ODS: Return Token (10m expiry)
-    ODS-->>VM: Return Token
-    VM->>OCT: tentacle register-with --apiKey
-    OCT-->>VM: X.509 Thumbprint Exchange
-    Note over VM,OCT: Mutual Trust Established (Token Discarded)
+```go
+fuseCmd := exec.Command(fusemountBin, "--dsn", dsn, "--mount", lower, "--direct-mount")
+fuseCmd.Start()
+waitFile(filepath.Join(lower, "README.md"), 15*time.Second)
 
+ovCmd := exec.Command(overlayBin,
+	"-o", fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work),
+	merged,
+)
+ovCmd.Run()
+```
 
-4. Technology Stack
+**Note on `kubectl exec`:** exec joins the **sandbox** namespaces, not the `unshare`’d ones. Validation therefore runs **inside** fuseboot’s userns and writes artifacts to the shared rootfs for `kind-validate.sh` to read.
 
-Component
+---
 
-Technology
+### 5.3 `fusemount` — FUSE server entrypoint
 
-Deployment Engine
+**File:** `cmd/fusemount/main.go`
 
-Octopus Deploy
+```go
+root := fusefs.NewRoot(st)
+opts := &fs.Options{
+	MountOptions: fuse.MountOptions{
+		FsName:            "pgfuse",
+		Name:              "pgfuse",
+		DirectMount:       *direct,       // true inside userns
+		DirectMountStrict: *direct,
+		DisableXAttrs:     true,
+		Options:           []string{"ro"}, // kernel read-only mount
+	},
+}
+server, err := fs.Mount(absMount, root, opts)
+```
 
-Configuration
+- **`DirectMount=false`** (default): setuid `fusermount3` (needs CapBnd / device access).  
+- **`DirectMount=true`**: `mount(2)` as mapped root inside userns (Kind path).
 
-OCL (HCL-based) / Terraform Provider
+---
 
-Secret Store
+### 5.4 `internal/store` — FUSE ↔ SQL
 
-HashiCorp Vault
+**File:** `internal/store/store.go`
 
-Identity/CMDB
+Path normalization: FUSE `""` / `"."` → DB `"/"`; relative names get a leading `/`.
 
-ServiceNow / Custom JWT Service
+| FUSE op | SQL |
+|---------|-----|
+| **Getattr** | `SELECT path, is_directory, COALESCE(length(content),0), updated_at WHERE path=$1` |
+| **ReadDir** (root) | `WHERE path LIKE '/%' AND path NOT LIKE '/%/%' AND path <> '/'` |
+| **ReadDir** (dir) | `WHERE path LIKE $dir\|\|'/%' AND path NOT LIKE $dir\|\|'/%/%'` |
+| **Read** | `SELECT substring(content FROM $offset+1 FOR $size)` — Postgres is **1-based** |
 
-Artifact Source
+```go
+// Read: FUSE offset is 0-based; PostgreSQL substring is 1-based.
+err := s.pool.QueryRow(ctx, `
+	SELECT substring(content FROM $2 FOR $3)
+	FROM workspace_files
+	WHERE path = $1 AND is_directory = FALSE
+`, dbPath, offset+1, size).Scan(&data)
+```
 
-GitLab Container Registry / Nexus
+---
 
-Infrastructure
+### 5.5 `internal/fusefs` — go-fuse nodes
 
-OpenShift, Windows, Linux
+**File:** `internal/fusefs/root.go`
 
-Last Updated: March 2, 2026
+Each inode is a `Node{store, path}` implementing:
+
+| Interface | Behavior |
+|-----------|----------|
+| `Lookup` | `Getattr(child)` → new child inode |
+| `Readdir` | `ReadDir` → `DirEntry` list |
+| `Getattr` | size / mode / mtime from DB |
+| `Open` | reject write flags with **`EROFS`**; else return `fileHandle` |
+| `fileHandle.Read` | `store.Read(path, off, len(dest))` |
+
+Modes reported as `0644` / `0755` so overlay can CoW; the FUSE mount itself is still `ro` and Open rejects writes.
+
+```go
+func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_TRUNC|syscall.O_APPEND|syscall.O_CREAT) != 0 {
+		return nil, 0, syscall.EROFS
+	}
+	// …
+	return &fileHandle{store: n.store, path: n.path}, fuse.FOPEN_KEEP_CACHE, 0
+}
+```
+
+Stable inode numbers: FNV-ish hash of path (`hashIno`).
+
+---
+
+## 6. Kind / Kubernetes layout
+
+| Manifest | Purpose |
+|----------|---------|
+| `deploy/kind/cluster.yaml` | Kind cluster |
+| `deploy/k8s/namespace.yaml` | `fuse-spike` |
+| `deploy/k8s/postgres.yaml` | Postgres + init ConfigMap (schema/seed); Service is **headless** (`clusterIP: None`) because nested Kind broke ClusterIP/kube-proxy |
+| `deploy/k8s/workspace.yaml` | **replicas: 2**, fuseboot entrypoint, fuse device, seccomp |
+| `deploy/k8s/generic-device-plugin.yaml` | Exposes `devic.es/fuse` |
+| `deploy/seccomp/fuse-mount.json` | Localhost seccomp profile |
+
+`kind-up.sh` also rewrites the DSN secret to the **Postgres Pod IP** when DNS/ClusterIP is flaky in nested environments.
+
+---
+
+## 7. Validation results
+
+### Per-pod (`container-validate.sh`, inside userns)
+
+- Mapped userns (`uid_map` ≠ `0 0 …`)
+- Nested paths present on **lower** and **merged**
+- Write/touch on `/mnt/lower` → **`Read-only file system`**
+- Edit via `/workspace` → file appears in **upper**; lower seed unchanged
+- New files upper-only
+- Lower fingerprint (file tree + sha256 of seed files) written to `/tmp/spike-fingerprint.txt`
+
+### Multi-pod (`kind-validate.sh`)
+
+- Both Ready workspace pods: no host `SYS_ADMIN`, `privileged: false`, `devic.es/fuse=1`
+- Both report `spike-validate.ok=ok`
+- **Lower fingerprints identical** across pods
+
+```
+KIND SPIKE OK — 2 containers see the same Postgres lower (R/O);
+fuseboot userns; no host SYS_ADMIN.
+```
+
+### What this proves about “bytea → real file”
+
+| Claim | Result |
+|-------|--------|
+| bytea row readable as a normal file path | Yes (in each FUSE consumer) |
+| Nested subpaths work | Yes |
+| Lower is R/O | Yes |
+| Two containers see the same lower content | Yes (each mounts independently) |
+| Other containers see mounts **without** running FUSE | **No** — out of scope; would need Bidirectional/CSI/shared mount ns |
+
+---
+
+## 8. How to run
+
+```bash
+# Prerequisites: Docker, kind, kubectl, /dev/fuse on the host for Kind nodes
+./scripts/kind-up.sh
+./scripts/kind-validate.sh
+./scripts/kind-down.sh
+```
+
+Image entrypoint:
+
+```text
+/usr/local/bin/fuseboot
+```
+
+---
+
+## 9. Follow-ups (out of Phase 1)
+
+1. Jupyter / workbench sidecar consuming `/workspace` (needs shared mount story or its own fuseboot)
+2. Push/sync upper → Postgres
+3. Pure-Go userns (`clone` + uid_map) instead of shelling to `unshare`
+4. Production device manager (smarter-device-manager / CSI) instead of squat GDP in Kind
+5. Auth, multi-tenant path isolation, large-file streaming tuning
+
+---
+
+## 10. Decision log (short)
+
+| Decision | Outcome |
+|----------|---------|
+| fuse-overlayfs vs Go in-process union | **fuse-overlayfs** — easier, correct whiteouts |
+| Bidirectional sidecar vs single process | **Single process** (`fuseboot`) |
+| Host SYS_ADMIN vs userns | **Userns** at startup |
+| Device plugin needed? | **Yes** for `/dev/fuse` cgroup |
+| Headless Postgres Service | **Yes** in this nested Kind (ClusterIP timed out) |
+
+---
+
+## 11. Key source index
+
+| Path | Role |
+|------|------|
+| `cmd/fuseboot/main.go` | Userns reexec + mount orchestration |
+| `cmd/fusemount/main.go` | FUSE mount options / lifecycle |
+| `internal/store/store.go` | SQL for getattr/readdir/read |
+| `internal/fusefs/root.go` | go-fuse Lookup/Readdir/Open/Read |
+| `sql/schema.sql` / `sql/seed.sql` | Table + nested seed |
+| `deploy/k8s/workspace.yaml` | Dual-replica non-privileged pod |
+| `deploy/seccomp/fuse-mount.json` | Custom seccomp |
+| `scripts/kind-up.sh` / `kind-validate.sh` | Cluster bring-up + multi-pod proof |
+| `scripts/container-validate.sh` | In-userns functional checks |
