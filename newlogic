@@ -1,68 +1,200 @@
-# UBI 9 variant of the POC desktop image: XFCE from EPEL + Chromium + VS Code GUI + JupyterLab.
-# Local check uses the public EPEL release RPM; in the org, point dnf at the internal EPEL mirror instead.
-#   docker build -f Dockerfile.ubi -t coder-kasm-desktop:ubi .
-FROM registry.access.redhat.com/ubi9/ubi
+# VDI agent startup, step by step (Jupyter + VS Code only)
 
-# EPEL provides XFCE (and xrdp) on RHEL/UBI 9; Red Hat repos do not ship XFCE.
-# Plain UBI's AppStream is a subset: XFCE also needs desktop libs (gvfs, libnotify, ...)
-# that live in full AppStream/CRB. LOCAL CHECK ONLY: CentOS Stream repos stand in for
-# them; in the org, build on a subscribed RHEL 9 builder / Satellite (AppStream + CRB
-# enabled) and delete the centos-stream.repo block below.
-# Note: no full `curl` package below — UBI ships curl-minimal, which conflicts with it.
-RUN dnf -y install \
-      https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
- && printf '[cs-baseos]\nname=CentOS Stream 9 BaseOS (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/$basearch/os/\ngpgcheck=0\n[cs-appstream]\nname=CentOS Stream 9 AppStream (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/$basearch/os/\ngpgcheck=0\n[cs-crb]\nname=CentOS Stream 9 CRB (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/CRB/$basearch/os/\ngpgcheck=0\n' \
-      > /etc/yum.repos.d/centos-stream.repo \
- && dnf -y groupinstall "Xfce" \
- && dnf -y install \
-      xfce4-terminal dbus-x11 xorg-x11-xinit \
-      chromium \
-      python3.11 python3.11-pip \
-      git sudo procps-ng ca-certificates dejavu-sans-fonts \
- && dnf clean all \
- && rm -rf /var/cache/dnf
+**Scope:** what the Coder agent does at workspace start so the KasmVNC desktop shows two
+working icons — **JupyterLab** and **VS Code**. Airflow/IntelliJ later follow the same pattern.
+**Implements:** ADR-0002 (`docs/adr/0002-vdi-desktop-via-kasmvnc-and-bounce.md`).
+**Status:** logic proven in the POC (Debian + UBI 9, KasmVNC 1.5.0, no sudo for `coder`);
+the icon-fetch/generation steps below are the target form, not yet in the templates.
 
-# VS Code GUI from the Microsoft yum repo (key imported explicitly; the repo stays enabled
-# here because, unlike the Debian .deb, the RPM registers its key correctly — verify with
-# `dnf repolist` / a later `dnf update` in CI).
-RUN rpm --import https://packages.microsoft.com/keys/microsoft.asc \
- && printf '[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com/yumrepos/vscode\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc\n' \
-      > /etc/yum.repos.d/vscode.repo \
- && dnf -y install code \
- && dnf clean all \
- && rm -rf /var/cache/dnf
+## Division of labour
 
-# JupyterLab in its own venv (outside /home/coder so the home volume cannot hide it).
-RUN python3.11 -m venv /opt/jupyter \
- && /opt/jupyter/bin/pip install --no-cache-dir jupyterlab
+| Baked into the image (`Dockerfile.ubi`) | Done by the agent at start |
+|---|---|
+| XFCE, Chromium (`chromium-browser`), VS Code RPM, JupyterLab venv (`/opt/jupyter`) | Create per-user dirs (`~/Desktop`, `~/.local/share/{applications,icons}`, `~/bin`) |
+| KasmVNC RPM + `kasmvncserver` symlink, `VERSION_CODENAME` in `/etc/os-release`, coder-owned `/usr/share/kasmvnc/www` | Fetch app icons from the Coder server |
+| Wrapper scripts master copy (`/usr/local/share/poc/launch-jupyter`, `launch-vscode`) | Generate the two `.desktop` files, copy wrappers to `~/bin`, mark launchers trusted |
 
-# KasmVNC server: not in EPEL. Use the EL9-family RPM from Kasm's GitHub releases
-# (verified: installs cleanly on UBI 9.8). Baking it in also matters because the Coder
-# kasmvnc module does not recognise ID=rhel — but it skips its install step when
-# `kasmvncserver` is already on PATH. The RPM names the launcher `vncserver`,
-# so add the `kasmvncserver` symlink the module checks for and launches — in
-# /usr/bin, because the script looks for the Xvnc binary next to itself.
-# The www chown: for path apps (subdomain=false) the module patches the Kasm web
-# root at startup (path_vnc.html); without sudo that write must be coder-owned.
-RUN dnf -y install \
-      "https://github.com/kasmtech/KasmVNC/releases/download/v1.5.0/kasmvncserver_oracle_9_1.5.0_$(uname -m).rpm" \
- && ln -s /usr/bin/vncserver /usr/bin/kasmvncserver \
- && chown -R 1000:1000 /usr/share/kasmvnc/www \
- && dnf clean all \
- && rm -rf /var/cache/dnf
+Rules: the image never changes per user; the startup script is **idempotent** (runs on every
+start, safe to re-run); nothing is downloaded except two small SVGs; no sudo.
 
-# No sudo grant for the workspace user: KasmVNC is preinstalled above, so the
-# kasmvnc module skips the only step that needed sudo and uses $HOME/.vnc config.
-# VERSION_CODENAME: the module's run.sh sources /etc/os-release under `set -u`
-# and reads $VERSION_CODENAME, which UBI does not define — without this line the
-# script dies before it even checks whether KasmVNC is installed.
-RUN useradd -m -s /bin/bash coder \
- && echo 'VERSION_CODENAME=""' >> /etc/os-release
+## Sequence
 
-# Desktop launchers + wrapper scripts (see Dockerfile for the Debian variant); the template's
-# startup script copies them into ~/Desktop on every start.
-COPY launch-jupyter launch-vscode JupyterLab.desktop VSCode.desktop jupyter.svg /usr/local/share/poc/
-RUN chmod +x /usr/local/share/poc/launch-jupyter /usr/local/share/poc/launch-vscode
+```mermaid
+flowchart TD
+  A["1. Agent connects; kasmvnc module script and<br/>agent startup_script run (order not guaranteed)"] --> B["2. mkdir per-user dirs"]
+  B --> C["3. Fetch icons: GET {coder}/icon/jupyter.svg, code.svg"]
+  C --> D["4. Copy wrappers launch-jupyter / launch-vscode to ~/bin"]
+  D --> E["5. Write JupyterLab.desktop + VSCode.desktop<br/>(applications menu + Desktop)"]
+  E --> F["6. chmod +x + trusted metadata"]
+  F --> G["7. XFCE picks icons up (xfdesktop watches ~/Desktop;<br/>works whether icons land before or after session start)"]
+  G --> H["8. User clicks icon -> wrapper starts service if needed -> app window opens"]
+```
 
-USER coder
-WORKDIR /home/coder
+Why order-tolerance matters: Coder does not guarantee the module's `coder_script` runs
+before/after `coder_agent.startup_script`. xfdesktop monitors `~/Desktop`, so icons appear
+even if the desktop session started first. The startup script must therefore never fail
+the agent if the desktop is not up yet — it only writes files.
+
+## The steps
+
+### 1. Inputs
+
+- `data.coder_workspace.me.access_url` — base URL for the icon fetch (public static files,
+  no token needed). Fallback if unset: the baked icons in the image.
+- `$HOME` = `/home/coder` (persistent volume — files survive restarts, so steps are cheap no-ops after first start).
+
+### 2. Create directories
+
+```bash
+mkdir -p "$HOME/Desktop" "$HOME/.local/share/applications" \
+         "$HOME/.local/share/icons" "$HOME/bin"
+```
+
+### 3. Fetch icons from Coder
+
+Coder serves 150 built-in icons at `/icon/<name>.svg`, the same set `coder_app.icon` uses —
+so desktop artwork matches the portal exactly.
+
+```bash
+for i in jupyter code; do
+  curl -fsSL "${CODER_ACCESS_URL}/icon/$i.svg" -o "$HOME/.local/share/icons/$i.svg" || true
+done
+```
+
+`|| true`: a failed fetch must not fail startup; XFCE falls back to a generic icon.
+
+### 4. Install wrappers
+
+```bash
+cp /usr/local/share/poc/launch-jupyter /usr/local/share/poc/launch-vscode "$HOME/bin/"
+chmod +x "$HOME/bin/launch-jupyter" "$HOME/bin/launch-vscode"
+```
+
+Wrapper behaviour (unchanged from POC):
+
+- `launch-jupyter`: if `127.0.0.1:8888/lab` is down, start `/opt/jupyter/bin/jupyter lab`
+  (no Jupyter token — localhost only, Coder/Kasm is the auth boundary), wait for health,
+  then `chromium-browser --no-sandbox --disable-gpu --app=http://127.0.0.1:8888/lab`
+  (browser binary resolves `chromium` on Debian, `chromium-browser` on EL).
+- `launch-vscode`: `code --no-sandbox /home/coder` (`--no-sandbox` is mandatory in containers).
+
+### 5. Generate the `.desktop` files
+
+Written to **both** `~/.local/share/applications/` (menu/App Finder) and `~/Desktop/` (desktop icons):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=JupyterLab
+Icon=/home/coder/.local/share/icons/jupyter.svg
+Exec=/home/coder/bin/launch-jupyter
+Terminal=false
+Categories=Development;
+```
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=VS Code
+Icon=/home/coder/.local/share/icons/code.svg
+Exec=/home/coder/bin/launch-vscode
+Terminal=false
+Categories=Development;
+```
+
+### 6. Make launchers trusted
+
+```bash
+chmod +x "$HOME/Desktop/"*.desktop "$HOME/.local/share/applications/"*.desktop
+for f in "$HOME/Desktop/"*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
+```
+
+Without the executable bit (and ideally the trusted flag) XFCE shows generic/untrusted
+icons — the cosmetic issue seen in the POC.
+
+### 7. Desktop pickup
+
+No restart needed: xfdesktop watches `~/Desktop`. Nothing in the startup script touches
+`DISPLAY` (the script runs outside the desktop session).
+
+### 8. Click behaviour
+
+- First Jupyter click starts the server (~seconds), subsequent clicks just open/focus the app window (wrapper's health check sees 8888 up).
+- VS Code opens directly; both apps run on display `:1` (the Kasm session) because the icon launches inside it.
+
+## Proposed `startup_script` (target form)
+
+```hcl
+resource "coder_agent" "main" {
+  # ... display_apps { web_terminal = false ... } ...
+
+  startup_script = <<-EOT
+    set -u
+    ICON_DIR="$HOME/.local/share/icons"
+    mkdir -p "$HOME/Desktop" "$HOME/.local/share/applications" "$ICON_DIR" "$HOME/bin"
+
+    for i in jupyter code; do
+      curl -fsSL "${data.coder_workspace.me.access_url}/icon/$i.svg" -o "$ICON_DIR/$i.svg" || true
+    done
+
+    cp /usr/local/share/poc/launch-jupyter /usr/local/share/poc/launch-vscode "$HOME/bin/"
+
+    cat > "$HOME/.local/share/applications/JupyterLab.desktop" <<'EOF'
+    [Desktop Entry]
+    Type=Application
+    Name=JupyterLab
+    Icon=/home/coder/.local/share/icons/jupyter.svg
+    Exec=/home/coder/bin/launch-jupyter
+    Terminal=false
+    Categories=Development;
+    EOF
+
+    cat > "$HOME/.local/share/applications/VSCode.desktop" <<'EOF'
+    [Desktop Entry]
+    Type=Application
+    Name=VS Code
+    Icon=/home/coder/.local/share/icons/code.svg
+    Exec=/home/coder/bin/launch-vscode
+    Terminal=false
+    Categories=Development;
+    EOF
+
+    cp "$HOME/.local/share/applications/JupyterLab.desktop" "$HOME/.local/share/applications/VSCode.desktop" "$HOME/Desktop/"
+    chmod +x "$HOME/bin/launch-"* "$HOME/Desktop/"*.desktop "$HOME/.local/share/applications/"*.desktop
+    for f in "$HOME/Desktop/"*.desktop; do gio set "$f" metadata::trusted true 2>/dev/null || true; done
+  EOT
+}
+```
+
+(Watch Terraform heredoc escaping in real code: `$HOME` is fine, but any `${...}` meant for
+bash must be written `$${...}`. The `gio` binary comes with glib2 — verify it exists in the
+UBI image, else skip step 6's second half.)
+
+## Validation checklist
+
+```bash
+ls ~/Desktop ~/.local/share/applications ~/.local/share/icons   # both .desktop + both .svg
+curl -sf http://127.0.0.1:8888/lab                              # after clicking Jupyter (or running ~/bin/launch-jupyter)
+pgrep -f '/usr/share/code/code'                                 # after clicking VS Code
+curl -sf http://<coder>/icon/jupyter.svg -o /dev/null -w '%{http_code}\n'   # icon endpoint reachable (200)
+```
+
+Plus the agent-level checks from the POC: agent `running ready`, `kasm-vnc (healthy)`,
+module log ends with `KasmVNC server started successfully!`, `sudo -n true` refused for `coder`.
+
+## Troubleshooting (all seen in the POC)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Module dies instantly, agent `start_error` | `VERSION_CODENAME: unbound variable` (script uses `set -u`, UBI lacks it) | `echo 'VERSION_CODENAME=""' >> /etc/os-release` in image |
+| Module tries to install Kasm and fails on `rhel` | `kasmvncserver` not on PATH | Bake the Oracle 9 RPM in + `/usr/bin/kasmvncserver` symlink (module then skips install) |
+| `mv: ... path_vnc.html: Permission denied` | Path-app patch writes to Kasm web root without sudo | `chown` `/usr/share/kasmvnc/www` to `coder` in image |
+| Jupyter window opens black / dies | Chromium sandbox in container | `--no-sandbox --disable-gpu` in wrapper |
+| Generic document icons | Launcher not executable/trusted, or icon fetch failed | Step 6; check the two SVGs exist and `Icon=` paths are absolute |
+| `apt-get update` fails during module install (Debian) | VS Code .deb left an unsigned Microsoft repo | Remove `vscode.sources` after install (image) — not applicable once Kasm is baked in |
+
+## Out of scope (same pattern later)
+
+- Airflow icon (`/icon/airflow.svg`, wrapper to `127.0.0.1:8080`), IntelliJ (`/icon/intellij.svg`)
+- Panel/dock pinning (XFCE panel config in `~/.config/xfce4/panel/`) — desktop + menu entries are enough for now
+- Per-team icon sets via template parameters
