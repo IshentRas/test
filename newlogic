@@ -1,164 +1,68 @@
-# ADR-0002: VDI desktop (KasmVNC) as a Coder app through the middle bounce
+# UBI 9 variant of the POC desktop image: XFCE from EPEL + Chromium + VS Code GUI + JupyterLab.
+# Local check uses the public EPEL release RPM; in the org, point dnf at the internal EPEL mirror instead.
+#   docker build -f Dockerfile.ubi -t coder-kasm-desktop:ubi .
+FROM registry.access.redhat.com/ubi9/ubi
 
-- **Status:** Proposed — POC validated locally (2026-10-21), not yet on EKS/UBI
-- **Date:** 2026-10-22
-- **Scope:** Workspace access UX (portal → middle → Coder), workspace image/template design, retirement of ttyd and of subdomain-app/wildcard-DNS requirements for desktop workspaces
+# EPEL provides XFCE (and xrdp) on RHEL/UBI 9; Red Hat repos do not ship XFCE.
+# Plain UBI's AppStream is a subset: XFCE also needs desktop libs (gvfs, libnotify, ...)
+# that live in full AppStream/CRB. LOCAL CHECK ONLY: CentOS Stream repos stand in for
+# them; in the org, build on a subscribed RHEL 9 builder / Satellite (AppStream + CRB
+# enabled) and delete the centos-stream.repo block below.
+# Note: no full `curl` package below — UBI ships curl-minimal, which conflicts with it.
+RUN dnf -y install \
+      https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+ && printf '[cs-baseos]\nname=CentOS Stream 9 BaseOS (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/$basearch/os/\ngpgcheck=0\n[cs-appstream]\nname=CentOS Stream 9 AppStream (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/$basearch/os/\ngpgcheck=0\n[cs-crb]\nname=CentOS Stream 9 CRB (local check)\nbaseurl=https://mirror.stream.centos.org/9-stream/CRB/$basearch/os/\ngpgcheck=0\n' \
+      > /etc/yum.repos.d/centos-stream.repo \
+ && dnf -y groupinstall "Xfce" \
+ && dnf -y install \
+      xfce4-terminal dbus-x11 xorg-x11-xinit \
+      chromium \
+      python3.11 python3.11-pip \
+      git sudo procps-ng ca-certificates dejavu-sans-fonts \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
 
-## Context
+# VS Code GUI from the Microsoft yum repo (key imported explicitly; the repo stays enabled
+# here because, unlike the Debian .deb, the RPM registers its key correctly — verify with
+# `dnf repolist` / a later `dnf update` in CI).
+RUN rpm --import https://packages.microsoft.com/keys/microsoft.asc \
+ && printf '[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com/yumrepos/vscode\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc\n' \
+      > /etc/yum.repos.d/vscode.repo \
+ && dnf -y install code \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
 
-Our access model so far (see `spike-middle/docs/bounce-for-all-coder-apps.md`):
+# JupyterLab in its own venv (outside /home/coder so the home volume cannot hide it).
+RUN python3.11 -m venv /opt/jupyter \
+ && /opt/jupyter/bin/pip install --no-cache-dir jupyterlab
 
-- Users never log into the Coder dashboard. The portal asks the middle for a one-time
-  code and form-POSTs it to the bounce (`POST /v1/bounce/start` → `/_portal/bounce`),
-  which sets an app-only Coder key in a narrowly scoped cookie.
-- Each tool is a separate `coder_app` opened in its own browser tab (VS Code Browser,
-  JupyterLab, …).
-- The terminal is **ttyd as a path app**, because Coder's built-in web terminal needs
-  the user's full key in a `Path=/` cookie (bounce doc §3.7).
-- Some local web tools only work as **subdomain apps** (e.g. Airflow running inside
-  the workspace, `templates/jupyter-subdomain/main.tf`: `airflow standalone` on
-  `127.0.0.1:8080` with `subdomain = true`). Subdomain apps require wildcard DNS,
-  a wildcard certificate, load-balancer rules on the wildcard hosts, and a second
-  bounce variant running on the app host (bounce doc §3.10, validated locally only).
+# KasmVNC server: not in EPEL. Use the EL9-family RPM from Kasm's GitHub releases
+# (verified: installs cleanly on UBI 9.8). Baking it in also matters because the Coder
+# kasmvnc module does not recognise ID=rhel — but it skips its install step when
+# `kasmvncserver` is already on PATH. The RPM names the launcher `vncserver`,
+# so add the `kasmvncserver` symlink the module checks for and launches — in
+# /usr/bin, because the script looks for the Xvnc binary next to itself.
+# The www chown: for path apps (subdomain=false) the module patches the Kasm web
+# root at startup (path_vnc.html); without sudo that write must be coder-owned.
+RUN dnf -y install \
+      "https://github.com/kasmtech/KasmVNC/releases/download/v1.5.0/kasmvncserver_oracle_9_1.5.0_$(uname -m).rpm" \
+ && ln -s /usr/bin/vncserver /usr/bin/kasmvncserver \
+ && chown -R 1000:1000 /usr/share/kasmvnc/www \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
 
-Two needs are not well served by this model:
+# No sudo grant for the workspace user: KasmVNC is preinstalled above, so the
+# kasmvnc module skips the only step that needed sudo and uses $HOME/.vnc config.
+# VERSION_CODENAME: the module's run.sh sources /etc/os-release under `set -u`
+# and reads $VERSION_CODENAME, which UBI does not define — without this line the
+# script dies before it even checks whether KasmVNC is installed.
+RUN useradd -m -s /bin/bash coder \
+ && echo 'VERSION_CODENAME=""' >> /etc/os-release
 
-1. **GUI / desktop tools** — IntelliJ and other thick clients, multi-window
-   workflows, "I just want my desktop" users. Browser apps cannot cover these.
-2. **Operational weight of subdomain apps** — wildcard DNS/TLS and the app-host
-   bounce exist largely to serve local web UIs (Airflow, Jupyter) that are already
-   listening on `localhost` inside the workspace.
+# Desktop launchers + wrapper scripts (see Dockerfile for the Debian variant); the template's
+# startup script copies them into ~/Desktop on every start.
+COPY launch-jupyter launch-vscode JupyterLab.desktop VSCode.desktop jupyter.svg /usr/local/share/poc/
+RUN chmod +x /usr/local/share/poc/launch-jupyter /usr/local/share/poc/launch-vscode
 
-A native RDP daemon (xrdp) was considered for (1) but fits poorly: RDP is raw TCP
-(so it cannot ride the HTTP bounce; it would need `coder port-forward`), it wants
-root/sesman/PAM/systemd, and it imposes a second, Linux-password login.
-
-## Decision
-
-**Offer a full Linux desktop ("VDI") inside the workspace, delivered as an
-ordinary Coder path app through the existing bounce. Everything graphical then
-lives inside that desktop.**
-
-| Layer | Choice |
-| --- | --- |
-| Desktop access | **KasmVNC** via Coder's official registry module (`registry.coder.com/coder/kasmvnc/coder`), XFCE desktop, exposed as `coder_app` slug `kasm-vnc`, **`subdomain = false`** (path app) |
-| Entry point | Portal button → `openViaBounce({ purpose: "app", workspace_id, slug: "kasm-vnc" })` — identical recipe to every other app; app-only key in cookie; dashboard unreachable |
-| Desktop contents (baked into image) | XFCE, Chromium, VS Code GUI, JupyterLab, (IntelliJ where licensed), terminal |
-| Local web tools (Airflow, Jupyter, …) | Run on `localhost` in the workspace as today, opened **inside the desktop** via desktop icons — **no `coder_app`, no subdomain, no bounce involvement** |
-| Icon launch pattern | XFCE `.desktop` files + wrapper scripts: start the service if needed, then open it in a Chromium app-mode window (`chromium --no-sandbox --disable-gpu --app=http://127.0.0.1:<port>`) so it looks like a native app |
-| Terminal | XFCE terminal inside the desktop. **ttyd is retired for desktop workspaces**; Coder's built-in web terminal stays hidden (`web_terminal = false`) |
-| Workspace image (target) | UBI 9 + XFCE from EPEL (internal mirror available) + KasmVNC RHEL 9 RPM; apps baked in at build time, never downloaded at workspace start |
-| CLI / IDE tokens | Unchanged: scoped tokens (`coder:workspaces.access` + `user:read`, ± `operate`) minted by the middle; no `user_secret:*` unless deliberately granted |
-
-### Access flow
-
-```mermaid
-sequenceDiagram
-  participant P as Portal
-  participant M as Middle
-  participant B as Bounce (plane host)
-  participant C as Coder
-  participant W as Workspace (KasmVNC :6800, XFCE)
-  P->>M: POST /v1/bounce/start {purpose: app, slug: kasm-vnc}
-  M-->>P: {bounce_url, code}
-  P->>B: form-POST code (new tab)
-  B-->>C: 302 with app-only cookie
-  C->>W: /@user/ws.main/apps/kasm-vnc/
-  Note over W: Inside desktop: Terminal, VS Code,<br/>Jupyter icon → 127.0.0.1:8888<br/>Airflow icon → 127.0.0.1:8080
-```
-
-## What this retires / makes unnecessary (desktop profile)
-
-| Before | After |
-| --- | --- |
-| ttyd as the terminal app | XFCE terminal inside the VDI; ttyd removed (may remain in a future "light" no-desktop profile) |
-| `coder_app` with `subdomain = true` for local Airflow/Jupyter | No `coder_app` at all; desktop icon opens `127.0.0.1:<port>` |
-| Wildcard DNS + wildcard certificate | Not required |
-| App-host bounce variant (bounce doc §3.10) + wildcard ALB/Ingress rules | Not required; bounce exists only on the plane host |
-| Port-forward UX for local web UIs | Desktop browser opens `localhost:<port>` directly |
-
-Unchanged: plane-host bounce, middle endpoints, scoped CLI/IDE tokens, keeping
-users out of the Coder dashboard. Browser `coder_app`s (path mode) may remain as
-lightweight shortcuts alongside the desktop; they are no longer the only door.
-
-## Alternatives considered
-
-| Option | Why not (as the primary path) |
-| --- | --- |
-| **xrdp + XFCE** (native RDP) | Raw TCP — cannot use the bounce; needs `coder port-forward` first; wants root/systemd/PAM and a second OS-password login; fights OpenShift restricted SCC / arbitrary UID. Remains an optional add-on if a native RDP client is mandated. |
-| **Subdomain apps + wildcard bounce** (status quo for Airflow) | Works (validated locally) but buys wildcard DNS/TLS, extra LB rules and a second bounce variant for tools that are already on `localhost`. |
-| **Browser apps + ttyd only** (status quo) | No answer for IntelliJ/thick clients or multi-window desktop workflows. |
-| **GNOME instead of XFCE** | Only Red Hat–supported desktop, but heavy and assumes systemd/logind/Wayland — impractical in a workspace container. XFCE comes from EPEL (community, not Red Hat supported — accepted, §Risks). |
-| **JupyterLab Desktop (Electron) instead of browser-in-desktop** | A second, heavy Jupyter install to maintain; Chromium `--app` mode gives the same "native app" feel with one install. |
-
-## POC evidence (2026-10-21, local)
-
-Local Coder v2.36.5, Docker workspaces
-(`spike-middle/templates/kasm-desktop/`, `spike-middle/local-subdomain-lab/kasm-desktop-lab.sh`):
-
-- kasmvnc module v1.3.0 created a healthy `kasm-vnc` path app; XFCE desktop
-  opened in the browser through Coder app auth.
-- Desktop icons launched the real tools: **VS Code GUI 1.143** and
-  **JupyterLab 4.6.4** (Chromium app-mode window), verified by screenshots and
-  by the Jupyter HTTP endpoint coming up on icon launch.
-- Image: Debian bookworm + XFCE + Chromium + VS Code + JupyterLab = **3.31 GB**
-  (Debian stands in for UBI locally; package source is the only intended difference).
-- Two real bugs found and fixed, both relevant to the UBI build:
-  1. The VS Code `.deb` leaves a Microsoft apt repo (`vscode.sources`) without a
-     working key in the image → all later `apt-get update` fail (broke the module
-     install). Fix: remove that repo after install; updates come from image rebuilds.
-  2. Chromium and VS Code need `--no-sandbox` in containers, or windows die silently.
-- Cosmetic leftover: desktop icons render as generic document icons (icon
-  theme/trusted-launcher metadata) — launchers work.
-
-## Consequences
-
-**Positive**
-
-- One entry pattern for everything: portal → bounce → app. The desktop is not a
-  special case in the middle or the frontend.
-- Infrastructure gets *simpler* as the offer gets richer: no wildcard DNS/TLS,
-  no app-host bounce, no ttyd, no RDP exposure.
-- Thick clients (IntelliJ, DB tools) become possible without Coder dashboard
-  access or a second login (KasmVNC rides Coder app auth; runs as the workspace
-  user, no systemd/root — OpenShift-friendly).
-- Local web tools keep their native shape (`/` on localhost) instead of being
-  forced under a path prefix or a subdomain.
-
-**Negative / costs**
-
-- Desktop workspaces are heavy: multi-GB image, real RAM/CPU (IntelliJ-class
-  use ⇒ 4 GB+), idle desktops burn cluster resources. Needs resource profiles,
-  autostop, and possibly concurrency limits.
-- The desktop image becomes a maintained product (UBI 9 + EPEL + apps):
-  patching cadence and an owning team are required. XFCE/EPEL is not
-  Red Hat supported; UBI must stay on 9 (no XFCE in EPEL for EL 10 today).
-- GUI sessions do not survive workspace stop/restart (home volume persists
-  files/settings only) — must be communicated to users.
-- New policy decisions: KasmVNC clipboard and file transfer in/out, session
-  recording expectations, desktop idle timeout.
-
-## Open items / next steps
-
-1. Build the **UBI 9 + EPEL** version of the image; confirm CRB deps resolve
-   against the internal mirror.
-2. Validate on **EKS behind the real bounce** (ALB or Go bounce microservice),
-   including the app-only cookie and "dashboard shows login page" check.
-3. Add IntelliJ; measure real memory/CPU; define workspace profiles
-   (light vs desktop) and autostop defaults.
-4. Frontend: "Desktop" choice from `GET /v1/workspaces/{id}/access`
-   (`slug: kasm-vnc`); update `frontend-guide-bounce-and-endpoints.md`
-   (terminal section: VDI supersedes ttyd for desktop workspaces).
-5. Airflow inside the desktop: preconfigure auth for `airflow standalone`
-   (its generated admin password is not a UX); decide which local tools get icons.
-6. Fix desktop icon artwork (trusted launchers / icon theme).
-7. Decide clipboard/file-transfer policy for KasmVNC before any pilot.
-
-## Related
-
-- `spike-middle/docs/bounce-for-all-coder-apps.md` — bounce design (§3.7 ttyd and
-  §3.10 subdomain apps are narrowed by this ADR for desktop workspaces)
-- `spike-middle/docs/frontend-guide-bounce-and-endpoints.md` — portal contract
-- `spike-middle/templates/kasm-desktop/` — POC image + template
-- `spike-middle/local-subdomain-lab/kasm-desktop-lab.sh` — POC bring-up/teardown
-- ADR-0001 — agent jobs via middle service + standard workspaces
+USER coder
+WORKDIR /home/coder
