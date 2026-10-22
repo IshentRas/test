@@ -4,7 +4,8 @@
 working icons — **JupyterLab** and **VS Code**. Airflow/IntelliJ later follow the same pattern.
 **Implements:** ADR-0002 (`docs/adr/0002-vdi-desktop-via-kasmvnc-and-bounce.md`).
 **Status:** logic proven in the POC (Debian + UBI 9, KasmVNC 1.5.0, no sudo for `coder`);
-the icon-fetch/generation steps below are the target form, not yet in the templates.
+the icon-fetch/generation steps and the no-auto-lock image changes below are the
+target form, not yet in the templates/Dockerfile.
 
 ## Division of labour
 
@@ -13,6 +14,7 @@ the icon-fetch/generation steps below are the target form, not yet in the templa
 | XFCE, Chromium (`chromium-browser`), VS Code RPM, JupyterLab venv (`/opt/jupyter`) | Create per-user dirs (`~/Desktop`, `~/.local/share/{applications,icons}`, `~/bin`) |
 | KasmVNC RPM + `kasmvncserver` symlink, `VERSION_CODENAME` in `/etc/os-release`, coder-owned `/usr/share/kasmvnc/www` | Fetch app icons from the Coder server |
 | Wrapper scripts master copy (`/usr/local/share/poc/launch-jupyter`, `launch-vscode`) | Generate the two `.desktop` files, copy wrappers to `~/bin`, mark launchers trusted |
+| **No auto-lock**: `xfce4-screensaver` removed; xfconf defaults disable screensaver/lock/DPMS (see “No auto-lock” below) | — (nothing: agent script has no session D-Bus, so this cannot be done reliably at start) |
 
 Rules: the image never changes per user; the startup script is **idempotent** (runs on every
 start, safe to re-run); nothing is downloaded except two small SVGs; no sudo.
@@ -74,9 +76,11 @@ Wrapper behaviour (unchanged from POC):
 
 - `launch-jupyter`: if `127.0.0.1:8888/lab` is down, start `/opt/jupyter/bin/jupyter lab`
   (no Jupyter token — localhost only, Coder/Kasm is the auth boundary), wait for health,
-  then `chromium-browser --no-sandbox --disable-gpu --app=http://127.0.0.1:8888/lab`
+  then `chromium-browser --no-sandbox --disable-gpu --password-store=basic --app=http://127.0.0.1:8888/lab`
   (browser binary resolves `chromium` on Debian, `chromium-browser` on EL).
-- `launch-vscode`: `code --no-sandbox /home/coder` (`--no-sandbox` is mandatory in containers).
+- `launch-vscode`: `code --no-sandbox --password-store=basic /home/coder`
+  (`--no-sandbox` is mandatory in containers; `--password-store=basic` on both wrappers
+  avoids GNOME keyring “set a password” prompts — the `coder` user has no password).
 
 ### 5. Generate the `.desktop` files
 
@@ -170,6 +174,55 @@ resource "coder_agent" "main" {
 bash must be written `$${...}`. The `gio` binary comes with glib2 — verify it exists in the
 UBI image, else skip step 6's second half.)
 
+## No auto-lock, no password prompts (image level)
+
+**Problem.** The XFCE image ships `xfce4-screensaver` (autostarted) and
+`xfce4-power-manager` (DPMS blanking). The `coder` user is created **without a
+password**, so a locked session can never be unlocked — the VDI is dead until
+restart. The same no-password user makes Chromium/VS Code pop GNOME keyring
+“set a password” prompts.
+
+**Decision.** No screen lock inside the VDI. The auth boundary is Coder/Kasm
+(SSO + app-only cookie) plus the user's endpoint OS lock; a lock with a shared
+or nonexistent password adds no security, only lockouts. Idle control, if
+required, belongs server-side (Kasm idle disconnect, workspace autostop).
+
+**Fix — all in the image** (the agent script cannot do this: `xfconf-query`
+needs the running session's D-Bus):
+
+```dockerfile
+# 1. Remove the screensaver entirely (nothing to autostart or lock)
+RUN dnf -y remove xfce4-screensaver
+```
+
+```xml
+<!-- 2. /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml
+        (belt & braces if the package ever returns) -->
+<channel name="xfce4-screensaver" version="1.0">
+  <property name="saver" type="empty">
+    <property name="enabled" type="bool" value="false"/>
+  </property>
+  <property name="lock" type="empty">
+    <property name="enabled" type="bool" value="false"/>
+  </property>
+</channel>
+```
+
+```xml
+<!-- 3. /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml
+        (never blank the display either — a black screen looks like a lock) -->
+<channel name="xfce4-power-manager" version="1.0">
+  <property name="xfce4-power-manager" type="empty">
+    <property name="dpms-enabled" type="bool" value="false"/>
+    <property name="blank-on-ac" type="int" value="0"/>
+  </property>
+</channel>
+```
+
+Files under `/etc/xdg` are xfconf *system defaults*: read at session start,
+valid for fresh home volumes, still user-overridable. And the wrappers carry
+`--password-store=basic` (step 4) so no keyring prompt appears.
+
 ## Validation checklist
 
 ```bash
@@ -182,6 +235,15 @@ curl -sf http://<coder>/icon/jupyter.svg -o /dev/null -w '%{http_code}\n'   # ic
 Plus the agent-level checks from the POC: agent `running ready`, `kasm-vnc (healthy)`,
 module log ends with `KasmVNC server started successfully!`, `sudo -n true` refused for `coder`.
 
+Anti-lock checks:
+
+```bash
+rpm -q xfce4-screensaver        # package not found
+pgrep -a xfce4-screensaver      # nothing running in the session
+grep -A2 'name="lock"' /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml
+# leave the desktop idle past the old timeout: no lock prompt, display stays on
+```
+
 ## Troubleshooting (all seen in the POC)
 
 | Symptom | Cause | Fix |
@@ -192,6 +254,8 @@ module log ends with `KasmVNC server started successfully!`, `sudo -n true` refu
 | Jupyter window opens black / dies | Chromium sandbox in container | `--no-sandbox --disable-gpu` in wrapper |
 | Generic document icons | Launcher not executable/trusted, or icon fetch failed | Step 6; check the two SVGs exist and `Icon=` paths are absolute |
 | `apt-get update` fails during module install (Debian) | VS Code .deb left an unsigned Microsoft repo | Remove `vscode.sources` after install (image) — not applicable once Kasm is baked in |
+| Screen locks / goes black after idle, asks for a password | `xfce4-screensaver` lock or DPMS blanking; `coder` has no password to unlock with | Remove screensaver + xfconf defaults (see “No auto-lock”) |
+| “Set password for new keyring” prompt in VS Code/Chromium | GNOME keyring with a password-less user | `--password-store=basic` on both wrappers |
 
 ## Out of scope (same pattern later)
 
