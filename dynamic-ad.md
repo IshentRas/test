@@ -173,20 +173,34 @@ Also needed for FUSE itself (already in default allow lists in this profile): op
 
 ## 7. Client binary path (proven): fuse-nfs + libnfs GSS
 
-`client/Dockerfile`:
+### 7.1 Debian spike (EKS lab)
 
-1. Build **libnfs from `main`** with `libkrb5-dev` / `libgssglue-dev` → must `ldd` show GSS/krb.
-2. Build **fuse-nfs** against that libnfs.
-3. Runtime image: `fuse`, `krb5-user`, `util-linux` (`unshare`), coder uid 1000, `user_allow_other` in `fuse.conf`.
+`client/Dockerfile`: git-clone **main**, build with `libkrb5-dev`, link `fuse-nfs`, copy into runtime.
+
+### 7.2 Red Hat / no-git path (org-friendly)
+
+`client/Dockerfile.ubi` — multi-stage Rocky 9:
+
+1. **curl** pinned tarball  
+   `https://github.com/sahlberg/libnfs/archive/refs/tags/libnfs-8.0.1.tar.gz`  
+   (swap `LIBNFS_URL` to an internal mirror when GitHub is blocked)
+2. `./bootstrap && ./configure --prefix=/opt/libnfs && make install` with `krb5-devel`
+3. `COPY --from=libnfs-build /opt/libnfs /opt/libnfs` into a thin runtime image (`krb5-libs`)
+4. Build gate: `ldd … | grep -iE 'gss|krb'` must pass
+
+Verified locally: configure prints `Build with gssapi_krb5 support`; final image links `libgssapi_krb5`.
+
+**EPEL `libnfs-5.0.3` on el9 = no GSS** — do not use for `sec=krb5`.
 
 Hard-learned:
 
 | Issue | Fix |
 |---|---|
-| libnfs **5.0.2** has no GSS | Build **main**; WRONGSEC otherwise |
+| libnfs **5.0.2 / EPEL 5.0.3** have no GSS | Build **8.0.1+** (or main) from source tarball |
 | Empty / wrong `USER` | `gss_import_name` fails → `export USER=alice` (match principal) |
 | FUSE local mode bits vs server ACL | `fuse-nfs … -p 0` |
 | Ticket ccache vs nested ns | `kinit` **inside** the same `unshare` as `fuse-nfs` |
+| Cannot `git clone` in org | curl release tarball (or vendor it); see `Dockerfile.ubi` |
 
 URL shape:
 
@@ -301,7 +315,8 @@ Second `unshare` maps back to uid 1000 while keeping the FUSE mount visible.
 | `README.md` | Short verdict + run/down |
 | `run-aws.sh` | Deploy + prove + `down` |
 | `eksctl-cluster.yaml` | EKS 1.33 lab cluster |
-| `client/Dockerfile` | libnfs main+GSS + fuse-nfs |
+| `client/Dockerfile` | Debian: libnfs main+GSS + fuse-nfs |
+| `client/Dockerfile.ubi` | Rocky9: curl `libnfs-8.0.1.tar.gz` → `/opt/libnfs` (GSS) |
 | `k8s/client.yaml` | Restricted client Pod |
 | `k8s/overlay-userns.json` | Seccomp allowlist |
 | `k8s/seccomp-install-ds.yaml` | Install profile on nodes |
